@@ -5,6 +5,7 @@
 import json
 import logging
 import os
+import time
 
 import gradio as gr
 from dotenv import load_dotenv
@@ -21,14 +22,21 @@ logging.basicConfig(
 logger = logging.getLogger("toomanyrules")
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-# V4-Flash, non-thinking mode
-DEEPSEEK_MODEL = "deepseek-chat"
-# V4-Flash, thinking mode
-#DEEPSEEK_MODEL = "deepseek-reasoner"
 # The cheap everyday default
-#DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 # Hardest reasoning and coding
 #DEEPSEEK_MODEL = "deepseek-v4-pro"
+
+# Дни 1-4 спроектированы под старую deepseek-chat, которая не рассуждала.
+# deepseek-v4-flash/pro — reasoning-модели с thinking, включённым по
+# умолчанию: скрытые reasoning-токены тратят тот же бюджет max_tokens, что
+# и видимый ответ (в дне 2 это приводило к пустому content и падению
+# json.loads при finish_reason=length), и на остальных днях просто удлиняют
+# ответ и повышают его стоимость без пользы для задачи. Отключаем thinking
+# явно на всех вызовах дней 1-4, чтобы поведение соответствовало старой
+# модели. День 5 — исключение: там режим thinking сам является переменной
+# эксперимента (см. DAY5_MATRIX) и переключается отдельно.
+DEEPSEEK_EXTRA_BODY = {"thinking": {"type": "disabled"}}
 
 # Системный промпт дня 1 — оставлен без изменений. Используется и в дне 1,
 # и в варианте A дня 2 (по спецификации дня 2: «тот же системный промпт, что
@@ -129,6 +137,31 @@ SYSTEM_PROMPT_CONSILIUM = SYSTEM_PROMPT + """
 DAY4_TEMPERATURES = [0.0, 0.7, 1.2]
 DAY4_REPEATS_PER_TEMPERATURE = 3
 
+# День 5: цены DeepSeek V4 в долларах за 1M токенов (off-peak).
+# Источник: https://api-docs.deepseek.com/quick_start/pricing (актуально
+# на момент реализации). В пиковые часы (01:00-04:00 и 06:00-10:00 UTC,
+# пн-пт) ставки ×2 — для оценочной стоимости используем off-peak, это
+# дефолтный режим бо́льшую часть суток и выходные.
+PRICING_PER_M_TOKENS = {
+    "deepseek-v4-flash": {"input": 0.22, "output": 0.66},
+    "deepseek-v4-pro":   {"input": 0.66, "output": 1.98},
+}
+
+# День 5: матрица 2×2 «модель × режим рассуждения». Единственные переменные
+# между 4 вызовами — это `model` и режим `thinking` (через `extra_body`,
+# а не отдельным именем модели — DeepSeek рекомендует так на странице
+# Thinking Mode). Порядок ячеек и номера вариантов — по таблице §2
+# спецификации (строки — модель, столбцы — режим thinking):
+#   1) flash + off (самый слабый/дешёвый/быстрый), 2) flash + on,
+#   3) pro   + off,                                 4) pro   + on
+#   (самый сильный — флагман + рассуждение).
+DAY5_MATRIX = [
+    ("deepseek-v4-flash", False, "Вариант 1 — deepseek-v4-flash, thinking off"),
+    ("deepseek-v4-flash", True,  "Вариант 2 — deepseek-v4-flash, thinking on"),
+    ("deepseek-v4-pro",   False, "Вариант 3 — deepseek-v4-pro,   thinking off"),
+    ("deepseek-v4-pro",   True,  "Вариант 4 — deepseek-v4-pro,   thinking on"),
+]
+
 
 def respond(message, history):
     """День 1: отправляет историю диалога и новый вопрос в DeepSeek API, стримит ответ."""
@@ -148,6 +181,7 @@ def respond(message, history):
             model=DEEPSEEK_MODEL,
             messages=messages,
             stream=True,
+            extra_body=DEEPSEEK_EXTRA_BODY,
         )
     except Exception as exc:
         yield f"Ошибка при обращении к DeepSeek API: {exc}"
@@ -186,6 +220,7 @@ def compare_variants(question: str):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": question},
             ],
+            extra_body=DEEPSEEK_EXTRA_BODY,
         )
         a_text = a_resp.choices[0].message.content or ""
         logger.info("Variant A finish_reason=%s", a_resp.choices[0].finish_reason)
@@ -205,6 +240,7 @@ def compare_variants(question: str):
             ],
             max_tokens=MAX_TOKENS_B,
             stop=[STOP_SEQUENCE],
+            extra_body=DEEPSEEK_EXTRA_BODY,
         )
         b_raw = b_resp.choices[0].message.content or ""
         # finish_reason == "stop" значит, что генерацию остановила стоп-
@@ -281,6 +317,7 @@ def run_day3(question: str):
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": question},
             ],
+            extra_body=DEEPSEEK_EXTRA_BODY,
         )
         out1 = r.choices[0].message.content or ""
         logger.info(
@@ -300,6 +337,7 @@ def run_day3(question: str):
                 {"role": "system", "content": SYSTEM_PROMPT_STEP_BY_STEP},
                 {"role": "user", "content": question},
             ],
+            extra_body=DEEPSEEK_EXTRA_BODY,
         )
         out2 = r.choices[0].message.content or ""
         logger.info(
@@ -320,6 +358,7 @@ def run_day3(question: str):
                 {"role": "system", "content": _build_meta_prompt(question)},
                 {"role": "user", "content": question},
             ],
+            extra_body=DEEPSEEK_EXTRA_BODY,
         )
         out3_prompt = (r.choices[0].message.content or "").strip()
         logger.info(
@@ -344,6 +383,7 @@ def run_day3(question: str):
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": out3_prompt},
                 ],
+                extra_body=DEEPSEEK_EXTRA_BODY,
             )
             out3 = r.choices[0].message.content or ""
             logger.info(
@@ -372,6 +412,7 @@ def run_day3(question: str):
                 {"role": "system", "content": SYSTEM_PROMPT_CONSILIUM},
                 {"role": "user", "content": question},
             ],
+            extra_body=DEEPSEEK_EXTRA_BODY,
         )
         out4 = r.choices[0].message.content or ""
         logger.info(
@@ -418,6 +459,7 @@ def run_day4(question: str):
                         {"role": "user", "content": question},
                     ],
                     temperature=temperature,
+                    extra_body=DEEPSEEK_EXTRA_BODY,
                 )
                 text = r.choices[0].message.content or ""
                 finish_reason = r.choices[0].finish_reason
@@ -439,6 +481,197 @@ def run_day4(question: str):
                 logger.exception("Day 4 %s failed", label)
 
     return tuple(results)
+
+
+def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """День 5: оценка стоимости одного вызова API в долларах по off-peak ценам
+    DeepSeek V4 за 1M токенов (см. `PRICING_PER_M_TOKENS`). При `thinking=on`
+    `completion_tokens` уже включает токены рассуждения — отдельный учёт не
+    нужен, как и указано в §3 спецификации дня 5."""
+    rates = PRICING_PER_M_TOKENS[model]
+    return (
+        prompt_tokens * rates["input"] / 1_000_000
+        + completion_tokens * rates["output"] / 1_000_000
+    )
+
+
+def _green(value: str) -> str:
+    """Обёртка для зелёного шрифта в Gradio Markdown (рендерит HTML)."""
+    return f'<span style="color:#1a7f37;font-weight:bold">{value}</span>'
+
+
+def _metric_md(label: str, cell: dict | None, mins: tuple | None = None) -> str:
+    """День 5: markdown-блок метрик одной ячейки матрицы.
+
+    `cell is None` — заявка ещё не отправлена (значение по умолчанию
+    компонента до клика — единственный момент, когда пустые подписи
+    видны, т.к. `run_day5` не стример и возвращает готовый результат
+    сразу со всеми цифрами): показываем подписи с пустыми значениями.
+    `mins` — `(min_elapsed, min_total_tokens, min_cost)` для зелёной
+    подсветки минимумов по всем 4 ячейкам.
+    """
+    header = f"### {label}"
+    if cell is None:
+        return (
+            f"{header}\n\n"
+            f"- **⏱ Время ответа:** \n"
+            f"- **🔢 Токены:** \n"
+            f"- **💲 Стоимость:** \n"
+            f"- **finish_reason:** "
+        )
+    if not cell["ok"]:
+        return f"{header}\n\n❌ **Ошибка API:** {cell['error']}"
+
+    elapsed_str = f"{cell['elapsed']:.2f} s"
+    total_str = str(cell["total_tokens"])
+    cost_str = f"${cell['cost']:.6f}"
+    if mins is not None:
+        min_elapsed, min_total_tokens, min_cost = mins
+        if min_elapsed is not None and cell["elapsed"] == min_elapsed:
+            elapsed_str = _green(elapsed_str)
+        if min_total_tokens is not None and cell["total_tokens"] == min_total_tokens:
+            total_str = _green(total_str)
+        if min_cost is not None and cell["cost"] == min_cost:
+            cost_str = _green(cost_str)
+
+    return (
+        f"{header}\n\n"
+        f"- **⏱ Время ответа:** {elapsed_str}\n"
+        f"- **🔢 Токены:** prompt={cell['prompt_tokens']} / "
+        f"completion={cell['completion_tokens']} / total={total_str}\n"
+        f"- **💲 Стоимость:** {cost_str}\n"
+        f"- **finish_reason:** `{cell['finish_reason']}`"
+    )
+
+
+def run_day5(question: str):
+    """День 5: один и тот же вопрос прогоняется через DeepSeek API на 4
+    ячейках матрицы 2×2 (`deepseek-v4-flash`/`deepseek-v4-pro` ×
+    `thinking off`/`on`). Системный промпт и вопрос одинаковы во всех
+    вызовах; единственные переменные — модель и режим `thinking`,
+    переключаемый через `extra_body={"thinking": {"type": "enabled"|
+    "disabled"}}` (а не отдельным именем модели). `temperature`/`top_p`/
+    `presence_penalty`/`frequency_penalty`/`max_tokens`/`stop` не задаются —
+    это требование спецификации §3 (и в режиме `thinking=enabled` API их
+    всё равно не поддерживает).
+
+    Обычная (не генератор) функция — как `run_day3`/`run_day4`: все 4
+    вызова выполняются последовательно внутри, а результат возвращается
+    один раз в конце кортежем из 8 строк (`metric_1, answer_1, ...,
+    metric_4, answer_4`). Это намеренно: генератор с промежуточными
+    `yield` заставляет Gradio считать событие «стримящимся» и показывать
+    вместо обычного индикатора ожидания только тонкую оранжевую рамку
+    вокруг компонента, без спиннера и таймера. Обычная функция (как в
+    дне 2) показывает стандартный оверлей Gradio на всё время вызова —
+    крутящуюся иконку по центру `gr.Markdown` и таймер в углу
+    `gr.Textbox`. Пока идёт вызов, во всех 4 ячейках виден `_metric_md`
+    с пустыми значениями (то же самое значение стоит по умолчанию у
+    `gr.Markdown` в интерфейсе) — реальные цифры и зелёная подсветка
+    минимумов появляются во всех ячейках разом, когда функция вернёт
+    результат.
+
+    Наименьшее значение по каждой из трёх метрик (время, `total_tokens`,
+    стоимость) подсвечено зелёным шрифтом — победители по разным
+    метрикам могут быть разными ячейками. Автоматической метрики
+    качества и подсветки «лучшего по качеству» код **не делает**
+    (см. §7 спецификации) — это ручное суждение автора.
+    """
+    logger.info("Day 5: question=%r", question)
+
+    cells: list[dict] = []
+    for model, thinking_on, label in DAY5_MATRIX:
+        cell: dict = {
+            "model": model,
+            "thinking_on": thinking_on,
+            "label": label,
+            "ok": False,
+            "text": "",
+            "elapsed": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost": 0.0,
+            "finish_reason": None,
+            "error": None,
+        }
+        try:
+            client = _get_client()
+            extra_body = (
+                {"thinking": {"type": "enabled"}}
+                if thinking_on
+                else {"thinking": {"type": "disabled"}}
+            )
+            t0 = time.perf_counter()
+            r = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": question},
+                ],
+                extra_body=extra_body,
+            )
+            elapsed = time.perf_counter() - t0
+
+            text = r.choices[0].message.content or ""
+            finish_reason = r.choices[0].finish_reason
+            # `usage` теоретически может быть None (разные провайдеры
+            # ведут себя по-разному) — `getattr` с дефолтом 0 страхует
+            # от AttributeError, чтобы не ронять весь прогон матрицы из-за
+            # одного вызова без usage.
+            usage = r.usage
+            prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+            completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+            total_tokens = getattr(usage, "total_tokens", 0) or 0
+            cost = _estimate_cost_usd(model, prompt_tokens, completion_tokens)
+
+            cell.update(
+                ok=True,
+                text=text,
+                elapsed=elapsed,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                cost=cost,
+                finish_reason=finish_reason,
+            )
+            logger.info(
+                "Day 5 %s model=%s thinking=%s finish_reason=%s time=%.2fs "
+                "tokens(prompt/completion/total)=%d/%d/%d cost=$%.6f, "
+                "%d chars: %s",
+                label, model,
+                "on" if thinking_on else "off",
+                finish_reason, elapsed,
+                prompt_tokens, completion_tokens, total_tokens, cost,
+                len(text), text,
+            )
+        except Exception as exc:
+            cell["error"] = exc
+            logger.exception("Day 5 %s failed", label)
+
+        cells.append(cell)
+
+    # Минимумы считаем только среди успешных ячеек: если какая-то ячейка
+    # упала, она просто не участвует в сравнении. Если все упали — None,
+    # и подсветки не будет.
+    successful = [c for c in cells if c["ok"]]
+    if successful:
+        mins = (
+            min(c["elapsed"] for c in successful),
+            min(c["total_tokens"] for c in successful),
+            min(c["cost"] for c in successful),
+        )
+    else:
+        mins = None
+
+    # Пересобираем метрики всех 4 ячеек уже с зелёной подсветкой минимумов.
+    # Сравнение по каждой метрике независимое (как требует §4 спецификации),
+    # так что одна и та же ячейка может быть зелёной по времени, токенам и
+    # стоимости сразу — или только по части метрик.
+    result: list[str] = []
+    for c in cells:
+        result.append(_metric_md(c["label"], c, mins))
+        result.append(c["text"] if c["ok"] else "")
+    return tuple(result)
 
 
 # --- Gradio-интерфейс: все дни живут в одном приложении через табы ---
@@ -765,6 +998,163 @@ with gr.Blocks(title="TooManyRules") as demo:
                 run_day4,
                 inputs=[question_input_4],
                 outputs=day4_outputs,
+            )
+
+        # День 5: матрица 2×2 «модель × режим рассуждения» — 4 вызова на
+        # одном и том же вопросе, чтобы увидеть раздельно эффект размера
+        # модели (`flash` vs `pro`) и эффект включения рассуждения
+        # (`thinking off` vs `on`). Режим `thinking` переключается через
+        # `extra_body`, не через имя модели (требование §3 спецификации).
+        with gr.Tab("День 5 — модель × thinking"):
+            gr.Markdown(
+                "Один и тот же вопрос по правилам прогоняется через DeepSeek "
+                "API **четыре раза** на матрице 2×2 `модель × режим "
+                "рассуждения`:\n\n"
+                "- **Вариант 1:** `deepseek-v4-flash`, `thinking=off` — "
+                "самый слабый/дешёвый/быстрый\n"
+                "- **Вариант 2:** `deepseek-v4-flash`, `thinking=on`\n"
+                "- **Вариант 3:** `deepseek-v4-pro`, `thinking=off`\n"
+                "- **Вариант 4:** `deepseek-v4-pro`, `thinking=on` — "
+                "самый сильный (флагман + рассуждение)\n\n"
+                "Системный промпт и вопрос одинаковы во всех 4 вызовах. "
+                "`temperature`/`top_p`/`presence_penalty`/`frequency_penalty`/"
+                "`max_tokens`/`stop` **не задаются** — переменные это только "
+                "модель и режим `thinking` "
+                "(`extra_body={'thinking': {'type': 'enabled'|'disabled'}}`).\n\n"
+                "Для каждого вызова показываются: время ответа, токены "
+                "(`prompt`/`completion`/`total`) и оценочная стоимость в "
+                "долларах по off-peak ценам DeepSeek V4 "
+                "(`deepseek-v4-flash`: $0.22/$0.66, `deepseek-v4-pro`: "
+                "$0.66/$1.98 за 1M input/output токенов; в пиковые часы "
+                "ставки ×2 — это ориентир, а не точная выписка). "
+                "**Зелёным шрифтом** выделено наименьшее значение по каждой "
+                "из трёх метрик **независимо** (время, `total_tokens`, "
+                "стоимость) — победители по разным метрикам могут быть "
+                "разными ячейками.\n\n"
+                "Каждый вызов логируется в stdout (смотрите терминал, где "
+                "запущен `app.py`): модель, `thinking on/off`, "
+                "`finish_reason`, время, токены, стоимость, длина и текст "
+                "ответа.\n\n"
+                "Сравнение **качества** ответов кодом **не делается** — это "
+                "ручное суждение автора по бумажной книге правил "
+                "(см. §7 спецификации)."
+            )
+
+            with gr.Row():
+                question_input_5 = gr.Textbox(
+                    label="Вопрос по правилам",
+                    value=(
+                        "Объясни как работает Отравление в Too Many Bones "
+                        "простыми словами, как будто объясняешь новому "
+                        "игроку, и приведи короткий пример игровой ситуации, "
+                        "описывающей это правило."
+                    ),
+                    lines=3,
+                    scale=4,
+                )
+                run_btn_5 = gr.Button(
+                    "Запустить 4 вызова", variant="primary", scale=1
+                )
+
+            gr.Examples(
+                examples=[
+                    [
+                        "Объясни как работает Отравление в Too Many Bones "
+                        "простыми словами, как будто объясняешь новому "
+                        "игроку, и приведи короткий пример игровой ситуации, "
+                        "описывающей это правило."
+                    ],
+                ],
+                inputs=[question_input_5],
+                label="Примеры вопросов (нажмите, чтобы подставить)",
+            )
+
+            # Раскладка 2×2: строки — режим `thinking` (off/on), колонки —
+            # модель (flash/pro). Это прямой аналог таблицы из §2 спецификации.
+            #
+            # В каждой ячейке два компонента: `Markdown` для метрик
+            # (короткий блок, сюда попадает зелёная подсветка минимумов)
+            # и `Textbox` для текста ответа. Значение по умолчанию для
+            # `Markdown` — тот же `_metric_md(label, cell=None)`, что
+            # используется внутри `run_day5`: подписи и пустые значения
+            # метрик видны сразу, даже до первого клика.
+            # `max_lines=lines` фиксирует высоту Textbox: без него он
+            # растягивается под самый длинный ответ (у `thinking=on`
+            # ответы обычно короче promptа, но при пустом `content` и
+            # длинном `reasoning` бывают многократные расхождения в длине),
+            # и 4 ячейки получались разной высоты. С `max_lines` высота
+            # всех 4 ячеек одинаковая, лишний текст скроллится внутри.
+            with gr.Row():
+                with gr.Column():
+                    out5_metric_1 = gr.Markdown(
+                        value=_metric_md(DAY5_MATRIX[0][2], cell=None)
+                    )
+                    out5_answer_1 = gr.Textbox(
+                        label="Ответ",
+                        lines=12,
+                        max_lines=12,
+                        placeholder="⏳ Ожидание...",
+                        buttons=["copy"],
+                    )
+                with gr.Column():
+                    out5_metric_2 = gr.Markdown(
+                        value=_metric_md(DAY5_MATRIX[1][2], cell=None)
+                    )
+                    out5_answer_2 = gr.Textbox(
+                        label="Ответ",
+                        lines=12,
+                        max_lines=12,
+                        placeholder="⏳ Ожидание...",
+                        buttons=["copy"],
+                    )
+            with gr.Row():
+                with gr.Column():
+                    out5_metric_3 = gr.Markdown(
+                        value=_metric_md(DAY5_MATRIX[2][2], cell=None)
+                    )
+                    out5_answer_3 = gr.Textbox(
+                        label="Ответ",
+                        lines=12,
+                        max_lines=12,
+                        placeholder="⏳ Ожидание...",
+                        buttons=["copy"],
+                    )
+                with gr.Column():
+                    out5_metric_4 = gr.Markdown(
+                        value=_metric_md(DAY5_MATRIX[3][2], cell=None)
+                    )
+                    out5_answer_4 = gr.Textbox(
+                        label="Ответ",
+                        lines=12,
+                        max_lines=12,
+                        placeholder="⏳ Ожидание...",
+                        buttons=["copy"],
+                    )
+
+            # Порядок: metric_1, answer_1, metric_2, answer_2, ... —
+            # такой же, как `run_day5` собирает результат.
+            day5_outputs = [
+                out5_metric_1, out5_answer_1,
+                out5_metric_2, out5_answer_2,
+                out5_metric_3, out5_answer_3,
+                out5_metric_4, out5_answer_4,
+            ]
+            # show_progress не переопределяется — остаётся дефолтный
+            # "full", тот же, что и у дня 2. Важно, что `run_day5` — не
+            # генератор (см. её docstring): Gradio показывает нормальный
+            # оверлей ожидания (спиннер по центру `Markdown`, таймер в
+            # углу `Textbox`) только для функций с одним `return`; у
+            # генератора вместо этого просто тонкая рамка вокруг
+            # компонента без спиннера и таймера.
+            run_btn_5.click(
+                run_day5,
+                inputs=[question_input_5],
+                outputs=day5_outputs,
+            )
+            question_input_5.submit(
+                run_day5,
+                inputs=[question_input_5],
+                outputs=day5_outputs,
             )
 
 
