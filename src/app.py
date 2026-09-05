@@ -21,7 +21,14 @@ logging.basicConfig(
 logger = logging.getLogger("toomanyrules")
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+# V4-Flash, non-thinking mode
 DEEPSEEK_MODEL = "deepseek-chat"
+# V4-Flash, thinking mode
+#DEEPSEEK_MODEL = "deepseek-reasoner"
+# The cheap everyday default
+#DEEPSEEK_MODEL = "deepseek-v4-flash"
+# Hardest reasoning and coding
+#DEEPSEEK_MODEL = "deepseek-v4-pro"
 
 # Системный промпт дня 1 — оставлен без изменений. Используется и в дне 1,
 # и в варианте A дня 2 (по спецификации дня 2: «тот же системный промпт, что
@@ -114,6 +121,13 @@ SYSTEM_PROMPT_CONSILIUM = SYSTEM_PROMPT + """
 В конце дай итоговый вывод: согласованный ответ или явное указание,
 что вопрос требует уточнения у официального FAQ.
 """
+
+# День 4: сравнение эффекта `temperature` на одной и той же задаче.
+# Задание требует именно эти три значения (0 / 0.7 / 1.2), по 3 повтора
+# на каждое — итого 9 вызовов API. Повторы нужны, чтобы увидеть не только
+# содержание ответа, но и разброс внутри одной температуры (разнообразие).
+DAY4_TEMPERATURES = [0.0, 0.7, 1.2]
+DAY4_REPEATS_PER_TEMPERATURE = 3
 
 
 def respond(message, history):
@@ -371,6 +385,62 @@ def run_day3(question: str):
     return out1, out2, out3_prompt, out3, out4
 
 
+def run_day4(question: str):
+    """День 4: один и тот же вопрос прогоняется через DeepSeek API при трёх
+    значениях `temperature` (`0.0` / `0.7` / `1.2`), по 3 повтора на каждое —
+    итого 9 вызовов. Системный промпт и вопрос одинаковы во всех вызовах;
+    `max_tokens`/`stop` из дня 2 не задаются, чтобы сравнивать эффект чистой
+    температуры.
+
+    Возвращает кортеж из 9 строк: индексы 0..2 — повторы при t=0.0, 3..5 —
+    при t=0.7, 6..8 — при t=1.2. Каждый вызов логируется в stdout
+    (temperature, номер повтора, finish_reason, длина и текст ответа) — тот
+    же паттерн, что в днях 2-3. Никаких автоматических метрик или подсветки
+    «лучшего» варианта — сравнение делает автор вручную (см. §7 спецификации).
+    """
+    logger.info("Day 4: question=%r", question)
+
+    # Сюда сложим 9 ответов в порядке «по температурам, внутри — по повтору»:
+    # 0..2 — t=0.0, 3..5 — t=0.7, 6..8 — t=1.2. Этот же порядок отдаём в UI
+    # для раскладки «3 колонки по температурам × 3 строки по повторам».
+    results: list[str] = [""] * (len(DAY4_TEMPERATURES) * DAY4_REPEATS_PER_TEMPERATURE)
+
+    for t_idx, temperature in enumerate(DAY4_TEMPERATURES):
+        for repeat in range(1, DAY4_REPEATS_PER_TEMPERATURE + 1):
+            slot = t_idx * DAY4_REPEATS_PER_TEMPERATURE + (repeat - 1)
+            label = f"temperature={temperature}, повтор {repeat}"
+            try:
+                client = _get_client()
+                r = client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": question},
+                    ],
+                    temperature=temperature,
+                )
+                text = r.choices[0].message.content or ""
+                finish_reason = r.choices[0].finish_reason
+                logger.info(
+                    "Day 4 %s finish_reason=%s, %d chars: %s",
+                    label, finish_reason, len(text), text,
+                )
+                # Подпись нужна и в UI, чтобы при сопоставлении 9 блоков
+                # было ясно видно, какой именно вызов перед нами — код
+                # подсветку «лучшего» не делает, но подписать каждый
+                # ответ по его `temperature`/повтору обязан (см. §4 спецификации).
+                results[slot] = (
+                    f"**temperature={temperature}, повтор {repeat}** "
+                    f"(finish_reason={finish_reason})\n\n"
+                    f"{text}"
+                )
+            except Exception as exc:
+                results[slot] = f"❌ **Ошибка API ({label}):** {exc}"
+                logger.exception("Day 4 %s failed", label)
+
+    return tuple(results)
+
+
 # --- Gradio-интерфейс: все дни живут в одном приложении через табы ---
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
@@ -587,6 +657,114 @@ with gr.Blocks(title="TooManyRules") as demo:
                     out_method3_prompt, out_method3,
                     out_method4,
                 ],
+            )
+
+        # День 4: один вопрос → 9 ответов (3 температуры × 3 повтора) для
+        # визуального сопоставления эффекта `temperature`. Подписи
+        # температуры и номера повтора выводятся внутри каждого блока,
+        # чтобы при просмотре 9 ответов рядом сразу было видно, какой
+        # именно вызов перед нами. Сравнение «какая температура лучше»
+        # код не делает — это ручное суждение автора.
+        with gr.Tab("День 4 — температура"):
+            gr.Markdown(
+                "Один и тот же вопрос по правилам прогоняется через DeepSeek "
+                "API **девять раз**: 3 значения `temperature` "
+                f"(`{DAY4_TEMPERATURES[0]}`, `{DAY4_TEMPERATURES[1]}`, "
+                f"`{DAY4_TEMPERATURES[2]}`) × {DAY4_REPEATS_PER_TEMPERATURE} "
+                "повтора. Системный промпт и вопрос одинаковы во всех 9 "
+                "вызовах — единственная переменная это `temperature`. "
+                "Повторы нужны, чтобы было видно разнообразие ответов при "
+                "одной и той же температуре, а не только их содержание.\n\n"
+                "Каждый вызов логируется в stdout (смотрите терминал, где "
+                "запущен `app.py`): `temperature`, номер повтора, "
+                "`finish_reason`, длина и текст ответа.\n\n"
+                "Какая температура лучше подходит для каких задач — ручное "
+                "суждение автора; код подсветку «лучшего» варианта **не "
+                "делает** (см. §7 спецификации)."
+            )
+
+            with gr.Row():
+                question_input_4 = gr.Textbox(
+                    label="Вопрос по правилам",
+                    value=(
+                        "Объясни как работает Отравление в Too Many Bones "
+                        "простыми словами, как будто объясняешь новому "
+                        "игроку, и приведи короткий пример игровой ситуации, "
+                        "описывающей это правило."
+                    ),
+                    lines=3,
+                    scale=4,
+                )
+                run_btn_4 = gr.Button(
+                    "Запустить 9 вызовов", variant="primary", scale=1
+                )
+
+            gr.Examples(
+                examples=[
+                    [
+                        "Объясни как работает Отравление в Too Many Bones "
+                        "простыми словами, как будто объясняешь новому "
+                        "игроку, и приведи короткий пример игровой ситуации, "
+                        "описывающей это правило."
+                    ],
+                ],
+                inputs=[question_input_4],
+                label="Примеры вопросов (нажмите, чтобы подставить)",
+            )
+
+            # 3 колонки — по одной на каждое значение `temperature`,
+            # в каждой 3 текстовых блока с подписанным номером повтора.
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown(f"### temperature = {DAY4_TEMPERATURES[0]}")
+                    out_t0_r1 = gr.Textbox(
+                        label="Повтор 1", lines=10, buttons=["copy"]
+                    )
+                    out_t0_r2 = gr.Textbox(
+                        label="Повтор 2", lines=10, buttons=["copy"]
+                    )
+                    out_t0_r3 = gr.Textbox(
+                        label="Повтор 3", lines=10, buttons=["copy"]
+                    )
+                with gr.Column():
+                    gr.Markdown(f"### temperature = {DAY4_TEMPERATURES[1]}")
+                    out_t1_r1 = gr.Textbox(
+                        label="Повтор 1", lines=10, buttons=["copy"]
+                    )
+                    out_t1_r2 = gr.Textbox(
+                        label="Повтор 2", lines=10, buttons=["copy"]
+                    )
+                    out_t1_r3 = gr.Textbox(
+                        label="Повтор 3", lines=10, buttons=["copy"]
+                    )
+                with gr.Column():
+                    gr.Markdown(f"### temperature = {DAY4_TEMPERATURES[2]}")
+                    out_t2_r1 = gr.Textbox(
+                        label="Повтор 1", lines=10, buttons=["copy"]
+                    )
+                    out_t2_r2 = gr.Textbox(
+                        label="Повтор 2", lines=10, buttons=["copy"]
+                    )
+                    out_t2_r3 = gr.Textbox(
+                        label="Повтор 3", lines=10, buttons=["copy"]
+                    )
+
+            # Порядок выходов в `run_day4` — 0..8, по температурам, внутри
+            # по повтору (см. реализацию `run_day4`).
+            day4_outputs = [
+                out_t0_r1, out_t0_r2, out_t0_r3,
+                out_t1_r1, out_t1_r2, out_t1_r3,
+                out_t2_r1, out_t2_r2, out_t2_r3,
+            ]
+            run_btn_4.click(
+                run_day4,
+                inputs=[question_input_4],
+                outputs=day4_outputs,
+            )
+            question_input_4.submit(
+                run_day4,
+                inputs=[question_input_4],
+                outputs=day4_outputs,
             )
 
 
