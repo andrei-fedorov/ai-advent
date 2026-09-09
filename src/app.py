@@ -1,9 +1,11 @@
-# TooManyRules — приложение недели 2 (день 7): чат через агента + дебаг-панель.
+# TooManyRules — приложение недели 2 (день 8): чат через агента + дебаг-панель.
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
 # `agent.Agent`, конфиги агентов проекта лежат в `presets.py`, история
-# диалогов — в `storage.py`.
+# диалогов — в `storage.py`, счёт токенов — в `tokens.py` (оттуда берутся
+# только чистые функции: генератор заполнителя и оценка его размера, всё
+# остальное панель получает от агента готовым).
 #
 # Интерфейс — это вид на состояние агента: содержимое чата на каждом шаге
 # рендерится из `agent.history`, своей копии переписки Gradio не ведёт.
@@ -25,10 +27,12 @@
 import logging
 
 import gradio as gr
+import pandas as pd
 
 from agent import Agent, agent_by_number, agents, delete_agent, process_stats
 from presets import DEFAULT_PRESET, PRESET_NOTES, PRESETS
 from storage import JsonHistoryStore, StorageError, display_path
+from tokens import FILLER_MAX_TOKENS, ContextUsage, estimate_tokens, filler_text
 
 # Логирование настраивает точка входа — тот же формат, что на неделе 1.
 logging.basicConfig(
@@ -56,6 +60,20 @@ def _fmt_cost(cost_usd: float | None) -> str:
 
 def _fmt_tokens(value: int | None) -> str:
     return "н/д" if value is None else str(value)
+
+
+def _fmt_int(value: int | None) -> str:
+    """Число с разделителями разрядов: в бюджете контекста числа семизначные,
+    и без пробелов их не прочитать."""
+    return "н/д" if value is None else f"{value:,}".replace(",", " ")
+
+
+def _fmt_delta(estimated: int | None, fact: int | None) -> str:
+    """Расхождение оценки с фактом в процентах, со знаком. Нигде не хранится —
+    считается из двух чисел, которые уже есть (агент делает так же в логе)."""
+    if estimated is None or not fact:
+        return "н/д"
+    return f"{(estimated - fact) / fact * 100:+.1f}%"
 
 
 def _agent_title(agent: Agent) -> str:
@@ -106,15 +124,224 @@ def _metrics_md(last_call: dict | None) -> str:
             "Стек сообщений при ошибке не меняется — вопрос можно отправить "
             "повторно, история не задвоится."
         )
-    return (
-        f"{header}\n\n"
-        f"- **⏱ Время ответа:** {last_call['elapsed']:.2f} s\n"
+    request = last_call.get("request_tokens") or {}
+    estimated_prompt = request.get("total")
+    lines = [
+        header,
+        "",
+        f"- **⏱ Время ответа:** {last_call['elapsed']:.2f} s",
         f"- **🔢 Токены:** prompt={_fmt_tokens(last_call['prompt_tokens'])} / "
         f"completion={_fmt_tokens(last_call['completion_tokens'])} / "
-        f"total={_fmt_tokens(last_call['total_tokens'])}\n"
-        f"- **💲 Стоимость:** {_fmt_cost(last_call['cost_usd'])}\n"
-        f"- **finish_reason:** `{last_call['finish_reason']}`\n"
-        f"- **Модель:** `{last_call['model']}`"
+        f"total={_fmt_tokens(last_call['total_tokens'])}",
+        # Две строки дня 8: оценка и факт стоят рядом по обе стороны вызова —
+        # до запроса точного числа не бывает, и видно, насколько мы промахнулись.
+        f"- **📏 Запрос:** оценка ≈{_fmt_int(estimated_prompt)} против факта "
+        f"{_fmt_int(last_call['prompt_tokens'])} "
+        f"({_fmt_delta(estimated_prompt, last_call['prompt_tokens'])})",
+        f"- **✍️ Ответ модели:** {_fmt_int(last_call['completion_tokens'])} "
+        f"токенов, оценка по тексту "
+        f"≈{_fmt_int(last_call['estimated_completion_tokens'])} "
+        f"({_fmt_delta(last_call['estimated_completion_tokens'], last_call['completion_tokens'])})",
+    ]
+    # Кэш промпта показывается, только если API его вернул. Стоимость по нему
+    # не пересчитывается — `PRICING_PER_M_TOKENS` остаётся off-peak-оценкой.
+    if last_call["prompt_cache_hit_tokens"] is not None:
+        lines.append(
+            f"- **♻️ Кэш промпта:** из кэша "
+            f"{_fmt_int(last_call['prompt_cache_hit_tokens'])} / новых "
+            f"{_fmt_int(last_call['prompt_cache_miss_tokens'])} — оценка "
+            f"стоимости кэш не учитывает, поэтому счёт растёт медленнее неё"
+        )
+    lines += [
+        f"- **💲 Стоимость:** {_fmt_cost(last_call['cost_usd'])}",
+        f"- **finish_reason:** `{last_call['finish_reason']}`",
+        f"- **Модель:** `{last_call['model']}`",
+    ]
+    return "\n".join(lines)
+
+
+_LEVEL_MARKERS = {"ok": "🟢", "warn": "🟡", "danger": "🔴", "over": "🔴"}
+
+_LEVEL_WARNINGS = {
+    "warn": (
+        "⚠️ **Занято больше 70% окна.** Каждый следующий ход тащит в модель "
+        "всю переписку целиком, так что дальше будет только быстрее."
+    ),
+    "danger": (
+        "🔴 **Занято больше 90% окна.** Ещё пара ходов — и запрос перестанет "
+        "влезать: обрезки и сжатия истории в проекте пока нет."
+    ),
+    "over": (
+        "🔴 **Оценка превышает окно модели.** Запрос всё равно будет отправлен "
+        "и, скорее всего, отклонён целиком: ответа не будет, ход не "
+        "состоится, стек сообщений и файл сессии останутся как есть. "
+        "Предохранителя здесь нет намеренно — день 8 показывает поломку, "
+        "чинят её дни 9-10."
+    ),
+}
+
+
+def _bar(usage: ContextUsage) -> str:
+    """Текстовая полоса занятости с маркером уровня. Надёжнее любого виджета
+    и хорошо читается на видео."""
+    marker = _LEVEL_MARKERS.get(usage.level, "⚪")
+    if usage.ratio is None:
+        return f"{marker} `░░░░░░░░░░` н/д"
+    filled = max(0, min(round(usage.ratio * 10), 10))
+    return (
+        f"{marker} `{'█' * filled}{'░' * (10 - filled)}` "
+        f"{usage.ratio * 100:.1f}%"
+    )
+
+
+def _heaviest_message(usage: ContextUsage, messages: list[dict]) -> str:
+    """Самое тяжёлое сообщение стека — по `per_message`, который идёт в том же
+    порядке, что история."""
+    per_message = usage.request.per_message
+    if not per_message:
+        return "- **Самое тяжёлое сообщение стека:** стек пуст"
+    index = max(range(len(per_message)), key=lambda i: per_message[i])
+    role = "н/д"
+    if index < len(messages) and isinstance(messages[index], dict):
+        role = messages[index].get("role", "н/д")
+    return (
+        f"- **Самое тяжёлое сообщение стека:** #{index} ({role}), "
+        f"≈{_fmt_int(per_message[index])} токенов"
+    )
+
+
+def _context_md(
+    usage: ContextUsage,
+    messages: list[dict],
+    calibration: float | None,
+    calibration_calls: int,
+    question: str,
+) -> str:
+    """Блок «Бюджет контекста»: сколько уйдёт в модель, если отправить сейчас.
+
+    Стоит сразу под метриками последнего вызова — это про тот же запрос,
+    только с другой стороны: там факт после вызова, здесь оценка до него.
+    """
+    request = usage.request
+    lines = [
+        "### Бюджет контекста",
+        "",
+        f"- **Модель:** `{usage.model}` · окно "
+        + (
+            "**н/д** (модели нет в таблице контекстных окон)"
+            if usage.limit is None
+            else f"{_fmt_int(usage.limit)} токенов"
+        )
+        + f", резерв под ответ {_fmt_int(usage.answer_reserve)}",
+        f"- **В запросе:** система {_fmt_int(request.system)} + история "
+        f"{_fmt_int(request.history)} ({len(request.per_message)} сообщ.) + "
+        f"вопрос {_fmt_int(request.question)} + служебные "
+        f"{_fmt_int(request.overhead)} ≈ **{_fmt_int(request.total)}**",
+    ]
+    if question:
+        lines.append(
+            f"- **В поле ввода:** ≈{_fmt_int(request.question)} токенов — "
+            f"итог и полоса ниже посчитаны вместе с ними"
+        )
+    if usage.limit is None:
+        lines.append(
+            f"- **Занято:** ≈{_fmt_int(usage.used)} токенов, от какой доли "
+            f"окна — неизвестно: процентов и предупреждений здесь не будет"
+        )
+    else:
+        # Отрицательный остаток — это «не влезли», и написать так честнее,
+        # чем показывать свободное место со знаком минус.
+        tail = (
+            f"свободно ≈{_fmt_int(usage.free)}"
+            if usage.free >= 0
+            else f"**не хватает ≈{_fmt_int(-usage.free)}**"
+        )
+        lines.append(
+            f"- **Занято:** ≈{_fmt_int(usage.used)} из "
+            f"{_fmt_int(usage.available)} доступных · {tail}"
+        )
+    lines.append(f"- {_bar(usage)}")
+    if calibration is None:
+        lines.append(
+            f"- **Калибровка:** оценка {_fmt_int(usage.estimated)} показана "
+            f"сырой — успешных вызовов с `usage` у этого агента ещё не было"
+        )
+    else:
+        lines.append(
+            f"- **Калибровка:** оценка {_fmt_int(usage.estimated)} → "
+            f"{_fmt_int(usage.used)} (×{calibration:.3f} по "
+            f"{calibration_calls} вызовам)"
+        )
+    lines.append(_heaviest_message(usage, messages))
+    warning = _LEVEL_WARNINGS.get(usage.level)
+    if warning:
+        lines += ["", warning]
+    lines += [
+        "",
+        "_До запроса это **оценка**, а не факт: точное число знает только "
+        "токенизатор модели, и приходит оно в `usage` вместе с ответом. "
+        "Без нового вопроса показан бюджет стека — нижняя граница следующего "
+        "запроса; пока вы набираете текст, панель не пересчитывается._",
+    ]
+    return "\n".join(lines)
+
+
+# --- «Рост по ходам»: журнал ходов агента в графики и таблицу -------------
+# Данные собираются из `agent.turns` через pandas — он уже стоит в проекте как
+# зависимость Gradio, новых строк в requirements.txt день 8 не добавляет.
+# Пустой журнал даёт пустой DataFrame с теми же колонками, а не None: графики
+# и таблица должны рисоваться и до первого хода.
+
+def _tokens_frame(turns: list[dict]) -> pd.DataFrame:
+    """«Длинный» формат для графика: строка на каждую метрику каждого хода.
+    Главный кадр дня — `prompt` растёт от хода к ходу, хотя вопросы одинаково
+    короткие."""
+    rows = [
+        {"ход": turn["turn"], "метрика": metric, "токены": turn[key]}
+        for turn in turns
+        for metric, key in (("prompt", "prompt_tokens"),
+                            ("completion", "completion_tokens"))
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=["ход", "метрика", "токены"],
+    ).astype({"ход": "int64", "метрика": "object", "токены": "int64"})
+
+
+def _cost_frame(turns: list[dict]) -> pd.DataFrame:
+    """Накопительная стоимость: одна линия, которая гнётся вверх."""
+    rows = [
+        {"ход": turn["turn"], "потрачено, $": turn["cumulative_cost_usd"]}
+        for turn in turns
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=["ход", "потрачено, $"],
+    ).astype({"ход": "int64", "потрачено, $": "float64"})
+
+
+def _turns_table(turns: list[dict]) -> pd.DataFrame:
+    """Полный ряд журнала: то же самое, что на графиках, но числами."""
+    rows = [
+        {
+            "ход": turn["turn"],
+            "стек до хода": turn["history_before"],
+            "оценка": turn["estimated_prompt_tokens"],
+            "prompt": turn["prompt_tokens"],
+            "completion": turn["completion_tokens"],
+            "total": turn["total_tokens"],
+            "оценка/факт": _fmt_delta(
+                turn["estimated_prompt_tokens"], turn["prompt_tokens"]
+            ),
+            "стоимость": _fmt_cost(turn["cost_usd"]),
+            "накопительно": _fmt_cost(turn["cumulative_cost_usd"]),
+        }
+        for turn in turns
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=["ход", "стек до хода", "оценка", "prompt", "completion",
+                 "total", "оценка/факт", "стоимость", "накопительно"],
     )
 
 
@@ -175,13 +402,19 @@ def _storage_md(state: dict, session_file: dict | None) -> str:
     return "\n".join(lines)
 
 
-def _view(agent: Agent, status: str) -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 13 значений,
+def _view(agent: Agent, status: str, question: str = "") -> tuple:
+    """Полный вид на состояние агента — фиксированный кортеж из 17 значений,
     позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
     Значения обоих выпадающих списков — тоже часть вида: иначе после
     переключения агента панель показывала бы одного, а списки — другого.
+
+    `question` передаёт только обработчик кнопки «Набить контекст» — это
+    единственный случай, когда интерфейс сам знает, что лежит в поле ввода.
+    Тогда бюджет считается вместе с этим текстом, и панель краснеет **до**
+    нажатия «Отправить». Остальные обработчики зовут `_view()` как раньше, и
+    бюджет показывается для стека без нового вопроса.
     """
     state = agent.debug_state()
     last_call = state["last_call"]
@@ -221,6 +454,19 @@ def _view(agent: Agent, status: str) -> tuple:
             value=session_file,
             label=f"Файл сессии {agent.session_id} на диске",
         ),
+        # Значения дня 8 — в конце кортежа, как и ключи в `debug_state()`.
+        # 14. бюджет контекста: оценка того, что уйдёт в модель
+        _context_md(
+            agent.context_usage(question),
+            messages,
+            state["calibration"],
+            state["totals"]["calibration_calls"],
+            question,
+        ),
+        # 15-17. рост по ходам: два графика и таблица из журнала агента
+        gr.update(value=_tokens_frame(state["turns"])),
+        gr.update(value=_cost_frame(state["turns"])),
+        gr.update(value=_turns_table(state["turns"])),
     )
 
 
@@ -449,6 +695,56 @@ def on_send(agent: Agent | None, message: str, preset_name: str):
     return (agent, message_update, *_view(agent, status))
 
 
+def on_fill_context(agent: Agent | None, thousands: float | None, preset_name: str):
+    """«Набить контекст» — положить в поле вопроса текст-заполнитель нужного
+    размера. Ничего не отправляет: отправляет человек обычной кнопкой
+    «Отправить», и на видео видно, что это такой же запрос, как любой другой,
+    а не спецрежим.
+
+    Настоящий диалог до переполнения окна не набрать (в окне модели больше
+    миллиона токенов), а подставлять фальшивый лимит нечестно: тогда ломался
+    бы наш собственный код, а не API.
+    """
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    requested = int(thousands or 0) * 1000
+    filler = filler_text(requested)
+    if not filler:
+        return (
+            agent,
+            gr.update(),
+            *_view(
+                agent,
+                "Размер заполнителя должен быть больше нуля — "
+                "поле ввода не тронуто.",
+            ),
+        )
+
+    estimated = estimate_tokens(filler)
+    usage = agent.context_usage(filler)
+    clamped = (
+        f" (запрошено {_fmt_int(requested)}, обрезано до предела "
+        f"{_fmt_int(FILLER_MAX_TOKENS)})"
+        if requested > FILLER_MAX_TOKENS
+        else ""
+    )
+    if usage.limit is None:
+        budget = f"вместе со стеком это ≈{_fmt_int(usage.used)} токенов (лимит модели н/д)"
+    else:
+        budget = (
+            f"вместе со стеком это ≈{_fmt_int(usage.used)} из "
+            f"{_fmt_int(usage.available)} доступных "
+            f"({usage.ratio * 100:.1f}%)"
+        )
+    status = (
+        f"В поле положен заполнитель ≈{_fmt_int(estimated)} токенов{clamped}; "
+        f"{budget}. Отправлять — обычной кнопкой «Отправить»."
+    )
+    logger.info("заполнитель: %s токенов, %s символов", estimated, len(filler))
+    return (agent, filler, *_view(agent, status, question=filler))
+
+
 def on_reset(agent: Agent | None, preset_name: str):
     """«Сбросить диалог» очищает стек сообщений агента. Тот же вызов удаляет
     и файл сессии — следствие правила «пустой список сообщений удаляет файл»:
@@ -497,7 +793,16 @@ with gr.Blocks(title="TooManyRules") as demo:
         "История диалога лежит на диске (`src/data/sessions/sNNN.json`), по "
         "файлу на сессию: после перезапуска приложения агенты поднимаются из "
         "файлов сами, и эта страница показывает тот же диалог — нажимать "
-        "ничего не нужно. "
+        "ничего не нужно.\n\n"
+        "С дня 8 агент считает токены **до** запроса, а не только после: в "
+        "панели видно, из чего складывается запрос (система + история + "
+        "вопрос), сколько это от контекстного окна модели и как токены со "
+        "стоимостью растут по ходам. Оценка до запроса и факт из `usage` "
+        "стоят рядом — точное число знает только токенизатор модели, а мы "
+        "калибруем эвристику по собственному трафику. Кнопка «Набить "
+        "контекст» доводит запрос до переполнения за один клик: он всё равно "
+        "отправляется и получает отказ целиком — обрезка и сжатие истории "
+        "это дни 9-10.\n\n"
         "Дни 1-5 (вкладки недели 1) заморожены в `app_week1.py`, "
         "запуск — `./run.sh week1`."
     )
@@ -577,8 +882,54 @@ with gr.Blocks(title="TooManyRules") as demo:
                 height=220,
             )
             metrics_md = gr.Markdown(_metrics_md(None))
+            # Бюджет контекста стоит сразу под метриками последнего вызова:
+            # там факт после запроса, здесь оценка до него — один и тот же
+            # запрос с двух сторон.
+            context_md = gr.Markdown("")
+            with gr.Row():
+                filler_size = gr.Number(
+                    value=8,
+                    label="Заполнитель, тыс. токенов",
+                    precision=0,
+                    minimum=0,
+                    scale=1,
+                )
+                fill_btn = gr.Button("Набить контекст", scale=1)
+            gr.Markdown(
+                "Кнопка кладёт текст-заполнитель в поле вопроса и ничего не "
+                "отправляет. Заполнитель, который **прошёл** в модель, "
+                "остаётся в истории и дорожает с каждым следующим ходом — "
+                "после эксперимента диалог сбрасывается кнопкой «Сбросить "
+                f"диалог». Больше {FILLER_MAX_TOKENS / 1_000_000:.1f} млн "
+                "токенов не набирается: этого уже хватает, чтобы вылезти за "
+                "окно модели."
+            )
             totals_md = gr.Markdown("")
             process_md = gr.Markdown(_process_md(process_stats()))
+            # «Рост по ходам» — под счётчиками процесса: это про накопление,
+            # а не про один вызов.
+            gr.Markdown("### Рост по ходам")
+            tokens_plot = gr.LinePlot(
+                value=_tokens_frame([]),
+                x="ход",
+                y="токены",
+                color="метрика",
+                title="Токены по ходам",
+                height=220,
+            )
+            cost_plot = gr.LinePlot(
+                value=_cost_frame([]),
+                x="ход",
+                y="потрачено, $",
+                title="Стоимость накопительно",
+                height=220,
+            )
+            turns_table = gr.Dataframe(
+                value=_turns_table([]),
+                label="Ходы агента (журнал живёт в процессе и на диск не едет)",
+                max_height=260,
+                wrap=True,
+            )
             # Аккордеон появляется только тогда, когда модель вернула
             # reasoning_content (пресет «Флагман + thinking»).
             with gr.Accordion(
@@ -634,6 +985,10 @@ with gr.Blocks(title="TooManyRules") as demo:
         preset_dropdown,
         storage_md,
         session_file_json,
+        context_md,
+        tokens_plot,
+        cost_plot,
+        turns_table,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
 
@@ -680,6 +1035,14 @@ with gr.Blocks(title="TooManyRules") as demo:
     reset_btn.click(
         on_reset,
         inputs=[agent_state, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # Единственный обработчик, который сам знает содержимое поля ввода и
+    # передаёт его в `_view()`: бюджет и полоса должны показать, что
+    # произойдёт при отправке, ещё до нажатия «Отправить».
+    fill_btn.click(
+        on_fill_context,
+        inputs=[agent_state, filler_size, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
 

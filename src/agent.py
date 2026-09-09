@@ -1,4 +1,4 @@
-# TooManyRules — сущность агента (день 6, неделя 2).
+# TooManyRules — сущность агента (день 6, неделя 2; день 8 — работа с токенами).
 #
 # Единственное место в проекте, где происходят вызовы LLM API. Модуль
 # намеренно ничего не знает ни про Gradio, ни про Too Many Bones: внутри
@@ -6,9 +6,11 @@
 # и стоимости, логирование и обработка ошибок. Наружу агент отдаёт результат
 # (`AgentReply`) и своё состояние для дебага (`debug_state`).
 #
-# Направление зависимостей одностороннее: app.py → presets.py → agent.py.
-# Отсюда не импортируется ничего из проекта (в том числе замороженный
-# `app_week1.py`) — см. `docs/TooManyRules — Неделя 2 архитектура.md`, §3.
+# Направление зависимостей одностороннее: app.py → presets.py → agent.py →
+# tokens.py. Из проекта здесь импортируется ровно один модуль — `tokens.py`,
+# лист графа, который сам не импортирует ничего (день 8; замороженный
+# `app_week1.py` не импортируется по-прежнему) — см.
+# `docs/TooManyRules — Неделя 2 архитектура.md`, §3, и спецификацию дня 8, §4.
 
 import logging
 import os
@@ -19,6 +21,8 @@ from typing import Protocol
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+import tokens
 
 # Ключ читается только здесь, поэтому и .env подхватывается здесь же —
 # интерфейс про API-ключи ничего не знает.
@@ -45,6 +49,19 @@ _NO_API_KEY_ERROR = (
     "Не задан DEEPSEEK_API_KEY. Положите ключ в файл src/.env строкой "
     "DEEPSEEK_API_KEY=... (ключ берётся на https://platform.deepseek.com) "
     "и перезапустите приложение."
+)
+
+# Признаки переполнения контекста в тексте ошибки API (день 8). Ищутся без
+# учёта регистра; у DeepSeek это ошибка с кодом 400 и текстом вида «This
+# model's maximum context length is 1048576 tokens. However, you requested
+# 1158576 tokens» (проверено живым вызовом 10.09.2026). Список — константа, а
+# не регулярка в коде: провайдеры формулируют по-разному, и дополнить его по
+# факту должно быть одной строкой.
+CONTEXT_OVERFLOW_MARKERS = (
+    "context length",
+    "maximum context",
+    "context_length_exceeded",
+    "too long",
 )
 
 
@@ -118,6 +135,41 @@ class AgentReply:
     reasoning: str | None              # reasoning_content, если модель его вернула
     model: str
     agent_name: str
+    # Поля дня 8 идут в конце и со значением по умолчанию: `AgentReply`
+    # создаётся по ключевым аргументам в двух местах (`ask()` и
+    # `_failed_reply()`), и порядок существующих полей не должен меняться.
+    #
+    # Оценка того, что ушло в модель, — по результату `_build_messages()`, то
+    # есть по тому же списку сообщений, который отправлен в API. Рядом с ней
+    # в панели всегда стоит факт из `usage`: до запроса точного числа не
+    # бывает, и в этом весь смысл дня.
+    request_tokens: "tokens.RequestTokens | None" = None
+    # Оценка по тексту ответа — вторая, более чистая проверка эвристики:
+    # у ответа нет служебной разметки сообщений.
+    estimated_completion_tokens: int | None = None
+    # Кэш промпта: DeepSeek возвращает их в `usage`, другие провайдеры могут
+    # не возвращать — тогда остаются `None`. Стоимость по ним сегодня не
+    # пересчитывается (спецификация дня 8, §10), но показать их честно нужно:
+    # они объясняют, почему счёт растёт медленнее нашей оценки.
+    prompt_cache_hit_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class TurnStats:
+    """Одна строка журнала ходов агента: что стоил ход и во что он обошёлся
+    накопительно. За один вызов роста токенов не видно в принципе — журнал
+    и есть та самая кривая, ради которой затевался день 8."""
+
+    turn: int                        # номер успешного хода агента, с 1
+    history_before: int              # сколько сообщений было в стеке до хода
+    estimated_prompt_tokens: int     # оценка до запроса, без калибровки
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cost_usd: float | None
+    cumulative_total_tokens: int
+    cumulative_cost_usd: float
 
 
 class HistoryStore(Protocol):
@@ -259,7 +311,18 @@ class Agent:
             "completion_tokens": 0,
             "total_tokens": 0,
             "cost_usd": 0.0,
+            # Суммы для калибровки (день 8): факт и наша оценка по одним и тем
+            # же запросам. Считаются только по вызовам, где пришёл `usage`, —
+            # у остальных сравнивать не с чем, и попасть в коэффициент они не
+            # должны. Отдельно от `prompt_tokens` выше именно поэтому.
+            "calibration_calls": 0,
+            "calibration_fact_tokens": 0,
+            "calibration_estimated_tokens": 0,
         }
+        # Журнал ходов (день 8). Ведёт себя как счётчики агента, а не как стек
+        # сообщений: `reset()` его не чистит, на диск он не едет, и после
+        # перезапуска процесса он пуст, хотя история восстановлена из файла.
+        self._turns: list[TurnStats] = []
 
         # Хранилище — необязательная зависимость: при `store=None` агент
         # работает целиком в памяти процесса (это и есть режим дня 6).
@@ -332,6 +395,49 @@ class Agent:
         и когда хранилища нет, и когда файла сессии ещё не было."""
         return self._restored_messages
 
+    @property
+    def turns(self) -> list[TurnStats]:
+        """Копия журнала ходов — как `history`, наружу список не уезжает.
+
+        Запись появляется только на успешный вызов: у неуспешного нет `usage`,
+        и точка на графике из него была бы выдумкой.
+        """
+        return list(self._turns)
+
+    @property
+    def calibration(self) -> float | None:
+        """Отношение суммы фактических `prompt_tokens` к сумме собственных
+        оценок тех же запросов за время жизни агента.
+
+        `None`, пока успешных вызовов с `usage` не было, — тогда оценка
+        показывается сырой. Дальше коэффициент применяется к оценке бюджета
+        множителем и уточняется сам с каждым ходом: у нас есть то, чего нет у
+        токенизатора, — факт по собственному трафику.
+        """
+        estimated = self._totals["calibration_estimated_tokens"]
+        if not self._totals["calibration_calls"] or estimated <= 0:
+            return None
+        return self._totals["calibration_fact_tokens"] / estimated
+
+    def context_usage(self, question: str = "") -> tokens.ContextUsage:
+        """Бюджет контекста текущего стека: сколько из окна модели уже занято.
+
+        Без аргумента считается стек как есть (системный промпт + история) —
+        это нижняя граница следующего запроса. С вопросом — то, что уйдёт в
+        модель, если отправить его прямо сейчас; так панель показывает
+        занятость до нажатия «Отправить».
+
+        Считается по результату `_build_messages()` — по тому же списку
+        сообщений, который ушёл бы в API: «посчитали» и «отправили» не должны
+        разъезжаться.
+        """
+        return tokens.context_usage(
+            self._count_messages(self._build_messages(question)),
+            model=self._config.model,
+            max_tokens=self._config.max_tokens,
+            calibration=self.calibration,
+        )
+
     def ask(self, user_message: str) -> AgentReply:
         """Один ход диалога: собрать сообщения, сходить в API, дописать пару
         «вопрос/ответ» в стек.
@@ -351,6 +457,21 @@ class Agent:
             return self._failed_reply(str(exc), elapsed=0.0)
 
         messages = self._build_messages(user_message)
+        # Счёт до запроса (день 8): считаем ровно тот список сообщений, который
+        # сейчас уйдёт в API, — и логируем бюджет до вызова, а не после.
+        request = self._count_messages(messages)
+        budget = tokens.context_usage(
+            request,
+            model=self._config.model,
+            max_tokens=self._config.max_tokens,
+            calibration=self.calibration,
+        )
+        self._log_budget(budget)
+        # Проверки «а влезет ли» здесь намеренно нет: переполненный запрос
+        # отправляется как есть. День 8 показывает поломку, чинят её дни 9-10
+        # (спецификация дня 8, §2.2) — предупреждение в логе и в панели есть,
+        # предохранителя нет.
+        history_before = len(self._messages)
 
         started = time.perf_counter()
         try:
@@ -367,8 +488,9 @@ class Agent:
         except Exception as exc:
             logger.exception("[%s] вызов API упал", self._log_name)
             return self._failed_reply(
-                f"Ошибка при обращении к DeepSeek API: {exc}",
+                _explain_api_error(exc, budget),
                 elapsed=time.perf_counter() - started,
+                request=request,
             )
         elapsed = time.perf_counter() - started
 
@@ -400,6 +522,10 @@ class Agent:
             reasoning=reasoning,
             model=self._config.model,
             agent_name=self._config.name,
+            request_tokens=request,
+            estimated_completion_tokens=tokens.estimate_tokens(text),
+            prompt_cache_hit_tokens=getattr(usage, "prompt_cache_hit_tokens", None),
+            prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
         )
 
         if self._config.keep_history:
@@ -408,14 +534,20 @@ class Agent:
             self._persist()
 
         self._record(reply)
+        self._record_turn(reply, history_before)
         logger.info(
             "[%s] model=%s thinking=%s finish_reason=%s time=%.2fs "
-            "tokens(prompt/completion/total)=%s/%s/%s cost=%s стек=%d сообщ., "
-            "%d символов: %s",
+            "tokens(prompt/completion/total)=%s/%s/%s "
+            "оценка/факт prompt=%s/%s (%s) ответ=%s/%s (%s) cost=%s "
+            "стек=%d сообщ., %d символов: %s",
             self._log_name, self._config.model,
             _thinking_label(self._config.thinking),
             reply.finish_reason, reply.elapsed,
             prompt_tokens, completion_tokens, total_tokens,
+            request.total, prompt_tokens,
+            _delta_str(request.total, prompt_tokens),
+            reply.estimated_completion_tokens, completion_tokens,
+            _delta_str(reply.estimated_completion_tokens, completion_tokens),
             _cost_str(cost_usd), len(self._messages), len(text), text,
         )
         return reply
@@ -445,6 +577,11 @@ class Agent:
             "last_call": asdict(self._last_reply) if self._last_reply else None,
             "totals": dict(self._totals),
             "process": process_stats(),
+            # Ключи дня 8 — в конце: существующие не переименовываются и не
+            # переставляются, иначе поехали бы рендеры дебаг-панели.
+            "context": asdict(self.context_usage()),
+            "turns": [asdict(turn) for turn in self._turns],
+            "calibration": self.calibration,
         }
 
     # --- Внутреннее ------------------------------------------------------
@@ -453,15 +590,52 @@ class Agent:
         """Единственное место, где собирается список сообщений для запроса:
         системный промпт из конфига + весь стек + новый вопрос.
 
-        Сюда на дне 8 встанет сжатие контекста — поэтому сборка вынесена в
-        отдельный метод, а не размазана по вызову. Сейчас никакого сжатия,
-        обрезания и лимита истории нет: в LLM уходит вся переписка целиком.
+        Сюда на днях 9-10 встанет сжатие контекста — поэтому сборка вынесена
+        в отдельный метод, а не размазана по вызову (день 8 оказался про
+        токены и из этого метода только читает). Сейчас никакого сжатия,
+        обрезания и лимита истории нет: в LLM уходит вся переписка целиком —
+        ровно то, что день 8 и меряет.
         """
         return (
             [{"role": "system", "content": self._config.system_prompt}]
             + self.history
             + [{"role": "user", "content": user_message}]
         )
+
+    def _count_messages(self, messages: list[dict]) -> tokens.RequestTokens:
+        """Разложение готового списка сообщений на систему / историю / вопрос.
+
+        Единственное место, где список сообщений превращается в оценку: и
+        `ask()`, и `context_usage()` ходят сюда, поэтому «сколько посчитали»
+        и «сколько отправили» считаются одним и тем же способом по одному и
+        тому же списку.
+        """
+        return tokens.count_request(
+            system_prompt=messages[0]["content"],
+            history=messages[1:-1],
+            question=messages[-1]["content"],
+        )
+
+    def _log_budget(self, budget: tokens.ContextUsage) -> None:
+        """Строка бюджета в лог перед вызовом API — и отдельное предупреждение,
+        когда занято больше `WARN_RATIO`: приближение к лимиту должно быть
+        видно в терминале, а не только в панели."""
+        request = budget.request
+        logger.info(
+            "[%s] бюджет: система %s + история %s + вопрос %s + служебные %s "
+            "≈ %s из %s доступных (%s); окно %s, резерв под ответ %s",
+            self._log_name,
+            _num(request.system), _num(request.history), _num(request.question),
+            _num(request.overhead), _num(budget.used),
+            _num(budget.available), _ratio_str(budget.ratio),
+            _num(budget.limit), _num(budget.answer_reserve),
+        )
+        if budget.level in ("warn", "danger", "over"):
+            logger.warning(
+                "[%s] контекст занят на %s (уровень %s): запрос всё равно уходит "
+                "в API — обрезки и сжатия в проекте нет, это дни 9-10",
+                self._log_name, _ratio_str(budget.ratio), budget.level,
+            )
 
     def _optional_params(self) -> dict:
         """Опциональные параметры запроса. То, что в конфиге `None`, в API
@@ -509,7 +683,16 @@ class Agent:
         else:
             self._store_error = None
 
-    def _failed_reply(self, error: str, elapsed: float) -> AgentReply:
+    def _failed_reply(
+        self,
+        error: str,
+        elapsed: float,
+        request: "tokens.RequestTokens | None" = None,
+    ) -> AgentReply:
+        """Неуспешный ход. `request` есть только у ошибок API: до вызова
+        запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
+        случай, когда оценку хочется видеть. У ошибки без ключа считать нечего.
+        """
         reply = AgentReply(
             ok=False,
             text="",
@@ -523,10 +706,34 @@ class Agent:
             reasoning=None,
             model=self._config.model,
             agent_name=self._config.name,
+            request_tokens=request,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
         return reply
+
+    def _record_turn(self, reply: AgentReply, history_before: int) -> None:
+        """Строка журнала ходов — только на успешный вызов и после `_record()`:
+        накопительные числа берутся из уже обновлённых счётчиков агента.
+
+        Ход без `usage` в журнал попадает (он состоялся), но в калибровку —
+        нет: сравнивать оценку не с чем.
+        """
+        self._turns.append(
+            TurnStats(
+                turn=len(self._turns) + 1,
+                history_before=history_before,
+                estimated_prompt_tokens=(
+                    reply.request_tokens.total if reply.request_tokens else 0
+                ),
+                prompt_tokens=reply.prompt_tokens or 0,
+                completion_tokens=reply.completion_tokens or 0,
+                total_tokens=reply.total_tokens or 0,
+                cost_usd=reply.cost_usd,
+                cumulative_total_tokens=self._totals["total_tokens"],
+                cumulative_cost_usd=self._totals["cost_usd"],
+            )
+        )
 
     def _record(self, reply: AgentReply) -> None:
         """Учёт вызова в счётчиках агента и процесса. Неуспешный вызов тоже
@@ -545,6 +752,13 @@ class Agent:
         self._totals["completion_tokens"] += completion_tokens
         self._totals["total_tokens"] += total_tokens
         self._totals["cost_usd"] += cost_usd
+
+        # Калибровка (день 8): в неё идут только успешные вызовы, у которых
+        # пришёл `usage`, — и только вместе с оценкой того же самого запроса.
+        if reply.ok and reply.prompt_tokens is not None and reply.request_tokens:
+            self._totals["calibration_calls"] += 1
+            self._totals["calibration_fact_tokens"] += reply.prompt_tokens
+            self._totals["calibration_estimated_tokens"] += reply.request_tokens.total
 
         _bump_process_stats(
             calls=1,
@@ -566,9 +780,53 @@ def _normalize_messages(messages: list[dict]) -> list[dict]:
     ]
 
 
+def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:
+    """Текст ошибки API для `AgentReply.error`.
+
+    Переполнение контекста узнаётся по признакам из `CONTEXT_OVERFLOW_MARKERS`
+    и объясняется по-человечески: с API это не «модель забудет начало
+    диалога», а отказ целиком — ответа нет, ход не состоялся. Не узнали —
+    отдаём текст ошибки как есть, как и на дне 6.
+    """
+    text = str(exc)
+    lowered = text.lower()
+    if not any(marker in lowered for marker in CONTEXT_OVERFLOW_MARKERS):
+        return f"Ошибка при обращении к DeepSeek API: {text}"
+    return (
+        f"Запрос не влез в контекстное окно модели и отклонён целиком. "
+        f"Мы насчитали ≈{_num(budget.used)} токенов "
+        f"(сырая оценка {_num(budget.estimated)}) при окне модели "
+        f"{_num(budget.limit)} и резерве {_num(budget.answer_reserve)} под "
+        f"ответ — доступно было {_num(budget.available)}. "
+        f"Ответа нет: превышенный контекст означает отказ, а не забывание "
+        f"начала диалога. Стек сообщений не изменился, файл сессии не тронут — "
+        f"вопрос можно задать заново, но сначала диалог придётся сбросить: "
+        f"обрезкой и сжатием истории займутся дни 9-10. "
+        f"Текст ошибки API: {text}"
+    )
+
+
 def _thinking_label(thinking: bool) -> str:
     return "on" if thinking else "off"
 
 
 def _cost_str(cost_usd: float | None) -> str:
     return "н/д" if cost_usd is None else f"${cost_usd:.6f}"
+
+
+def _num(value: int | None) -> str:
+    """Число с разделителями разрядов: строку бюджета в логе читает человек,
+    а числа там семизначные."""
+    return "н/д" if value is None else f"{value:,}".replace(",", " ")
+
+
+def _ratio_str(ratio: float | None) -> str:
+    return "н/д" if ratio is None else f"{ratio * 100:.1f}%"
+
+
+def _delta_str(estimated: int | None, fact: int | None) -> str:
+    """Расхождение оценки с фактом в процентах, со знаком. Само расхождение
+    нигде не хранится — это производная от двух чисел, которые уже есть."""
+    if estimated is None or not fact:
+        return "н/д"
+    return f"{(estimated - fact) / fact * 100:+.1f}%"
