@@ -121,11 +121,13 @@ class AgentReply:
 
 
 class HistoryStore(Protocol):
-    """Точка подключения дня 7 (сохранение истории между запусками).
+    """Сохранение истории между запусками (реализация — `storage.py`, день 7).
 
-    На дне 6 реализаций в проекте нет: агент всегда создаётся со `store=None`
-    и живёт в памяти процесса. Протокол объявлен заранее, чтобы день 7 добавил
-    `storage.py` без переписывания агента.
+    Протокол объявлен на дне 6, когда реализаций в проекте ещё не было, —
+    чтобы день 7 подставил в эту точку `JsonHistoryStore`, не переписывая
+    агента. Сигнатуры с тех пор не менялись и меняться не должны: туда же,
+    когда появится VPS, встанет SQLite. Агент по-прежнему работает и со
+    `store=None` — тогда он живёт только в памяти процесса.
     """
 
     def load(self, session_id: str) -> list[dict]: ...
@@ -262,22 +264,45 @@ class Agent:
         # Хранилище — необязательная зависимость: при `store=None` агент
         # работает целиком в памяти процесса (это и есть режим дня 6).
         self._messages: list[dict] = []
+        self._store_error: str | None = None
+        # Запись выключается ровно в одном случае — если не удалось прочитать
+        # свою историю: агент, не прочитавший файл, не должен его затирать.
+        self._store_writable = store is not None
         if store is not None and config.keep_history:
-            self._messages = _normalize_messages(store.load(session_id))
+            try:
+                self._messages = _normalize_messages(store.load(session_id))
+            except Exception as exc:
+                # Стартуем с пустым стеком; файл остаётся на диске как есть —
+                # вдруг он ещё починится. Причина уедет в лог ниже, когда у
+                # агента появится номер, и в дебаг-панель через store_error.
+                self._store_writable = False
+                self._store_error = (
+                    f"история не загрузилась, запись выключена: {exc}"
+                )
+        # Сколько сообщений пришло из хранилища: после первого же хода
+        # `len(history)` растёт, и «сколько было восстановлено» иначе не
+        # показать.
+        self._restored_messages = len(self._messages)
 
         # Регистрация в реестре — последним шагом конструктора, когда все
         # поля уже проставлены: наружу не должен попасть недособранный агент.
         self._number = _register_agent(self)
         # Префикс логов: с несколькими агентами одного пресета одно только имя
-        # ничего не различает.
-        self._log_name = f"#{self._number} {config.name}"
+        # ничего не различает, а с дня 7 у каждого агента ещё и свой файл —
+        # поэтому в префиксе и номер, и сессия.
+        self._log_name = f"#{self._number} {config.name} · {session_id}"
         logger.info(
-            "[%s] агент создан: model=%s thinking=%s session_id=%s "
-            "история=%d сообщ., живых агентов: %d",
+            "[%s] агент создан: model=%s thinking=%s "
+            "восстановлено из хранилища=%d сообщ., живых агентов: %d",
             self._log_name, config.model, _thinking_label(config.thinking),
-            session_id, len(self._messages),
+            self._restored_messages,
             process_stats()["agents_alive"],
         )
+        # Сбой загрузки логируется здесь, а не на месте: до регистрации в
+        # реестре у агента ещё нет номера, а без номера строка в логе
+        # ничего не опознаёт.
+        if self._store_error is not None:
+            logger.warning("[%s] %s", self._log_name, self._store_error)
 
     # --- Публичный контракт ---------------------------------------------
 
@@ -300,6 +325,12 @@ class Agent:
         """Копия стека сообщений — только user/assistant, без системного
         промпта и без reasoning_content."""
         return [dict(message) for message in self._messages]
+
+    @property
+    def restored_messages(self) -> int:
+        """Сколько сообщений пришло из хранилища при создании агента. Ноль —
+        и когда хранилища нет, и когда файла сессии ещё не было."""
+        return self._restored_messages
 
     def ask(self, user_message: str) -> AgentReply:
         """Один ход диалога: собрать сообщения, сходить в API, дописать пару
@@ -404,8 +435,11 @@ class Agent:
             "number": self._number,
             "config": asdict(self._config),
             "session_id": self._session_id,
-            # На дне 6 всегда None; на дне 7 здесь будет имя класса хранилища.
+            # С дня 7 здесь имя класса хранилища (`JsonHistoryStore`); None
+            # означает агента, живущего только в памяти процесса.
             "store": type(self._store).__name__ if self._store else None,
+            "restored_messages": self._restored_messages,
+            "store_error": self._store_error,
             "history_size": len(self._messages),
             "messages": self.history,
             "last_call": asdict(self._last_reply) if self._last_reply else None,
@@ -453,10 +487,27 @@ class Agent:
         return self._client
 
     def _persist(self) -> None:
-        """Сохранение стека в хранилище, если оно передано. На дне 6 store
-        всегда None и метод ничего не делает."""
-        if self._store is not None and self._config.keep_history:
+        """Сохранение стека в хранилище, если оно передано (при `store=None`
+        метод ничего не делает).
+
+        Наружу отсюда ничего не бросается: `_persist()` вызывается изнутри
+        `ask()`, а `ask()` по контракту исключений не бросает. Ход при сбое
+        записи состоялся, ответ пользователю отдаётся как обычно, причина
+        видна в панели и в логе, а попытка повторится на следующем ходе:
+        разовый сбой диска не должен переводить агента в режим «только
+        память» навсегда.
+        """
+        if self._store is None or not self._config.keep_history:
+            return
+        if not self._store_writable:
+            return
+        try:
             self._store.save(self._session_id, self.history)
+        except Exception as exc:
+            self._store_error = f"история не сохранилась: {exc}"
+            logger.warning("[%s] %s", self._log_name, self._store_error)
+        else:
+            self._store_error = None
 
     def _failed_reply(self, error: str, elapsed: float) -> AgentReply:
         reply = AgentReply(

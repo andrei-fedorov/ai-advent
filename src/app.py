@@ -1,17 +1,20 @@
-# TooManyRules — приложение недели 2 (день 6): чат через агента + дебаг-панель.
+# TooManyRules — приложение недели 2 (день 7): чат через агента + дебаг-панель.
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
-# `agent.Agent`, конфиги агентов проекта лежат в `presets.py`.
+# `agent.Agent`, конфиги агентов проекта лежат в `presets.py`, история
+# диалогов — в `storage.py`.
 #
 # Интерфейс — это вид на состояние агента: содержимое чата на каждом шаге
 # рендерится из `agent.history`, своей копии переписки Gradio не ведёт.
-# Поэтому на дне 7, когда история начнёт приходить из файла, интерфейс
-# менять не придётся.
+# Ровно поэтому день 7 не потребовал переделки интерфейса: история приходит
+# из файла, а чат рендерится из того же `agent.history`, что и раньше.
 #
 # Агентов в процессе много: переключатель в дебаг-панели листает реестр
 # `agent.agents()`, и выбранный агент становится активным — вместе с ним
-# переключаются чат, стек сообщений, конфиг и метрики.
+# переключаются чат, стек сообщений, конфиг и метрики. С дня 7 агенты
+# переживают перезапуск: при старте процесса они поднимаются по файлам
+# сессий, и открытая страница сразу показывает диалог.
 #
 # Вкладок больше нет: дни недели 2 наращивают одну и ту же сущность, и
 # «что нового сегодня» показывает дебаг-панель. Дни 1-5 живут в
@@ -25,13 +28,24 @@ import gradio as gr
 
 from agent import Agent, agent_by_number, agents, delete_agent, process_stats
 from presets import DEFAULT_PRESET, PRESET_NOTES, PRESETS
+from storage import JsonHistoryStore, StorageError, display_path
 
 # Логирование настраивает точка входа — тот же формат, что на неделе 1.
-# Сам агент только пишет в свой logger; здесь логировать нечего.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+logger = logging.getLogger("toomanyrules.app")
+
+# Хранилище одно на процесс и общее для всех агентов: `session_id` разводит
+# их по файлам. Создаётся на модуле, а не в обработчиках, — иначе номера
+# сессий выдавали бы несколько независимых экземпляров.
+STORE = JsonHistoryStore()
+
+# Сколько агентов поднялось из файлов при старте процесса — заполняется
+# `_restore_agents()` ниже и показывается в строке статуса при открытии
+# страницы.
+RESTORED_AT_START = 0
 
 
 # --- Рендер дебаг-панели -------------------------------------------------
@@ -68,7 +82,7 @@ def _agent_choices(active: Agent) -> list[tuple[str, int]]:
         entries.insert(0, (active, " · удалён"))
     return [
         (
-            f"#{agent.number} · {agent.config.name} · "
+            f"#{agent.number} · {agent.config.name} · {agent.session_id} · "
             f"{len(agent.history)} сообщ.{suffix}",
             agent.number,
         )
@@ -129,8 +143,40 @@ def _process_md(process: dict) -> str:
     )
 
 
+def _storage_md(state: dict, session_file: dict | None) -> str:
+    """Блок «Хранилище»: то же самое, что в стеке сообщений, но с точки зрения
+    диска — чтобы «в памяти» и «на диске» были в кадре рядом."""
+    session_id = state["session_id"]
+    path = STORE.path_for(session_id)
+    lines = [
+        "### Хранилище",
+        "",
+        f"- **Класс:** `{state['store']}`",
+        f"- **Каталог данных:** `{display_path(STORE.data_dir)}`",
+        f"- **Сессия:** `{session_id}` → `{display_path(path)}`",
+        f"- **Восстановлено при создании агента:** "
+        f"{state['restored_messages']} сообщ.",
+    ]
+    if session_file is not None:
+        messages = session_file.get("messages") or []
+        lines.append(
+            f"- **В файле сейчас:** {len(messages)} сообщ., "
+            f"обновлён {session_file.get('updated_at') or 'н/д'}"
+        )
+    elif path.exists():
+        lines.append("- **Файл:** есть на диске, но не читается — см. ошибку ниже.")
+    else:
+        lines.append(
+            "- **Файла ещё нет:** он появится после первого успешного ответа "
+            "и исчезнет по «Сбросить диалог» — пустых файлов сессий не бывает."
+        )
+    if state["store_error"]:
+        lines.append(f"- ⚠️ **Хранилище:** {state['store_error']}")
+    return "\n".join(lines)
+
+
 def _view(agent: Agent, status: str) -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 11 значений,
+    """Полный вид на состояние агента — фиксированный кортеж из 13 значений,
     позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
@@ -142,6 +188,9 @@ def _view(agent: Agent, status: str) -> tuple:
     reasoning = (last_call or {}).get("reasoning") or ""
     title = _agent_title(agent)
     messages = state["messages"]
+    # Файл перечитывается на каждом событии интерфейса — поллинга и
+    # автообновления, как и на дне 6, здесь нет.
+    session_file = STORE.read_file(state["session_id"])
     return (
         # 1. чат = стек агента; номер в подписи — чей именно диалог показан
         gr.update(
@@ -165,6 +214,13 @@ def _view(agent: Agent, status: str) -> tuple:
         gr.update(choices=_agent_choices(agent), value=agent.number),
         # 11. список пресетов подтягивается к конфигу активного агента
         gr.update(value=agent.config.name),
+        # 12. блок «Хранилище»: сессия, файл, сколько восстановлено
+        _storage_md(state, session_file),
+        # 13. сырое содержимое файла сессии
+        gr.update(
+            value=session_file,
+            label=f"Файл сессии {agent.session_id} на диске",
+        ),
     )
 
 
@@ -178,8 +234,13 @@ def _new_agent(preset_name: str) -> Agent:
     агент живёт в `gr.State`, то есть у каждой открытой вкладки браузера он
     свой; глобального «текущего агента» в модуле нет. Сам экземпляр при этом
     попадает в реестр процесса и остаётся доступен в переключателе после того,
-    как вкладка перешла на другого."""
-    return Agent(PRESETS[preset_name])
+    как вкладка перешла на другого.
+
+    С дня 7 у каждого агента есть своя сессия в хранилище. Файла до первого
+    успешного ответа не появляется: `create_session` только выдаёт номер.
+    """
+    session_id = STORE.create_session(preset_name)
+    return Agent(PRESETS[preset_name], session_id=session_id, store=STORE)
 
 
 def _spawn(preset_name: str, reason: str):
@@ -192,16 +253,90 @@ def _spawn(preset_name: str, reason: str):
         gr.update(),
         *_view(
             agent,
-            f"{reason} Поднят агент {_agent_title(agent)} с пустым стеком. "
+            f"{reason} Поднят агент {_agent_title(agent)} с пустым стеком, "
+            f"сессия `{agent.session_id}` — файла до первого ответа не будет. "
             f"Агентов в реестре: {process_stats()['agents_alive']}.",
         ),
     )
 
 
+def _agents_word(count: int) -> str:
+    """«1 агент» / «3 агента» / «5 агентов»: строку статуса читает человек."""
+    if 11 <= count % 100 <= 14:
+        return "агентов"
+    match count % 10:
+        case 1:
+            return "агент"
+        case 2 | 3 | 4:
+            return "агента"
+        case _:
+            return "агентов"
+
+
+def _restore_agents() -> int:
+    """Поднимает агентов по файлам сессий — один раз при старте процесса.
+
+    Вызывается на модуле, а не в `demo.load`: `demo.load` срабатывает на
+    каждую открытую вкладку браузера и плодил бы копии одних и тех же
+    сессий. Порядок — по возрастанию `session_id` (он же порядок создания),
+    поэтому восстановленные агенты получают номера процесса #1..#N в том же
+    порядке, в каком сессии заводились.
+
+    Пресет восстанавливается по имени из `PRESETS`: на диске лежит только
+    имя, а системный промпт, модель и параметры берутся из кода — правка
+    промпта должна доезжать до восстановленных агентов. Имени нет в наборе
+    (пресет переименовали или убрали) — берём пресет по умолчанию; падать
+    из-за этого приложение не должно.
+    """
+    restored = 0
+    for info in STORE.sessions():
+        preset_name = info.preset
+        if preset_name not in PRESETS:
+            logger.warning(
+                "сессия %s: пресет «%s» в PRESETS не найден, поднимаем на «%s»",
+                info.session_id, preset_name, DEFAULT_PRESET,
+            )
+            preset_name = DEFAULT_PRESET
+        # Экземпляр никуда не присваивается намеренно: агент сам встаёт в
+        # реестр процесса, и оттуда его берут `on_load` и переключатель.
+        Agent(PRESETS[preset_name], session_id=info.session_id, store=STORE)
+        restored += 1
+    logger.info(
+        "старт процесса: восстановлено %d %s из %s",
+        restored, _agents_word(restored), display_path(STORE.data_dir),
+    )
+    return restored
+
+
 def on_load(preset_name: str):
-    """Открытие страницы: поднимаем агента для этой сессии и показываем его
-    конфиг ещё до первого вопроса."""
-    return _spawn(preset_name, "Страница открыта.")
+    """Открытие страницы.
+
+    Если в реестре уже кто-то есть (агенты восстановлены при старте процесса
+    или подняты из другой вкладки), новый агент не создаётся: активным
+    становится последний в реестре — это и есть сессия с наибольшим номером,
+    последняя заведённая. Так после перезапуска пользователь открывает
+    страницу и видит свой диалог, а не пустой чат рядом с восстановленными
+    агентами в переключателе. Остальные агенты никуда не делись и берутся
+    одним кликом в переключателе.
+    """
+    registry = agents()
+    if not registry:
+        return _spawn(preset_name, "Страница открыта.")
+
+    target = registry[-1]
+    if RESTORED_AT_START:
+        status = (
+            f"Восстановлено {RESTORED_AT_START} "
+            f"{_agents_word(RESTORED_AT_START)} из {display_path(STORE.data_dir)}. "
+            f"Активен {_agent_title(target)} · `{target.session_id}`: "
+            f"{target.restored_messages} сообщ. из файла."
+        )
+    else:
+        status = (
+            f"Страница открыта. Активен {_agent_title(target)} · "
+            f"`{target.session_id}`: в стеке {len(target.history)} сообщ."
+        )
+    return (target, gr.update(), *_view(target, status))
 
 
 def on_preset_change(preset_name: str):
@@ -216,18 +351,27 @@ def on_new_agent(preset_name: str):
 
 
 def on_delete_agent(agent: Agent | None, preset_name: str):
-    """«Удалить агент» — снять активного агента с учёта в процессе.
+    """«Удалить агент» — снять активного агента с учёта в процессе и удалить
+    его файл сессии.
 
-    Счётчики процесса при этом не откатываются: потраченные токены и деньги
-    остались потраченными, а номер удалённого не переиспользуется. Активным
-    становится последний из оставшихся; если реестр опустел — поднимаем
-    нового, экрана без активного агента не бывает.
+    Файл удаляется здесь же: иначе «удалённый» агент возвращался бы из файла
+    на следующем запуске. Счётчики процесса при этом не откатываются:
+    потраченные токены и деньги остались потраченными, а номера агента и
+    сессии не переиспользуются. Активным становится последний из оставшихся;
+    если реестр опустел — поднимаем нового, экрана без активного агента
+    не бывает.
     """
     if agent is None:  # страховка на случай сессии без сработавшего load
         return _spawn(preset_name, "Удалять было нечего.")
 
     title = _agent_title(agent)
     delete_agent(agent.number)
+    try:
+        STORE.delete_session(agent.session_id)
+    except StorageError as exc:
+        # Агента из процесса уже убрали; о том, что файл остался на диске
+        # (и агент вернётся при следующем запуске), честнее сказать вслух.
+        logger.warning("сессия %s: файл не удалён — %s", agent.session_id, exc)
     remaining = agents()
     if not remaining:
         return _spawn(
@@ -306,21 +450,33 @@ def on_send(agent: Agent | None, message: str, preset_name: str):
 
 
 def on_reset(agent: Agent | None, preset_name: str):
-    """«Сбросить диалог» очищает стек сообщений агента. Счётчики за время
-    жизни агента при этом сохраняются."""
-    if agent is None:
+    """«Сбросить диалог» очищает стек сообщений агента. Тот же вызов удаляет
+    и файл сессии — следствие правила «пустой список сообщений удаляет файл»:
+    нет контекста, нет и сессии. Счётчики за время жизни агента при этом
+    сохраняются."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
         agent = _new_agent(preset_name)
+        note = "агент поднят заново"
     else:
         agent.reset()
+        note = f"файл сессии `{agent.session_id}` удалён"
     return (
         agent,
         gr.update(),
         *_view(
             agent,
             f"Диалог агента {_agent_title(agent)} сброшен: стек сообщений пуст, "
-            "счётчики агента сохранены.",
+            f"{note}, счётчики агента сохранены.",
         ),
     )
+
+
+# --- Старт процесса ------------------------------------------------------
+# Восстановление агентов происходит здесь, при импорте модуля, — один раз на
+# процесс и до `demo.launch()`. Кнопки «восстановить» в интерфейсе нет и не
+# нужно: к моменту, когда откроется первая страница, агенты уже в реестре.
+
+RESTORED_AT_START = _restore_agents()
 
 
 # --- Интерфейс -----------------------------------------------------------
@@ -337,7 +493,11 @@ with gr.Blocks(title="TooManyRules") as demo:
         "Вся работа с LLM — внутри сущности `Agent`: конфиг, стек сообщений, "
         "вызов API, токены и стоимость. Интерфейс — только вид на её состояние: "
         "агентов в процессе живёт много, и переключатель в дебаг-панели "
-        "показывает стек любого из них. "
+        "показывает стек любого из них.\n\n"
+        "История диалога лежит на диске (`src/data/sessions/sNNN.json`), по "
+        "файлу на сессию: после перезапуска приложения агенты поднимаются из "
+        "файлов сами, и эта страница показывает тот же диалог — нажимать "
+        "ничего не нужно. "
         "Дни 1-5 (вкладки недели 1) заморожены в `app_week1.py`, "
         "запуск — `./run.sh week1`."
     )
@@ -450,6 +610,14 @@ with gr.Blocks(title="TooManyRules") as demo:
                 show_indices=True,
                 max_height=420,
             )
+            # Два блока дня 7 стоят сразу под стеком сообщений, чтобы «в
+            # памяти» и «на диске» были в кадре рядом: одна и та же переписка,
+            # показанная с двух сторон.
+            storage_md = gr.Markdown("")
+            session_file_json = gr.JSON(
+                label="Файл сессии на диске",
+                max_height=420,
+            )
 
     # Порядок выходов совпадает с порядком значений в `_view()`.
     VIEW_OUTPUTS = [
@@ -464,6 +632,8 @@ with gr.Blocks(title="TooManyRules") as demo:
         messages_json,
         agent_dropdown,
         preset_dropdown,
+        storage_md,
+        session_file_json,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
 
