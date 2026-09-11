@@ -61,46 +61,39 @@ PRESETS: dict[str, AgentConfig] = {
     "Базовый": AgentConfig(
         name="Базовый",
         system_prompt=SYSTEM_PROMPT,
+        description=(
+            "день 1 — базовая роль, `deepseek-flash`, thinking off, "
+            "никаких ограничений формата"
+        ),
     ),
     "Строгий JSON": AgentConfig(
         name="Строгий JSON",
         system_prompt=SYSTEM_PROMPT_JSON,
         max_tokens=MAX_TOKENS_JSON,
         stop=[STOP_SEQUENCE],
+        description=(
+            "день 2, вариант B — промпт требует JSON, "
+            f"`max_tokens={MAX_TOKENS_JSON}`, `stop=['{STOP_SEQUENCE}']`; "
+            "ответ уходит в чат сырым текстом, парсинг JSON — работа дня 2 "
+            "и здесь не повторяется"
+        ),
     ),
     "Креативный": AgentConfig(
         name="Креативный",
         system_prompt=SYSTEM_PROMPT,
         temperature=CREATIVE_TEMPERATURE,
+        description=f"день 4 — тот же промпт, `temperature={CREATIVE_TEMPERATURE}`",
     ),
     "Флагман + thinking": AgentConfig(
         name="Флагман + thinking",
         system_prompt=SYSTEM_PROMPT,
         model=DEEPSEEK_MODEL_PRO,
         thinking=True,
+        description=(
+            f"день 5 — `{DEEPSEEK_MODEL_PRO}` с включённым режимом рассуждения; "
+            "`reasoning_content` виден в дебаг-панели, дороже и медленнее"
+        ),
     ),
 }
 
 DEFAULT_PRESET = "Базовый"
-
-# Откуда взят каждый пресет — строка показывается в интерфейсе под списком,
-# чтобы связь с неделей 1 была видна без чтения кода.
-PRESET_NOTES: dict[str, str] = {
-    "Базовый": (
-        "день 1 — базовая роль, `deepseek-v4-flash`, thinking off, "
-        "никаких ограничений формата"
-    ),
-    "Строгий JSON": (
-        "день 2, вариант B — промпт требует JSON, "
-        f"`max_tokens={MAX_TOKENS_JSON}`, `stop=['{STOP_SEQUENCE}']`; "
-        "ответ уходит в чат сырым текстом, парсинг JSON — работа дня 2 "
-        "и здесь не повторяется"
-    ),
-    "Креативный": (
-        f"день 4 — тот же промпт, `temperature={CREATIVE_TEMPERATURE}`"
-    ),
-    "Флагман + thinking": (
-        f"день 5 — `{DEEPSEEK_MODEL_PRO}` с включённым режимом рассуждения; "
-        "`reasoning_content` виден в дебаг-панели, дороже и медленнее"
-    ),
-}

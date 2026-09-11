@@ -31,18 +31,32 @@ load_dotenv()
 logger = logging.getLogger("toomanyrules.agent")
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-# Дешёвая модель на каждый день — дефолт конфига.
-DEEPSEEK_MODEL = "deepseek-v4-flash"
+# Дешёвая модель на каждый день — дефолт конфига. С 11.09.2026 это
+# `deepseek-flash` (DeepSeek-V4.1-Flash): прежняя `deepseek-v4-flash`
+# выведена из эксплуатации. Имя модели — ключ и в таблице цен ниже, и в
+# таблице контекстных окон `tokens.py`: переименовали модель — правьте обе,
+# иначе стоимость и бюджет молча станут «н/д».
+DEEPSEEK_MODEL = "deepseek-flash"
 # Флагман: сильнее и дороже, используется пресетом «Флагман + thinking».
 DEEPSEEK_MODEL_PRO = "deepseek-v4-pro"
 
-# Цены DeepSeek V4 в долларах за 1M токенов (off-peak), перенесены из недели 1.
-# Источник: https://api-docs.deepseek.com/quick_start/pricing. В пиковые часы
-# (01:00-04:00 и 06:00-10:00 UTC, пн-пт) ставки ×2 — считаем по off-peak,
-# это осознанно оценка, а не выписка по счёту.
+# Цены в долларах за 1M токенов (off-peak), ключ — имя модели. Источник:
+# https://api-docs.deepseek.com/quick_start/pricing, сверено 11.09.2026.
+# В пиковые часы (01:00-04:00 и 06:00-10:00 UTC, пн-пт) ставки ×2 — считаем по
+# off-peak, это осознанно оценка, а не выписка по счёту. Цена входа взята по
+# cache miss: кэш промпта дешевле в разы ($0.003/1M у flash), но в оценку он
+# не заводится — поля кэша показываются в панели отдельно (день 8, §10).
+#
+# 11.09.2026 дешёвая модель переименована: `deepseek-v4-flash` выведена из
+# эксплуатации, вместо неё `deepseek-flash` (DeepSeek-V4.1-Flash) и цены
+# 0.22/0.66 → 0.15/0.60. Старое имя API ещё принимает и обслуживает той же
+# моделью по цене flash, но в таблице его нет намеренно: платим за то, что
+# реально отвечает, а мёртвый алиас в проекте не используется. Замороженный
+# `app_week1.py` со своей копией таблицы остаётся на старом имени и старых
+# ценах — это цена заморозки, а не рассинхрон, который надо чинить.
 PRICING_PER_M_TOKENS = {
-    "deepseek-v4-flash": {"input": 0.22, "output": 0.66},
-    "deepseek-v4-pro":   {"input": 0.66, "output": 1.98},
+    "deepseek-flash":  {"input": 0.15, "output": 0.60},
+    "deepseek-v4-pro": {"input": 0.66, "output": 1.98},
 }
 
 _NO_API_KEY_ERROR = (
@@ -96,6 +110,7 @@ class AgentConfig:
 
     name: str                          # имя агента: попадает в логи и дебаг-панель
     system_prompt: str
+    description: str = ""              # для выпадающего списка пресетов в интерфейсе
     model: str = DEEPSEEK_MODEL
     thinking: bool = False             # → extra_body={"thinking": {"type": ...}}
     temperature: float | None = None

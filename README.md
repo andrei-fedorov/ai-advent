@@ -62,7 +62,7 @@
 
 | Пресет | Конфиг | Откуда |
 | --- | --- | --- |
-| Базовый | `SYSTEM_PROMPT`, `deepseek-v4-flash`, thinking off | день 1 |
+| Базовый | `SYSTEM_PROMPT`, `deepseek-flash`, thinking off | день 1 |
 | Строгий JSON | промпт с требованием JSON, `max_tokens=350`, `stop=["###END###"]` | день 2 |
 | Креативный | `SYSTEM_PROMPT`, `temperature=1.2` | день 4 |
 | Флагман + thinking | `SYSTEM_PROMPT`, `deepseek-v4-pro`, thinking on | день 5 |

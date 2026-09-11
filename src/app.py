@@ -30,7 +30,7 @@ import gradio as gr
 import pandas as pd
 
 from agent import Agent, agent_by_number, agents, delete_agent, process_stats
-from presets import DEFAULT_PRESET, PRESET_NOTES, PRESETS
+from presets import DEFAULT_PRESET, PRESETS
 from storage import JsonHistoryStore, StorageError, display_path
 from tokens import FILLER_MAX_TOKENS, ContextUsage, estimate_tokens, filler_text
 
@@ -286,42 +286,14 @@ def _context_md(
     return "\n".join(lines)
 
 
-# --- «Рост по ходам»: журнал ходов агента в графики и таблицу -------------
+# --- «Рост по ходам»: журнал ходов агента в таблицу -----------------------
 # Данные собираются из `agent.turns` через pandas — он уже стоит в проекте как
 # зависимость Gradio, новых строк в requirements.txt день 8 не добавляет.
-# Пустой журнал даёт пустой DataFrame с теми же колонками, а не None: графики
-# и таблица должны рисоваться и до первого хода.
-
-def _tokens_frame(turns: list[dict]) -> pd.DataFrame:
-    """«Длинный» формат для графика: строка на каждую метрику каждого хода.
-    Главный кадр дня — `prompt` растёт от хода к ходу, хотя вопросы одинаково
-    короткие."""
-    rows = [
-        {"ход": turn["turn"], "метрика": metric, "токены": turn[key]}
-        for turn in turns
-        for metric, key in (("prompt", "prompt_tokens"),
-                            ("completion", "completion_tokens"))
-    ]
-    return pd.DataFrame(
-        rows,
-        columns=["ход", "метрика", "токены"],
-    ).astype({"ход": "int64", "метрика": "object", "токены": "int64"})
-
-
-def _cost_frame(turns: list[dict]) -> pd.DataFrame:
-    """Накопительная стоимость: одна линия, которая гнётся вверх."""
-    rows = [
-        {"ход": turn["turn"], "потрачено, $": turn["cumulative_cost_usd"]}
-        for turn in turns
-    ]
-    return pd.DataFrame(
-        rows,
-        columns=["ход", "потрачено, $"],
-    ).astype({"ход": "int64", "потрачено, $": "float64"})
-
+# Пустой журнал даёт пустой DataFrame с теми же колонками, а не None: таблица
+# должна рисоваться и до первого хода.
 
 def _turns_table(turns: list[dict]) -> pd.DataFrame:
-    """Полный ряд журнала: то же самое, что на графиках, но числами."""
+    """Полный ряд журнала ходов агента."""
     rows = [
         {
             "ход": turn["turn"],
@@ -403,7 +375,7 @@ def _storage_md(state: dict, session_file: dict | None) -> str:
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 17 значений,
+    """Полный вид на состояние агента — фиксированный кортеж из 15 значений,
     позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
@@ -463,9 +435,7 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
             state["totals"]["calibration_calls"],
             question,
         ),
-        # 15-17. рост по ходам: два графика и таблица из журнала агента
-        gr.update(value=_tokens_frame(state["turns"])),
-        gr.update(value=_cost_frame(state["turns"])),
+        # 15. рост по ходам: таблица из журнала агента
         gr.update(value=_turns_table(state["turns"])),
     )
 
@@ -777,34 +747,17 @@ RESTORED_AT_START = _restore_agents()
 
 # --- Интерфейс -----------------------------------------------------------
 
-PRESET_NOTES_MD = "\n".join(
-    f"- **{name}** — {note}" for name, note in PRESET_NOTES.items()
-)
-
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
-        "# TooManyRules — агент\n"
-        "Ассистент по правилам настольной игры Too Many Bones "
-        "(Chip Theory Games). Без RAG, модель отвечает из общих знаний.\n\n"
-        "Вся работа с LLM — внутри сущности `Agent`: конфиг, стек сообщений, "
-        "вызов API, токены и стоимость. Интерфейс — только вид на её состояние: "
-        "агентов в процессе живёт много, и переключатель в дебаг-панели "
-        "показывает стек любого из них.\n\n"
-        "История диалога лежит на диске (`src/data/sessions/sNNN.json`), по "
-        "файлу на сессию: после перезапуска приложения агенты поднимаются из "
-        "файлов сами, и эта страница показывает тот же диалог — нажимать "
-        "ничего не нужно.\n\n"
-        "С дня 8 агент считает токены **до** запроса, а не только после: в "
+        "# TooManyRules \n"
+        "День 8: агент считает токены **до** запроса, а не только после: в "
         "панели видно, из чего складывается запрос (система + история + "
         "вопрос), сколько это от контекстного окна модели и как токены со "
         "стоимостью растут по ходам. Оценка до запроса и факт из `usage` "
         "стоят рядом — точное число знает только токенизатор модели, а мы "
         "калибруем эвристику по собственному трафику. Кнопка «Набить "
         "контекст» доводит запрос до переполнения за один клик: он всё равно "
-        "отправляется и получает отказ целиком — обрезка и сжатие истории "
-        "это дни 9-10.\n\n"
-        "Дни 1-5 (вкладки недели 1) заморожены в `app_week1.py`, "
-        "запуск — `./run.sh week1`."
+        "отправляется и получает отказ целиком."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -814,9 +767,12 @@ with gr.Blocks(title="TooManyRules") as demo:
 
     with gr.Row():
         # --- Слева: чат ---
-        with gr.Column(scale=3):
+        with gr.Column(scale=1):
             preset_dropdown = gr.Dropdown(
-                choices=list(PRESETS),
+                choices=[
+                    (f"{name} ({config.description})", name)
+                    for name, config in PRESETS.items()
+                ],
                 value=DEFAULT_PRESET,
                 label="Пресет агента",
                 # Поиск по четырём пунктам не нужен, а поле фильтра добавляет
@@ -828,10 +784,6 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "диалог: стек сообщений очищается. Предыдущий агент никуда "
                     "не девается — он остаётся в переключателе справа."
                 ),
-            )
-            gr.Markdown(
-                "Один и тот же агент, разные конфиги — то, что на неделе 1 "
-                "было разными кусками кода:\n\n" + PRESET_NOTES_MD
             )
 
             # Формат значения — список сообщений {"role", "content"}, то есть
@@ -909,21 +861,6 @@ with gr.Blocks(title="TooManyRules") as demo:
             # «Рост по ходам» — под счётчиками процесса: это про накопление,
             # а не про один вызов.
             gr.Markdown("### Рост по ходам")
-            tokens_plot = gr.LinePlot(
-                value=_tokens_frame([]),
-                x="ход",
-                y="токены",
-                color="метрика",
-                title="Токены по ходам",
-                height=220,
-            )
-            cost_plot = gr.LinePlot(
-                value=_cost_frame([]),
-                x="ход",
-                y="потрачено, $",
-                title="Стоимость накопительно",
-                height=220,
-            )
             turns_table = gr.Dataframe(
                 value=_turns_table([]),
                 label="Ходы агента (журнал живёт в процессе и на диск не едет)",
@@ -986,8 +923,6 @@ with gr.Blocks(title="TooManyRules") as demo:
         storage_md,
         session_file_json,
         context_md,
-        tokens_plot,
-        cost_plot,
         turns_table,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
