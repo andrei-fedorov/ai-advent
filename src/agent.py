@@ -1,4 +1,5 @@
-# TooManyRules — сущность агента (день 6, неделя 2; день 8 — работа с токенами).
+# TooManyRules — сущность агента (день 6, неделя 2; день 8 — работа с токенами,
+# день 9 — управление контекстом).
 #
 # Единственное место в проекте, где происходят вызовы LLM API. Модуль
 # намеренно ничего не знает ни про Gradio, ни про Too Many Bones: внутри
@@ -7,10 +8,15 @@
 # (`AgentReply`) и своё состояние для дебага (`debug_state`).
 #
 # Направление зависимостей одностороннее: app.py → presets.py → agent.py →
-# tokens.py. Из проекта здесь импортируется ровно один модуль — `tokens.py`,
-# лист графа, который сам не импортирует ничего (день 8; замороженный
-# `app_week1.py` не импортируется по-прежнему) — см.
-# `docs/TooManyRules — Неделя 2 архитектура.md`, §3, и спецификацию дня 8, §4.
+# tokens.py, context.py. Из проекта здесь импортируются только листья графа,
+# которые сами не импортируют ничего: `tokens.py` (день 8) и `context.py`
+# (день 9); замороженный `app_week1.py` не импортируется по-прежнему — см.
+# `docs/TooManyRules — Неделя 2 архитектура.md`, §3, и спецификации дня 8, §4,
+# и дня 9, §4.
+#
+# С дня 9 вызовов LLM API здесь два: основной (ответ игроку) и служебный
+# (свёртка старой части диалога в сводку, которую попросила стратегия). Оба —
+# в этом модуле: правило «вызовы LLM API только в `agent.py`» не нарушено.
 
 import logging
 import os
@@ -22,6 +28,7 @@ from typing import Protocol
 from dotenv import load_dotenv
 from openai import OpenAI
 
+import context
 import tokens
 
 # Ключ читается только здесь, поэтому и .env подхватывается здесь же —
@@ -133,6 +140,31 @@ class AgentConfig:
 
 
 @dataclass(frozen=True)
+class ServiceCall:
+    """Служебный вызов модели, сделанный стратегией до основного запроса
+    (день 9).
+
+    Это настоящий вызов: он считается в счётчиках агента и процесса наравне с
+    обычными и логируется так же. Но это не ход — он не пишет в стек
+    сообщений, не создаёт строку журнала ходов и не затирает `_last_reply`:
+    в блоке «Последний вызов» должен оставаться ответ игроку, а не сводка.
+    """
+
+    kind: str                  # из ContextTask
+    label: str
+    ok: bool
+    error: str | None
+    elapsed: float
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    cost_usd: float | None
+    covers: int                # сколько сообщений истории свёрнуто этим вызовом
+    folded_tokens: int         # оценка того, сколько эти сообщения весили
+    text: str                  # что получилось — для панели
+
+
+@dataclass(frozen=True)
 class AgentReply:
     """Результат одного вызова `ask()`. Полный набор метрик на каждый ход —
     это содержимое дебаг-панели (и причина, по которой день 6 обходится без
@@ -168,6 +200,10 @@ class AgentReply:
     # они объясняют, почему счёт растёт медленнее нашей оценки.
     prompt_cache_hit_tokens: int | None = None
     prompt_cache_miss_tokens: int | None = None
+    # Поле дня 9 — тоже в конце и с умолчанием. `None` означает «стратегия
+    # служебного вызова не просила», а не «свёртка не удалась»: неудачная
+    # свёртка приезжает сюда объектом с `ok=False`.
+    service_call: ServiceCall | None = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +221,34 @@ class TurnStats:
     cost_usd: float | None
     cumulative_total_tokens: int
     cumulative_cost_usd: float
+    # Поля дня 9 — в конце и с умолчаниями, как поля дня 8 в `AgentReply`.
+    # Ради них журнал и заводился: в одной строке видно, что ушло в модель,
+    # что ушло бы без сжатия и сколько стоила свёртка на этом ходе.
+    strategy: str = ""
+    sent_messages: int = 0          # сколько сообщений истории ушло в модель
+    full_prompt_tokens: int = 0     # оценка «сколько ушло бы без сжатия»
+    service_tokens: int = 0         # служебные токены, потраченные на этом ходе
+    service_cost_usd: float | None = None
+
+
+@dataclass(frozen=True)
+class ContextView:
+    """Что уйдёт в модель на следующем ходе и чего это стоит по сравнению с
+    полным контекстом.
+
+    Считается один раз и отдаётся и панели, и логам: иначе «сколько уходит» и
+    «сколько сэкономлено» считались бы в двух местах и разъехались бы.
+    """
+
+    strategy: str
+    state: context.StrategyState
+    usage: tokens.ContextUsage     # то, что уйдёт (со сжатием)
+    full: tokens.RequestTokens     # то, что ушло бы без сжатия
+    sent_messages: int             # сообщений истории в запросе
+    history_messages: int          # сообщений в стеке
+    saved_tokens: int              # full.total - usage.estimated, может быть < 0
+    pending_label: str             # «свёртка назрела: …», "" — не назрела
+    pending_messages: int
 
 
 class HistoryStore(Protocol):
@@ -192,13 +256,23 @@ class HistoryStore(Protocol):
 
     Протокол объявлен на дне 6, когда реализаций в проекте ещё не было, —
     чтобы день 7 подставил в эту точку `JsonHistoryStore`, не переписывая
-    агента. Сигнатуры с тех пор не менялись и меняться не должны: туда же,
-    когда появится VPS, встанет SQLite. Агент по-прежнему работает и со
-    `store=None` — тогда он живёт только в памяти процесса.
+    агента. Туда же, когда появится VPS, встанет SQLite. Агент по-прежнему
+    работает и со `store=None` — тогда он живёт только в памяти процесса.
+
+    День 9 дополняет протокол минимально: у `save()` появился третий
+    необязательный параметр `context` (память стратегий — для хранилища это
+    непрозрачный словарь), и добавился `load_context()`. История пишется
+    вместе с контекстом одной записью: разъехаться они не должны.
     """
 
     def load(self, session_id: str) -> list[dict]: ...
-    def save(self, session_id: str, messages: list[dict]) -> None: ...
+    def save(
+        self,
+        session_id: str,
+        messages: list[dict],
+        context: dict | None = None,
+    ) -> None: ...
+    def load_context(self, session_id: str) -> dict: ...
 
 
 # --- Счётчики процесса и реестр агентов ----------------------------------
@@ -225,6 +299,11 @@ _process_stats = {
 
 
 _agents: list["Agent"] = []
+
+# База для сравнения «без сжатия»: этой стратегией агент меряет, сколько ушло
+# бы в модель, если бы контекстом никто не управлял. Экземпляр один на процесс
+# и общий для всех агентов — у «Всей истории» нет памяти, делить ей нечего.
+_FULL_HISTORY = context.FullHistory()
 
 
 def process_stats() -> dict:
@@ -311,6 +390,8 @@ class Agent:
         config: AgentConfig,
         session_id: str = "default",
         store: HistoryStore | None = None,
+        strategies: dict[str, context.ContextStrategy] | None = None,
+        strategy: str | None = None,
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -333,11 +414,44 @@ class Agent:
             "calibration_calls": 0,
             "calibration_fact_tokens": 0,
             "calibration_estimated_tokens": 0,
+            # Счётчики дня 9. Служебные вызовы считаются и в общих счётчиках
+            # выше (те же токены, те же деньги), и отдельно здесь: рядом с
+            # «сэкономлено» всегда должно стоять «потрачено на свёртки», иначе
+            # день превращается в фокус.
+            "service_calls": 0,
+            "service_tokens": 0,
+            "service_cost_usd": 0.0,
+            # Сумма экономии по ходам: «сколько ушло бы без сжатия» минус
+            # «сколько ушло». На коротком диалоге бывает отрицательной — так и
+            # показываем.
+            "saved_tokens": 0,
         }
         # Журнал ходов (день 8). Ведёт себя как счётчики агента, а не как стек
         # сообщений: `reset()` его не чистит, на диск он не едет, и после
         # перезапуска процесса он пуст, хотя история восстановлена из файла.
         self._turns: list[TurnStats] = []
+
+        # Стратегия — третья зависимость агента после конфига и хранилища и,
+        # как хранилище, необязательная: `strategies=None` даёт единственную
+        # «Всю историю», и агент ведёт себя ровно как на дне 8. Экземпляры
+        # свои у каждого агента (их создаёт `presets.make_strategies()`):
+        # память сводки относится к конкретному диалогу.
+        #
+        # Стратегия — состояние агента, а не поле `AgentConfig`: конфиг
+        # заморожен и описывает вызов модели, а стратегия описывает память и
+        # переключается на живом агенте, не теряя диалог (день 9, §6.1).
+        self._strategies: dict[str, context.ContextStrategy] = (
+            dict(strategies)
+            if strategies
+            else {context.FULL_HISTORY_NAME: context.FullHistory()}
+        )
+        # Предупреждения, накопленные до регистрации в реестре: без номера
+        # агента строка в логе ничего не опознаёт, поэтому они логируются
+        # ниже, вместе со `store_error`.
+        self._startup_warnings: list[str] = []
+        self._strategy_name = next(iter(self._strategies))
+        if strategy is not None:
+            self._strategy_name = self._known_strategy(strategy)
 
         # Хранилище — необязательная зависимость: при `store=None` агент
         # работает целиком в памяти процесса (это и есть режим дня 6).
@@ -357,6 +471,16 @@ class Agent:
                 self._store_error = (
                     f"история не загрузилась, запись выключена: {exc}"
                 )
+            # Память стратегий и имя активной — отдельным чтением и отдельным
+            # try: сбой контекста не должен отменять чтение истории. Не
+            # прочиталось — стартуем с пустой памятью и предупреждением в лог,
+            # файл при этом не трогаем.
+            try:
+                self._load_context(store.load_context(session_id))
+            except Exception as exc:
+                self._startup_warnings.append(
+                    f"память стратегий не прочиталась, стартуем с пустой: {exc}"
+                )
         # Сколько сообщений пришло из хранилища: после первого же хода
         # `len(history)` растёт, и «сколько было восстановлено» иначе не
         # показать.
@@ -370,10 +494,11 @@ class Agent:
         # поэтому в префиксе и номер, и сессия.
         self._log_name = f"#{self._number} {config.name} · {session_id}"
         logger.info(
-            "[%s] агент создан: model=%s thinking=%s "
-            "восстановлено из хранилища=%d сообщ., живых агентов: %d",
+            "[%s] агент создан: model=%s thinking=%s стратегия=«%s» "
+            "восстановлено из хранилища=%d сообщ.%s, живых агентов: %d",
             self._log_name, config.model, _thinking_label(config.thinking),
-            self._restored_messages,
+            self._strategy_name, self._restored_messages,
+            _memory_note(self.strategy.describe(self._messages)),
             process_stats()["agents_alive"],
         )
         # Сбой загрузки логируется здесь, а не на месте: до регистрации в
@@ -381,6 +506,8 @@ class Agent:
         # ничего не опознаёт.
         if self._store_error is not None:
             logger.warning("[%s] %s", self._log_name, self._store_error)
+        for warning in self._startup_warnings:
+            logger.warning("[%s] %s", self._log_name, warning)
 
     # --- Публичный контракт ---------------------------------------------
 
@@ -397,6 +524,39 @@ class Agent:
         """Порядковый номер агента в процессе (с 1). Им агент опознаётся в
         переключателе дебаг-панели и в логах."""
         return self._number
+
+    @property
+    def strategy(self) -> context.ContextStrategy:
+        """Активная стратегия сборки запроса."""
+        return self._strategies[self._strategy_name]
+
+    def strategy_names(self) -> list[str]:
+        """Имена стратегий, между которыми умеет переключаться этот агент."""
+        return list(self._strategies)
+
+    def set_strategy(self, name: str) -> bool:
+        """Переключение стратегии на живом агенте; возвращает, произошло ли оно.
+
+        Стек сообщений, файл истории и счётчики не трогаются: меняется способ
+        сборки запроса, а не агент и не диалог. Память неактивных стратегий
+        при этом не чистится — она привязана к `covered`, индексу в историю,
+        поэтому «отстать» не может: вернувшись к сводке после десяти ходов под
+        другой стратегией, агент свернёт накопившееся одной свёрткой.
+        """
+        if name not in self._strategies or name == self._strategy_name:
+            return False
+        previous = self._strategy_name
+        self._strategy_name = name
+        logger.info(
+            "[%s] стратегия «%s» → «%s»: %s; стек не тронут (%d сообщ.), "
+            "история на диске полная",
+            self._log_name, previous, name,
+            self.strategy.describe(self._messages).note, len(self._messages),
+        )
+        # В файле меняется активная стратегия — иначе перезапуск вернул бы
+        # предыдущую.
+        self._persist()
+        return True
 
     @property
     def history(self) -> list[dict]:
@@ -437,30 +597,36 @@ class Agent:
     def context_usage(self, question: str = "") -> tokens.ContextUsage:
         """Бюджет контекста текущего стека: сколько из окна модели уже занято.
 
-        Без аргумента считается стек как есть (системный промпт + история) —
-        это нижняя граница следующего запроса. С вопросом — то, что уйдёт в
-        модель, если отправить его прямо сейчас; так панель показывает
-        занятость до нажатия «Отправить».
+        Без аргумента считается стек как есть (системный промпт, память
+        стратегии и несвёрнутая история) — это нижняя граница следующего
+        запроса. С вопросом — то, что уйдёт в модель, если отправить его
+        прямо сейчас; так панель показывает занятость до нажатия «Отправить».
 
         Считается по результату `_build_messages()` — по тому же списку
         сообщений, который ушёл бы в API: «посчитали» и «отправили» не должны
-        разъезжаться.
+        разъезжаться. С дня 9 это, значит, **сжатый** запрос; «сколько было бы
+        без сжатия» лежит рядом, в `ContextView.full`.
         """
-        return tokens.context_usage(
-            self._count_messages(self._build_messages(question)),
-            model=self._config.model,
-            max_tokens=self._config.max_tokens,
-            calibration=self.calibration,
-        )
+        return self.context_view(question).usage
+
+    def context_view(self, question: str = "") -> ContextView:
+        """Что уйдёт в модель на следующем ходе и чего это стоит по сравнению
+        с полным контекстом (день 9). Чистый расчёт: ни сети, ни изменения
+        памяти — панель зовёт его на каждый свой рендер."""
+        return self._context_view(question)[1]
 
     def ask(self, user_message: str) -> AgentReply:
-        """Один ход диалога: собрать сообщения, сходить в API, дописать пару
-        «вопрос/ответ» в стек.
+        """Один ход диалога: подготовить контекст, собрать сообщения, сходить
+        в API, дописать пару «вопрос/ответ» в стек.
+
+        С дня 9 фаз две: сначала стратегии дают возможность попросить
+        служебный вызов (свёртку), и только потом собирается и уходит основной
+        запрос. Служебный вызов ходом не является и через `ask()` не идёт.
 
         Исключений не бросает: ошибка API или отсутствующий ключ возвращаются
-        как `AgentReply(ok=False, error=...)`. При ошибке стек не меняется —
-        ни вопрос, ни ответ в него не попадают, чтобы повтор не задваивал
-        историю.
+        как `AgentReply(ok=False, error=...)` — в том числе при сбое
+        служебного вызова. При ошибке стек не меняется — ни вопрос, ни ответ
+        в него не попадают, чтобы повтор не задваивал историю.
 
         Параметры запроса берутся только из конфига: аргументов, меняющих
         модель/температуру/лимиты, у `ask()` нет — другой набор параметров
@@ -471,21 +637,28 @@ class Agent:
         except RuntimeError as exc:
             return self._failed_reply(str(exc), elapsed=0.0)
 
-        messages = self._build_messages(user_message)
+        # Фаза подготовки контекста (день 9). Стратегия может попросить
+        # служебный вызов — свернуть старую часть диалога в сводку. Сбой
+        # свёртки хода не отменяет: память не двигается, запрос собирается тем,
+        # что есть, и деградация идёт в сторону «без сжатия», а не в сторону
+        # потерянного контекста. Специального кода это не требует — достаточно
+        # того, что `covered` не сдвинулся.
+        service = self._run_context_task(client, user_message)
+
         # Счёт до запроса (день 8): считаем ровно тот список сообщений, который
         # сейчас уйдёт в API, — и логируем бюджет до вызова, а не после.
-        request = self._count_messages(messages)
-        budget = tokens.context_usage(
-            request,
-            model=self._config.model,
-            max_tokens=self._config.max_tokens,
-            calibration=self.calibration,
-        )
+        # Сборка и расчёт идут одним вызовом, чтобы «что отправляем» и «что
+        # показываем в панели» не считались двумя путями.
+        messages, view = self._context_view(user_message)
+        request = view.usage.request
+        budget = view.usage
+        self._log_context(view)
         self._log_budget(budget)
         # Проверки «а влезет ли» здесь намеренно нет: переполненный запрос
-        # отправляется как есть. День 8 показывает поломку, чинят её дни 9-10
-        # (спецификация дня 8, §2.2) — предупреждение в логе и в панели есть,
-        # предохранителя нет.
+        # отправляется как есть. День 8 показывает поломку, день 9 даёт способ
+        # до неё не доходить — но предохранителем не становится (спецификация
+        # дня 9, §12): предупреждение в логе и в панели есть, проверки перед
+        # вызовом нет.
         history_before = len(self._messages)
 
         started = time.perf_counter()
@@ -506,6 +679,7 @@ class Agent:
                 _explain_api_error(exc, budget),
                 elapsed=time.perf_counter() - started,
                 request=request,
+                service=service,
             )
         elapsed = time.perf_counter() - started
 
@@ -541,6 +715,7 @@ class Agent:
             estimated_completion_tokens=tokens.estimate_tokens(text),
             prompt_cache_hit_tokens=getattr(usage, "prompt_cache_hit_tokens", None),
             prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
+            service_call=service,
         )
 
         if self._config.keep_history:
@@ -549,7 +724,7 @@ class Agent:
             self._persist()
 
         self._record(reply)
-        self._record_turn(reply, history_before)
+        self._record_turn(reply, history_before, view, service)
         logger.info(
             "[%s] model=%s thinking=%s finish_reason=%s time=%.2fs "
             "tokens(prompt/completion/total)=%s/%s/%s "
@@ -568,16 +743,28 @@ class Agent:
         return reply
 
     def reset(self) -> None:
-        """Очищает стек сообщений. Счётчики за время жизни агента и метрики
-        последнего вызова сохраняются — это разные вещи: сброшен диалог,
-        а не агент."""
+        """Очищает стек сообщений и память всех стратегий. Счётчики за время
+        жизни агента, журнал ходов и метрики последнего вызова сохраняются —
+        это разные вещи: сброшен диалог, а не агент.
+
+        Память чистится вся, а не только у активной стратегии: сводка
+        удалённого диалога не должна пережить сброс и уехать в запрос после
+        переключения.
+        """
         self._messages = []
+        for strategy in self._strategies.values():
+            strategy.reset()
         self._persist()
-        logger.info("[%s] стек сообщений очищен (reset)", self._log_name)
+        logger.info(
+            "[%s] стек сообщений очищен (reset); память стратегий (%s) "
+            "очищена вместе с ним",
+            self._log_name, ", ".join(f"«{name}»" for name in self._strategies),
+        )
 
     def debug_state(self) -> dict:
         """Состояние агента для дебаг-панели: конфиг, стек, метрики
         последнего вызова, накопленное за время жизни и счётчики процесса."""
+        view = self.context_view()
         return {
             "number": self._number,
             "config": asdict(self._config),
@@ -594,42 +781,216 @@ class Agent:
             "process": process_stats(),
             # Ключи дня 8 — в конце: существующие не переименовываются и не
             # переставляются, иначе поехали бы рендеры дебаг-панели.
-            "context": asdict(self.context_usage()),
+            # `context` заполняется из того же `ContextView`, что и ключ
+            # `context_view` ниже: бюджет за один рендер считается один раз.
+            "context": asdict(view.usage),
             "turns": [asdict(turn) for turn in self._turns],
             "calibration": self.calibration,
+            # Ключи дня 9 — тоже в конце. В `context_view` уходит описание
+            # назревшей свёртки, а не сама `ContextTask`: её `messages` могут
+            # весить сотни килобайт, и в панель им не место.
+            "strategy": self._strategy_name,
+            "context_view": asdict(view),
         }
 
     # --- Внутреннее ------------------------------------------------------
 
     def _build_messages(self, user_message: str) -> list[dict]:
-        """Единственное место, где собирается список сообщений для запроса:
-        системный промпт из конфига + весь стек + новый вопрос.
+        """Единственное место, где собирается список сообщений для запроса.
 
-        Сюда на днях 9-10 встанет сжатие контекста — поэтому сборка вынесена
-        в отдельный метод, а не размазана по вызову (день 8 оказался про
-        токены и из этого метода только читает). Сейчас никакого сжатия,
-        обрезания и лимита истории нет: в LLM уходит вся переписка целиком —
-        ровно то, что день 8 и меряет.
+        С дня 9 сборку делает стратегия: агент отдаёт ей системный промпт,
+        весь стек и новый вопрос, а что из этого уедет в модель — решает она
+        (`context.py`, §4). Сам стек при этом не меняется: сжимается запрос,
+        а не память. День 10 добавит сюда ещё три стратегии, не тронув ни
+        строчки в этом методе.
         """
-        return (
-            [{"role": "system", "content": self._config.system_prompt}]
-            + self.history
-            + [{"role": "user", "content": user_message}]
+        return self.strategy.build(
+            self._config.system_prompt, self._messages, user_message
         )
 
+    def _context_view(self, question: str = "") -> tuple[list[dict], ContextView]:
+        """Сборка запроса и всё, что про неё нужно знать панели и логам, —
+        одним проходом.
+
+        Отдаёт и сам список сообщений, и `ContextView`: `ask()` нужно и то и
+        другое, и собирать запрос дважды (один раз чтобы отправить, другой
+        чтобы показать) — верный способ разъехаться.
+
+        Чистый метод: `describe()`, `prepare()` и `build()` ничего не меняют и
+        в сеть не ходят, поэтому его безопасно звать на каждый рендер панели.
+        """
+        messages = self._build_messages(question)
+        usage = tokens.context_usage(
+            self._count_messages(messages),
+            model=self._config.model,
+            max_tokens=self._config.max_tokens,
+            calibration=self.calibration,
+        )
+        # База для сравнения: во сколько обошёлся бы тот же ход без всякого
+        # управления контекстом. Считается тем же счётчиком по той же сборке,
+        # только стратегией «Вся история».
+        full = self._count_messages(
+            _FULL_HISTORY.build(
+                self._config.system_prompt, self._messages, question
+            )
+        )
+        state = self.strategy.describe(self._messages)
+        task = self.strategy.prepare(self._messages, question)
+        return messages, ContextView(
+            strategy=self._strategy_name,
+            state=state,
+            usage=usage,
+            full=full,
+            # Сколько сообщений истории реально ушло в запрос: `per_message`
+            # считается только по ним, память стратегии в этот ряд не входит.
+            sent_messages=len(usage.request.per_message),
+            history_messages=len(self._messages),
+            # Экономия — по сырым оценкам обеих сборок: калибровка это общий
+            # множитель, в отношении он бы сократился.
+            saved_tokens=full.total - usage.estimated,
+            # В панель уходит описание назревшей свёртки, а не сама задача:
+            # её `messages` могут весить сотни килобайт.
+            pending_label=task.label if task else "",
+            pending_messages=task.covers - state.covered if task else 0,
+        )
+
+    def _run_context_task(
+        self, client: OpenAI, question: str
+    ) -> ServiceCall | None:
+        """Служебный вызов, если стратегия его попросила: свернуть старую
+        часть диалога в сводку.
+
+        Второе (и последнее) место в проекте, где вызывается
+        `chat.completions.create`. Набор параметров у него намеренно другой:
+        сообщения из задачи, `thinking` всегда выключен (скрытые
+        reasoning-токены тратят тот же бюджет `max_tokens`, что и видимый
+        ответ, и на маленьком лимите сводка пришла бы пустой), `max_tokens` из
+        задачи, ни температуры, ни `stop`.
+
+        Это настоящий вызов, но не ход: в стек сообщений он не пишет, строку
+        журнала ходов не создаёт и `_last_reply` не трогает.
+        """
+        task = self.strategy.prepare(self._messages, question)
+        if task is None:
+            return None
+
+        covered_before = self.strategy.describe(self._messages).covered
+        folded = self._messages[covered_before:task.covers]
+        folded_tokens = sum(
+            tokens.estimate_tokens(message.get("content")) for message in folded
+        )
+
+        started = time.perf_counter()
+        try:
+            response = client.chat.completions.create(
+                model=self._config.model,
+                messages=task.messages,
+                extra_body={"thinking": {"type": "disabled"}},
+                **({"max_tokens": task.max_tokens} if task.max_tokens else {}),
+            )
+        except Exception as exc:
+            logger.exception("[%s] служебный вызов упал", self._log_name)
+            call = ServiceCall(
+                kind=task.kind, label=task.label, ok=False,
+                # В `error` только причина, без слова «свёртка»: и лог, и
+                # панель подписывают её сами, и дважды это читается плохо.
+                error=str(exc),
+                elapsed=time.perf_counter() - started,
+                prompt_tokens=None, completion_tokens=None, total_tokens=None,
+                cost_usd=None, covers=0, folded_tokens=folded_tokens, text="",
+            )
+            self._record_service(call)
+            logger.warning(
+                "[%s] свёртка не удалась: %s; ход не отменяется: память не "
+                "сдвинулась, в запрос уйдёт всё несвёрнутое (%d сообщ.)",
+                self._log_name, call.error, len(self._messages) - covered_before,
+            )
+            return call
+
+        elapsed = time.perf_counter() - started
+        text = (response.choices[0].message.content or "").strip()
+        usage = response.usage
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+        cost_usd = estimate_cost_usd(
+            self._config.model, prompt_tokens, completion_tokens
+        )
+        call = ServiceCall(
+            kind=task.kind,
+            label=task.label,
+            ok=bool(text),
+            error=None if text else "модель вернула пустую сводку",
+            elapsed=elapsed,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
+            covers=task.covers - covered_before if text else 0,
+            folded_tokens=folded_tokens,
+            text=text,
+        )
+        # Токены потрачены в любом случае — считаем их до того, как решим,
+        # годится ли результат.
+        self._record_service(call)
+        if not text:
+            logger.warning(
+                "[%s] свёртка: модель вернула пустой ответ — память не "
+                "сдвинулась, сообщения #%d-#%d останутся в запросе целиком",
+                self._log_name, covered_before, task.covers - 1,
+            )
+            return call
+
+        self.strategy.apply(task, text)
+        # Немедленное сохранение: свёртка уже оплачена, и падение до основного
+        # вызова не должно её терять.
+        self._persist()
+        logger.info(
+            "[%s] свёртка: сообщения #%d-#%d (%d шт., ≈%s токенов) → сводка "
+            "≈%s токенов; служебный вызов %.2fs, tokens=%s/%s/%s, cost=%s",
+            self._log_name, covered_before, task.covers - 1, call.covers,
+            _num(folded_tokens), _num(tokens.estimate_tokens(text)), elapsed,
+            prompt_tokens, completion_tokens, total_tokens, _cost_str(cost_usd),
+        )
+        return call
+
     def _count_messages(self, messages: list[dict]) -> tokens.RequestTokens:
-        """Разложение готового списка сообщений на систему / историю / вопрос.
+        """Разложение готового списка сообщений на систему / память стратегии /
+        историю / вопрос.
 
         Единственное место, где список сообщений превращается в оценку: и
         `ask()`, и `context_usage()` ходят сюда, поэтому «сколько посчитали»
         и «сколько отправили» считаются одним и тем же способом по одному и
         тому же списку.
+
+        С дня 9 разбор идёт по ролям, а не по позициям: первое сообщение —
+        системный промпт, последнее — вопрос, а все `system` между ними это
+        память стратегии (сводка сегодня, блок фактов у дня 10). Правило
+        безопасно: история агента нормализуется до `user`/`assistant` ещё с
+        дня 6, и `system` в ней не бывает.
         """
+        middle = messages[1:-1]
         return tokens.count_request(
             system_prompt=messages[0]["content"],
-            history=messages[1:-1],
+            history=[m for m in middle if m.get("role") != "system"],
             question=messages[-1]["content"],
+            memory="\n\n".join(
+                m.get("content") or "" for m in middle if m.get("role") == "system"
+            ),
         )
+
+    def _log_context(self, view: ContextView) -> None:
+        """Строка стратегии перед строкой бюджета: что уходит в модель и
+        сколько это против полного контекста. По логу должно быть видно, что
+        сжатие работает, — не открывая панель."""
+        logger.info(
+            "[%s] стратегия «%s»: в запросе %d сообщ. из %d, ≈%s вместо ≈%s (%s)",
+            self._log_name, view.strategy, view.sent_messages,
+            view.history_messages, _num(view.usage.estimated),
+            _num(view.full.total), _saved_str(view.saved_tokens, view.full.total),
+        )
+        if view.pending_label:
+            logger.info("[%s] %s", self._log_name, view.pending_label)
 
     def _log_budget(self, budget: tokens.ContextUsage) -> None:
         """Строка бюджета в лог перед вызовом API — и отдельное предупреждение,
@@ -637,18 +998,21 @@ class Agent:
         видно в терминале, а не только в панели."""
         request = budget.request
         logger.info(
-            "[%s] бюджет: система %s + история %s + вопрос %s + служебные %s "
-            "≈ %s из %s доступных (%s); окно %s, резерв под ответ %s",
+            "[%s] бюджет: система %s + память %s + история %s + вопрос %s + "
+            "служебные %s ≈ %s из %s доступных (%s); окно %s, резерв под "
+            "ответ %s",
             self._log_name,
-            _num(request.system), _num(request.history), _num(request.question),
-            _num(request.overhead), _num(budget.used),
+            _num(request.system), _num(request.memory), _num(request.history),
+            _num(request.question), _num(request.overhead), _num(budget.used),
             _num(budget.available), _ratio_str(budget.ratio),
             _num(budget.limit), _num(budget.answer_reserve),
         )
         if budget.level in ("warn", "danger", "over"):
             logger.warning(
-                "[%s] контекст занят на %s (уровень %s): запрос всё равно уходит "
-                "в API — обрезки и сжатия в проекте нет, это дни 9-10",
+                "[%s] контекст занят на %s (уровень %s): запрос всё равно "
+                "уходит в API — предохранителя перед вызовом в проекте нет "
+                "(день 8, §2.2), сжатие это способ до переполнения не "
+                "доходить, а не проверка перед вызовом",
                 self._log_name, _ratio_str(budget.ratio), budget.level,
             )
 
@@ -691,18 +1055,80 @@ class Agent:
         if not self._store_writable:
             return
         try:
-            self._store.save(self._session_id, self.history)
+            self._store.save(
+                self._session_id, self.history, context=self._context_dump()
+            )
         except Exception as exc:
             self._store_error = f"история не сохранилась: {exc}"
             logger.warning("[%s] %s", self._log_name, self._store_error)
         else:
             self._store_error = None
 
+    def _context_dump(self) -> dict:
+        """Память стратегий и имя активной — одним блоком для хранилища.
+
+        Пустые памяти в файл не пишутся: у «Всей истории» её нет вовсе, и
+        строчка `{}` в файле сессии только мешала бы читать его глазами.
+        """
+        memory = {
+            name: dump
+            for name, strategy in self._strategies.items()
+            if (dump := strategy.dump())
+        }
+        return {"strategy": self._strategy_name, "memory": memory}
+
+    def _load_context(self, data: dict) -> None:
+        """Память стратегий из файла сессии.
+
+        Файл версии 1 (ключа `context` в нём нет) и битый `context` дают
+        пустую память и стратегию по умолчанию — читать историю это не мешает.
+        Имя стратегии из файла перекрывает переданное конструктором: у
+        восстановленного агента умолчания нет, берётся записанное.
+        """
+        if not isinstance(data, dict) or not data:
+            return
+        memory = data.get("memory")
+        if isinstance(memory, dict):
+            for name, dump in memory.items():
+                strategy = self._strategies.get(name)
+                if strategy is None:
+                    self._startup_warnings.append(
+                        f"память стратегии «{name}» в файле есть, а самой "
+                        f"стратегии в наборе нет — пропущена"
+                    )
+                    continue
+                strategy.load(dump if isinstance(dump, dict) else {})
+        elif memory is not None:
+            self._startup_warnings.append(
+                f"ключ memory в файле сессии имеет тип "
+                f"{type(memory).__name__} вместо словаря — память пустая"
+            )
+        saved = data.get("strategy")
+        if isinstance(saved, str) and saved:
+            self._strategy_name = self._known_strategy(saved)
+
+    def _known_strategy(self, name: str) -> str:
+        """Имя стратегии из файла или от вызывающей стороны, приведённое к
+        набору этого агента.
+
+        Имени нет в наборе (стратегию переименовали или это файл дня 10 на
+        коде дня 9) — берём первую и предупреждаем; падать из-за этого
+        приложение не должно. Тот же приём, что с именем пресета на дне 7.
+        """
+        if name in self._strategies:
+            return name
+        fallback = next(iter(self._strategies))
+        self._startup_warnings.append(
+            f"стратегия «{name}» в наборе не найдена, работаем на «{fallback}»"
+        )
+        return fallback
+
     def _failed_reply(
         self,
         error: str,
         elapsed: float,
         request: "tokens.RequestTokens | None" = None,
+        service: ServiceCall | None = None,
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
@@ -722,12 +1148,19 @@ class Agent:
             model=self._config.model,
             agent_name=self._config.name,
             request_tokens=request,
+            service_call=service,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
         return reply
 
-    def _record_turn(self, reply: AgentReply, history_before: int) -> None:
+    def _record_turn(
+        self,
+        reply: AgentReply,
+        history_before: int,
+        view: ContextView,
+        service: ServiceCall | None,
+    ) -> None:
         """Строка журнала ходов — только на успешный вызов и после `_record()`:
         накопительные числа берутся из уже обновлённых счётчиков агента.
 
@@ -747,7 +1180,50 @@ class Agent:
                 cost_usd=reply.cost_usd,
                 cumulative_total_tokens=self._totals["total_tokens"],
                 cumulative_cost_usd=self._totals["cost_usd"],
+                strategy=view.strategy,
+                sent_messages=view.sent_messages,
+                full_prompt_tokens=view.full.total,
+                service_tokens=(service.total_tokens or 0) if service else 0,
+                service_cost_usd=service.cost_usd if service else None,
             )
+        )
+        # Экономия копится по ходам и может быть отрицательной: на коротком
+        # диалоге свёртка дороже, чем её отсутствие.
+        self._totals["saved_tokens"] += view.saved_tokens
+
+    def _record_service(self, call: ServiceCall) -> None:
+        """Учёт служебного вызова. Он считается в счётчиках агента и процесса
+        наравне с обычными — те же токены, та же оценка стоимости — и отдельно
+        в своих: рядом с «сэкономлено» в панели всегда стоит «потрачено на
+        свёртки».
+
+        `_last_reply` не трогается: в блоке «Последний вызов» должен оставаться
+        ответ игроку. В калибровку служебный вызов тоже не идёт — собственной
+        оценки этого запроса мы не считали, сравнивать факт не с чем.
+        """
+        prompt_tokens = call.prompt_tokens or 0
+        completion_tokens = call.completion_tokens or 0
+        total_tokens = call.total_tokens or 0
+        cost_usd = call.cost_usd or 0.0
+        errors = 0 if call.ok else 1
+
+        self._totals["calls"] += 1
+        self._totals["errors"] += errors
+        self._totals["prompt_tokens"] += prompt_tokens
+        self._totals["completion_tokens"] += completion_tokens
+        self._totals["total_tokens"] += total_tokens
+        self._totals["cost_usd"] += cost_usd
+        self._totals["service_calls"] += 1
+        self._totals["service_tokens"] += total_tokens
+        self._totals["service_cost_usd"] += cost_usd
+
+        _bump_process_stats(
+            calls=1,
+            errors=errors,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            cost_usd=cost_usd,
         )
 
     def _record(self, reply: AgentReply) -> None:
@@ -815,10 +1291,33 @@ def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:
         f"ответ — доступно было {_num(budget.available)}. "
         f"Ответа нет: превышенный контекст означает отказ, а не забывание "
         f"начала диалога. Стек сообщений не изменился, файл сессии не тронут — "
-        f"вопрос можно задать заново, но сначала диалог придётся сбросить: "
-        f"обрезкой и сжатием истории займутся дни 9-10. "
+        f"вопрос можно задать заново, сбросив диалог или переключив стратегию "
+        f"управления контекстом: со сжатием в модель уходит сводка вместо "
+        f"старой части истории, и запрос снова влезает. Предохранителя перед "
+        f"вызовом нет намеренно. "
         f"Текст ошибки API: {text}"
     )
+
+
+def _memory_note(state: context.StrategyState) -> str:
+    """Кусок строки лога про память восстановленной стратегии: по логу должно
+    быть видно, приехала сводка из файла или нет."""
+    if not state.memory_text:
+        return ""
+    return (
+        f", память «{state.name}»: сводка ≈{tokens.estimate_tokens(state.memory_text)} "
+        f"токенов на {state.covered} сообщ."
+    )
+
+
+def _saved_str(saved: int, full_total: int) -> str:
+    """Экономия в процентах от полного контекста. Со знаком: на коротком
+    диалоге сжатие бывает дороже, чем его отсутствие, и показывать это надо
+    честно."""
+    if full_total <= 0:
+        return "н/д"
+    sign = "−" if saved >= 0 else "+"
+    return f"{sign}{abs(saved) / full_total * 100:.0f}%"
 
 
 def _thinking_label(thinking: bool) -> str:

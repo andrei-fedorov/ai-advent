@@ -1,4 +1,5 @@
-# TooManyRules — счёт токенов (день 8, неделя 2).
+# TooManyRules — счёт токенов (день 8, неделя 2; день 9 — корзина памяти
+# стратегии).
 #
 # Модуль знает только про текст и числа: ни Gradio, ни Too Many Bones, ни
 # вызовов API здесь нет и быть не может. Из проекта не импортируется ничего —
@@ -172,14 +173,24 @@ class RequestTokens:
     overhead: int              # служебные токены разметки
     total: int
     per_message: list[int]     # оценка по каждому сообщению истории, по порядку
+    # Корзина дня 9 — в конце и со значением по умолчанию, как поля дня 8 в
+    # `AgentReply`. Память стратегии (сегодня это сводка) уходит в запрос
+    # ведущими `system`-сообщениями и историей не является: без отдельной
+    # корзины главное число дня — «сколько истории уехало в сводку» — было бы
+    # неправдой. `per_message` при этом остаётся только про историю: панель
+    # ищет по нему самое тяжёлое сообщение стека, и сводка в этом ряду была бы
+    # посторонней.
+    memory: int = 0
 
 
 def count_request(
     system_prompt: str,
     history: list[dict],
     question: str = "",
+    memory: str = "",
 ) -> RequestTokens:
-    """Оценка запроса по частям: системный промпт + вся история + новый вопрос.
+    """Оценка запроса по частям: системный промпт + память стратегии + вся
+    история + новый вопрос.
 
     Считается ровно то, что уходит в API: агент зовёт эту функцию по
     результату `_build_messages()`, а не по стеку отдельно (спецификация
@@ -187,22 +198,27 @@ def count_request(
 
     `question=""` — законный случай: так панель считает бюджет стека без
     нового вопроса, то есть нижнюю границу следующего запроса. Пустой вопрос
-    не считается сообщением и служебных токенов не добавляет.
+    не считается сообщением и служебных токенов не добавляет; с `memory`
+    (день 9) то же правило.
     """
     per_message = [estimate_tokens(_content(message)) for message in history or []]
     system = estimate_tokens(system_prompt)
     history_tokens = sum(per_message)
     question_tokens = estimate_tokens(question)
+    memory_tokens = estimate_tokens(memory)
 
-    messages = 1 + len(per_message) + (1 if question else 0)
+    messages = (
+        1 + len(per_message) + (1 if question else 0) + (1 if memory else 0)
+    )
     overhead = messages * TOKENS_PER_MESSAGE + TOKENS_PER_REQUEST
     return RequestTokens(
         system=system,
         history=history_tokens,
         question=question_tokens,
         overhead=overhead,
-        total=system + history_tokens + question_tokens + overhead,
+        total=system + history_tokens + question_tokens + memory_tokens + overhead,
         per_message=per_message,
+        memory=memory_tokens,
     )
 
 

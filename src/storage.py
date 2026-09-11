@@ -1,4 +1,5 @@
-# TooManyRules — хранилище истории диалогов (день 7, неделя 2).
+# TooManyRules — хранилище истории диалогов (день 7, неделя 2; день 9 —
+# формат версии 2, память стратегии рядом с историей).
 #
 # Реализация протокола `HistoryStore`, объявленного в `agent.py` на дне 6:
 # одна сессия — один JSON-файл в `src/data/sessions/`. День 6 объявил
@@ -26,10 +27,14 @@ from pathlib import Path
 
 logger = logging.getLogger("toomanyrules.storage")
 
-# Версия формата файла — задел на дни 8-10 (сжатие контекста, скорее всего,
-# добавит в файл сводку). Миграций сейчас нет: поле нужно, чтобы старый файл
-# можно было опознать.
-FORMAT_VERSION = 1
+# Версия формата файла. День 9 — ровно тот случай, под который поле заводилось
+# на дне 7: рядом с историей в файл легла память стратегии (`context`), и
+# формат стал вторым.
+#
+# Миграций нет и не будет: версия 1 читается (нет ключа `context` — пустая
+# память и стратегия по умолчанию), версия 2 пишется. Первая же запись делает
+# старый файл вторым; «на месте» ничего не переписывается.
+FORMAT_VERSION = 2
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "data" / "sessions"
@@ -111,12 +116,22 @@ class JsonHistoryStore:
         )
         return messages
 
-    def save(self, session_id: str, messages: list[dict]) -> None:
+    def save(
+        self,
+        session_id: str,
+        messages: list[dict],
+        context: dict | None = None,
+    ) -> None:
         """Записывает историю сессии, переписывая файл целиком и атомарно.
 
         Инкрементальной дозаписи нет: файл маленький, а простота здесь дороже.
         Пустой список удаляет файл — пустых файлов сессий не бывает: нет
         контекста, нет и сессии.
+
+        `context` (день 9) — непрозрачный блок от агента: память стратегий и
+        имя активной. Хранилище не знает ни про стратегии, ни про сводки —
+        что пришло, то и уедет обратно. Пишется одной записью вместе с
+        историей: разъехаться сводка с диалогом не должна.
         """
         if not messages:
             self.delete_session(session_id)
@@ -134,6 +149,9 @@ class JsonHistoryStore:
             "preset": _preset_of(existing) or self._preset_for(session_id),
             "created_at": str(existing.get("created_at") or now),
             "updated_at": now,
+            # Контекст идёт перед историей: в файле, открытом глазами, сводку
+            # нужно видеть сразу, а не после сотни сообщений.
+            "context": context if isinstance(context, dict) else {},
             "messages": [
                 {"role": message["role"], "content": message["content"]}
                 for message in messages
@@ -160,9 +178,39 @@ class JsonHistoryStore:
             ) from exc
 
         logger.info(
-            "сохранено %s: %d сообщ. → %s",
-            session_id, len(messages), display_path(path),
+            "сохранено %s: %d сообщ.%s → %s",
+            session_id, len(messages),
+            _context_note(payload["context"]), display_path(path),
         )
+
+    def load_context(self, session_id: str) -> dict:
+        """Память стратегий из файла сессии — непрозрачный блок, каким его
+        записал агент.
+
+        Исключений не бросает и историю читать не мешает: файла нет, файл
+        битый, `context` не словарь — пустой словарь и предупреждение в лог.
+        Пустая память хуже полной, но лучше отказа читать диалог.
+        """
+        path = self.path_for(session_id)
+        if not path.exists():
+            return {}
+        try:
+            data = self._read(path)
+        except StorageError as exc:
+            logger.warning("сессия %s: контекст не прочитан — %s", session_id, exc)
+            return {}
+        context = data.get("context")
+        if context is None:
+            # Файл версии 1: ключа `context` в нём нет и не должно быть.
+            return {}
+        if not isinstance(context, dict):
+            logger.warning(
+                "сессия %s: в файле context имеет тип %s вместо словаря — "
+                "память стратегий пустая, история прочитана как обычно",
+                session_id, type(context).__name__,
+            )
+            return {}
+        return context
 
     # --- Каталог сессий: этим пользуется только app.py -------------------
 
@@ -355,6 +403,16 @@ def _clean_messages(messages: object, session_id: str) -> list[dict]:
             session_id, dropped, len(clean),
         )
     return clean
+
+
+def _context_note(context: dict) -> str:
+    """Кусок строки лога про записанный контекст: по логу должно быть видно,
+    что на диск уехала не только история."""
+    if not context:
+        return ""
+    memory = context.get("memory")
+    kinds = len(memory) if isinstance(memory, dict) else 0
+    return f" + контекст (стратегия «{context.get('strategy')}», памяти: {kinds})"
 
 
 def _preset_of(data: dict) -> str | None:

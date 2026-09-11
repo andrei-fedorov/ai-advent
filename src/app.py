@@ -1,11 +1,17 @@
-# TooManyRules — приложение недели 2 (день 8): чат через агента + дебаг-панель.
+# TooManyRules — приложение недели 2 (день 9): чат через агента + дебаг-панель.
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
 # `agent.Agent`, конфиги агентов проекта лежат в `presets.py`, история
 # диалогов — в `storage.py`, счёт токенов — в `tokens.py` (оттуда берутся
 # только чистые функции: генератор заполнителя и оценка его размера, всё
-# остальное панель получает от агента готовым).
+# остальное панель получает от агента готовым), стратегии управления
+# контекстом — в `context.py`, и напрямую он отсюда тоже не импортируется:
+# набор стратегий агенту выдаёт `presets.make_strategies()`.
+#
+# Панель не знает, какие бывают стратегии и что такое сводка: она рисует то,
+# что вернули `debug_state()` и `ContextView` — имя, описание словами, текст
+# памяти и числа. День 10 добавит стратегий, не тронув здесь ни строчки.
 #
 # Интерфейс — это вид на состояние агента: содержимое чата на каждом шаге
 # рендерится из `agent.history`, своей копии переписки Gradio не ведёт.
@@ -25,14 +31,28 @@
 # Запуск: ./run.sh (или python app.py из src/ с активированным .venv)
 
 import logging
+from dataclasses import asdict
 
 import gradio as gr
 import pandas as pd
 
-from agent import Agent, agent_by_number, agents, delete_agent, process_stats
-from presets import DEFAULT_PRESET, PRESETS
+from agent import (
+    Agent,
+    agent_by_number,
+    agents,
+    delete_agent,
+    estimate_cost_usd,
+    process_stats,
+)
+from presets import (
+    DEFAULT_PRESET,
+    DEFAULT_STRATEGY,
+    PRESETS,
+    STRATEGIES,
+    make_strategies,
+)
 from storage import JsonHistoryStore, StorageError, display_path
-from tokens import FILLER_MAX_TOKENS, ContextUsage, estimate_tokens, filler_text
+from tokens import FILLER_MAX_TOKENS, estimate_tokens, filler_text
 
 # Логирование настраивает точка входа — тот же формат, что на неделе 1.
 logging.basicConfig(
@@ -74,6 +94,23 @@ def _fmt_delta(estimated: int | None, fact: int | None) -> str:
     if estimated is None or not fact:
         return "н/д"
     return f"{(estimated - fact) / fact * 100:+.1f}%"
+
+
+def _fmt_saved(saved: int, full_total: int) -> str:
+    """Экономия в процентах от полного контекста, со знаком. Отрицательная
+    экономия — нормальный результат на коротком диалоге, и прячут её только
+    фокусники."""
+    if full_total <= 0:
+        return "н/д"
+    sign = "−" if saved >= 0 else "+"
+    return f"{sign}{abs(saved) / full_total * 100:.0f}%"
+
+
+def _times_word(count: int) -> str:
+    """«1 раз» / «2 раза» / «5 раз»: строку в панели читает человек."""
+    if 11 <= count % 100 <= 14:
+        return "раз"
+    return "раза" if count % 10 in (2, 3, 4) else "раз"
 
 
 def _agent_title(agent: Agent) -> str:
@@ -157,61 +194,92 @@ def _metrics_md(last_call: dict | None) -> str:
         f"- **finish_reason:** `{last_call['finish_reason']}`",
         f"- **Модель:** `{last_call['model']}`",
     ]
+    lines += _service_lines(last_call.get("service_call"))
     return "\n".join(lines)
+
+
+def _service_lines(service: dict | None) -> list[str]:
+    """Служебный вызов этого хода — отдельной строкой в «Последнем вызове».
+
+    `None` означает, что стратегия свёртки не просила. Сбой свёртки
+    показывается здесь же и за ошибку ответа не выдаётся: ход состоялся,
+    ответ игроку пришёл.
+    """
+    if not service:
+        return []
+    if not service["ok"]:
+        return [
+            f"- **🧵 Свёртка не удалась:** {service['error']} — память "
+            f"стратегии не сдвинулась, ход состоялся, в запрос ушло всё "
+            f"несвёрнутое. Потрачено "
+            f"{_fmt_int(service['total_tokens'] or 0)} токенов."
+        ]
+    return [
+        f"- **🧵 Свёртка:** {service['covers']} сообщ. "
+        f"(≈{_fmt_int(service['folded_tokens'])} токенов) → сводка "
+        f"≈{_fmt_int(estimate_tokens(service['text']))} токенов; служебный "
+        f"вызов {_fmt_int(service['total_tokens'])} токенов, "
+        f"{_fmt_cost(service['cost_usd'])}, {service['elapsed']:.2f} s"
+    ]
 
 
 _LEVEL_MARKERS = {"ok": "🟢", "warn": "🟡", "danger": "🔴", "over": "🔴"}
 
 _LEVEL_WARNINGS = {
     "warn": (
-        "⚠️ **Занято больше 70% окна.** Каждый следующий ход тащит в модель "
-        "всю переписку целиком, так что дальше будет только быстрее."
+        "⚠️ **Занято больше 70% окна.** Дальше будет только быстрее — если "
+        "запрос собирается стратегией «Вся история»."
     ),
     "danger": (
         "🔴 **Занято больше 90% окна.** Ещё пара ходов — и запрос перестанет "
-        "влезать: обрезки и сжатия истории в проекте пока нет."
+        "влезать. Сжатие истории с дня 9 есть, но включается оно вручную: "
+        "переключателем стратегии слева."
     ),
     "over": (
         "🔴 **Оценка превышает окно модели.** Запрос всё равно будет отправлен "
         "и, скорее всего, отклонён целиком: ответа не будет, ход не "
         "состоится, стек сообщений и файл сессии останутся как есть. "
-        "Предохранителя здесь нет намеренно — день 8 показывает поломку, "
-        "чинят её дни 9-10."
+        "Предохранителя здесь нет намеренно: сжатие — способ до переполнения "
+        "не доходить, а не проверка перед вызовом."
     ),
 }
 
 
-def _bar(usage: ContextUsage) -> str:
+def _bar(usage: dict) -> str:
     """Текстовая полоса занятости с маркером уровня. Надёжнее любого виджета
     и хорошо читается на видео."""
-    marker = _LEVEL_MARKERS.get(usage.level, "⚪")
-    if usage.ratio is None:
+    marker = _LEVEL_MARKERS.get(usage["level"], "⚪")
+    if usage["ratio"] is None:
         return f"{marker} `░░░░░░░░░░` н/д"
-    filled = max(0, min(round(usage.ratio * 10), 10))
+    filled = max(0, min(round(usage["ratio"] * 10), 10))
     return (
         f"{marker} `{'█' * filled}{'░' * (10 - filled)}` "
-        f"{usage.ratio * 100:.1f}%"
+        f"{usage['ratio'] * 100:.1f}%"
     )
 
 
-def _heaviest_message(usage: ContextUsage, messages: list[dict]) -> str:
+def _heaviest_message(usage: dict, messages: list[dict]) -> str:
     """Самое тяжёлое сообщение стека — по `per_message`, который идёт в том же
-    порядке, что история."""
-    per_message = usage.request.per_message
+    порядке, что **отправленная** часть истории: сообщения, уехавшие в сводку,
+    в этом ряду не участвуют."""
+    per_message = usage["request"]["per_message"]
     if not per_message:
         return "- **Самое тяжёлое сообщение стека:** стек пуст"
     index = max(range(len(per_message)), key=lambda i: per_message[i])
+    # Индекс в отправленном хвосте, а не в стеке: при сжатии хвост начинается
+    # не с нулевого сообщения, и смещение нужно вернуть обратно.
+    offset = max(0, len(messages) - len(per_message))
     role = "н/д"
-    if index < len(messages) and isinstance(messages[index], dict):
-        role = messages[index].get("role", "н/д")
+    if offset + index < len(messages) and isinstance(messages[offset + index], dict):
+        role = messages[offset + index].get("role", "н/д")
     return (
-        f"- **Самое тяжёлое сообщение стека:** #{index} ({role}), "
-        f"≈{_fmt_int(per_message[index])} токенов"
+        f"- **Самое тяжёлое сообщение из отправленных:** #{offset + index} "
+        f"({role}), ≈{_fmt_int(per_message[index])} токенов"
     )
 
 
 def _context_md(
-    usage: ContextUsage,
+    usage: dict,
     messages: list[dict],
     calibration: float | None,
     calibration_calls: int,
@@ -222,58 +290,67 @@ def _context_md(
     Стоит сразу под метриками последнего вызова — это про тот же запрос,
     только с другой стороны: там факт после вызова, здесь оценка до него.
     """
-    request = usage.request
+    request = usage["request"]
     lines = [
         "### Бюджет контекста",
         "",
-        f"- **Модель:** `{usage.model}` · окно "
+        f"- **Модель:** `{usage['model']}` · окно "
         + (
             "**н/д** (модели нет в таблице контекстных окон)"
-            if usage.limit is None
-            else f"{_fmt_int(usage.limit)} токенов"
+            if usage["limit"] is None
+            else f"{_fmt_int(usage['limit'])} токенов"
         )
-        + f", резерв под ответ {_fmt_int(usage.answer_reserve)}",
-        f"- **В запросе:** система {_fmt_int(request.system)} + история "
-        f"{_fmt_int(request.history)} ({len(request.per_message)} сообщ.) + "
-        f"вопрос {_fmt_int(request.question)} + служебные "
-        f"{_fmt_int(request.overhead)} ≈ **{_fmt_int(request.total)}**",
+        + f", резерв под ответ {_fmt_int(usage['answer_reserve'])}",
+        f"- **В запросе:** система {_fmt_int(request['system'])} + история "
+        f"{_fmt_int(request['history'])} ({len(request['per_message'])} сообщ.) + "
+        f"вопрос {_fmt_int(request['question'])} + служебные "
+        f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(request['total'])}**",
+        # Строка дня 9: память стратегии — отдельная корзина, историей она не
+        # считается.
+        f"- **Память стратегии в запросе:** "
+        + (
+            f"≈{_fmt_int(request['memory'])} токенов — она уходит ведущим "
+            f"`system`-сообщением сразу после системного промпта"
+            if request["memory"]
+            else "ничего: у активной стратегии памяти нет или она пуста"
+        ),
     ]
     if question:
         lines.append(
-            f"- **В поле ввода:** ≈{_fmt_int(request.question)} токенов — "
+            f"- **В поле ввода:** ≈{_fmt_int(request['question'])} токенов — "
             f"итог и полоса ниже посчитаны вместе с ними"
         )
-    if usage.limit is None:
+    if usage["limit"] is None:
         lines.append(
-            f"- **Занято:** ≈{_fmt_int(usage.used)} токенов, от какой доли "
+            f"- **Занято:** ≈{_fmt_int(usage['used'])} токенов, от какой доли "
             f"окна — неизвестно: процентов и предупреждений здесь не будет"
         )
     else:
         # Отрицательный остаток — это «не влезли», и написать так честнее,
         # чем показывать свободное место со знаком минус.
         tail = (
-            f"свободно ≈{_fmt_int(usage.free)}"
-            if usage.free >= 0
-            else f"**не хватает ≈{_fmt_int(-usage.free)}**"
+            f"свободно ≈{_fmt_int(usage['free'])}"
+            if usage["free"] >= 0
+            else f"**не хватает ≈{_fmt_int(-usage['free'])}**"
         )
         lines.append(
-            f"- **Занято:** ≈{_fmt_int(usage.used)} из "
-            f"{_fmt_int(usage.available)} доступных · {tail}"
+            f"- **Занято:** ≈{_fmt_int(usage['used'])} из "
+            f"{_fmt_int(usage['available'])} доступных · {tail}"
         )
     lines.append(f"- {_bar(usage)}")
     if calibration is None:
         lines.append(
-            f"- **Калибровка:** оценка {_fmt_int(usage.estimated)} показана "
+            f"- **Калибровка:** оценка {_fmt_int(usage['estimated'])} показана "
             f"сырой — успешных вызовов с `usage` у этого агента ещё не было"
         )
     else:
         lines.append(
-            f"- **Калибровка:** оценка {_fmt_int(usage.estimated)} → "
-            f"{_fmt_int(usage.used)} (×{calibration:.3f} по "
+            f"- **Калибровка:** оценка {_fmt_int(usage['estimated'])} → "
+            f"{_fmt_int(usage['used'])} (×{calibration:.3f} по "
             f"{calibration_calls} вызовам)"
         )
     lines.append(_heaviest_message(usage, messages))
-    warning = _LEVEL_WARNINGS.get(usage.level)
+    warning = _LEVEL_WARNINGS.get(usage["level"])
     if warning:
         lines += ["", warning]
     lines += [
@@ -284,6 +361,124 @@ def _context_md(
         "запроса; пока вы набираете текст, панель не пересчитывается._",
     ]
     return "\n".join(lines)
+
+
+def _flow_md(view: dict, totals: dict, model: str) -> str:
+    """Блок «Контекст: что уходит в модель» — главный блок дня 9.
+
+    Стоит над «Бюджетом контекста»: сначала «что отправляем», потом «сколько
+    это от окна». Панель не знает, какие бывают стратегии: имя, параметры
+    словами и текст памяти приходят из `StrategyState`, числа — из
+    `ContextView`.
+    """
+    state = view["state"]
+    request = view["usage"]["request"]
+    estimated = view["usage"]["estimated"]
+    full_total = view["full"]["total"]
+    saved = view["saved_tokens"]
+    memory_name = state["memory_label"].lower()
+
+    lines = [
+        "### Контекст: что уходит в модель",
+        "",
+        f"- **Стратегия:** «{view['strategy']}» — {state['description']}",
+        f"- **Состав запроса:** система {_fmt_int(request['system'])} + "
+        f"{memory_name} {_fmt_int(request['memory'])} + "
+        f"{view['sent_messages']} сообщ. истории {_fmt_int(request['history'])} + "
+        f"вопрос {_fmt_int(request['question'])} + служебные "
+        f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(estimated)}**",
+    ]
+
+    if view["sent_messages"] >= view["history_messages"] and not request["memory"]:
+        # Сюда попадает и «Вся история», и «Сводка» до первой свёртки: в обоих
+        # случаях в модель уходит весь стек, и врать про экономию нечего.
+        lines.append(
+            f"- **За бортом:** ничего — все {view['history_messages']} сообщ. "
+            f"стека ушли в запрос целиком, экономии нет"
+        )
+    else:
+        lines.append(
+            f"- **За бортом:** свёрнуто {state['covered']} сообщ. из "
+            f"{view['history_messages']}, отправлено {view['sent_messages']}"
+        )
+        if saved >= 0:
+            share = f"{estimated / full_total * 100:.0f}%" if full_total else "н/д"
+            lines.append(
+                f"- **Экономия:** ≈{_fmt_int(estimated)} вместо "
+                f"≈{_fmt_int(full_total)} — {share} полного контекста, "
+                f"сэкономлено ≈{_fmt_int(saved)} токенов "
+                f"(≈{_fmt_cost(estimate_cost_usd(model, saved, 0))} по входу)"
+            )
+        else:
+            # Так бывает: сводка длиннее того, что она заменила. Показываем
+            # честно — это и есть цена приёма на коротком диалоге.
+            lines.append(
+                f"- **Экономия:** её нет — запрос ≈{_fmt_int(estimated)} "
+                f"токенов, то есть дороже полного контекста на "
+                f"≈{_fmt_int(-saved)}"
+            )
+
+    # Итог за время жизни агента: честный ответ на вопрос «а экономит ли».
+    lifetime_saved = totals["saved_tokens"]
+    verdict = "сэкономлено" if lifetime_saved >= 0 else "переплачено"
+    lines.append(
+        f"- **За время жизни агента:** {verdict} ≈{_fmt_int(abs(lifetime_saved))} "
+        f"токенов "
+        f"(≈{_fmt_cost(estimate_cost_usd(model, abs(lifetime_saved), 0))} по "
+        f"входу), потрачено на свёртки {_fmt_int(totals['service_tokens'])} "
+        f"токенов ({_fmt_cost(totals['service_cost_usd'])}) за "
+        f"{totals['service_calls']} {_service_word(totals['service_calls'])}"
+    )
+    if view["pending_label"]:
+        lines.append(f"- ⏳ **На следующем ходе:** {view['pending_label']}")
+    else:
+        lines.append(f"- **Дальше:** {state['note']}")
+    lines += [
+        "",
+        "_Сжимается запрос, а не память: стек сообщений и файл сессии всегда "
+        "полные. Переключение стратегии диалог не трогает — один и тот же "
+        "разговор можно отправить двумя способами и сравнить ответы._",
+    ]
+    return "\n".join(lines)
+
+
+def _service_word(count: int) -> str:
+    """«1 свёртку» / «2 свёртки» / «5 свёрток»."""
+    if 11 <= count % 100 <= 14:
+        return "свёрток"
+    match count % 10:
+        case 1:
+            return "свёртку"
+        case 2 | 3 | 4:
+            return "свёртки"
+        case _:
+            return "свёрток"
+
+
+def _memory_update(view: dict) -> dict:
+    """Блок «Память стратегии»: сама сводка текстом — то самое «храните summary
+    отдельно», которое должно быть видно.
+
+    Подпись и содержимое приходят из `StrategyState`: панель не знает, что
+    внутри — сводка, факты или ничего. Памяти нет — в поле стоит объяснение
+    почему, а не пустота.
+    """
+    state = view["state"]
+    text = state["memory_text"]
+    if not text:
+        return gr.update(
+            value=state["note"],
+            label=f"{state['memory_label']}: пусто",
+        )
+    return gr.update(
+        value=text,
+        label=(
+            f"{state['memory_label']}: покрывает {state['covered']} сообщ. из "
+            f"{view['history_messages']}, обновлялась {state['updated_turns']} "
+            f"{_times_word(state['updated_turns'])}, "
+            f"≈{estimate_tokens(text)} токенов"
+        ),
+    )
 
 
 # --- «Рост по ходам»: журнал ходов агента в таблицу -----------------------
@@ -307,25 +502,42 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             ),
             "стоимость": _fmt_cost(turn["cost_usd"]),
             "накопительно": _fmt_cost(turn["cumulative_cost_usd"]),
+            # Колонки дня 9 — в конце: существующие не переставляются.
+            # «без сжатия» и «служебные» рядом отвечают на главный вопрос дня:
+            # экономия минус плата за свёртку.
+            "стратегия": turn["strategy"],
+            "отправлено сообщ.": turn["sent_messages"],
+            "без сжатия": turn["full_prompt_tokens"],
+            "служебные": turn["service_tokens"],
         }
         for turn in turns
     ]
     return pd.DataFrame(
         rows,
         columns=["ход", "стек до хода", "оценка", "prompt", "completion",
-                 "total", "оценка/факт", "стоимость", "накопительно"],
+                 "total", "оценка/факт", "стоимость", "накопительно",
+                 "стратегия", "отправлено сообщ.", "без сжатия", "служебные"],
     )
 
 
-def _totals_md(agent_title: str, totals: dict) -> str:
+def _totals_md(agent_title: str, totals: dict, model: str) -> str:
     """Накопленное агентом за время жизни. «Сбросить диалог» эти счётчики
     не обнуляет — сброшен диалог, а не агент."""
+    lifetime_saved = totals["saved_tokens"]
+    verdict = "сэкономлено" if lifetime_saved >= 0 else "переплачено"
     return (
         f"### Накоплено агентом {agent_title}\n\n"
-        f"- **Вызовов:** {totals['calls']} (из них с ошибкой: {totals['errors']})\n"
+        f"- **Вызовов:** {totals['calls']} (из них с ошибкой: "
+        f"{totals['errors']}, служебных: {totals['service_calls']})\n"
         f"- **🔢 Токены:** prompt={totals['prompt_tokens']} / "
         f"completion={totals['completion_tokens']} / "
         f"total={totals['total_tokens']}\n"
+        f"- **🧵 Свёртки:** {_fmt_int(totals['service_tokens'])} токенов, "
+        f"{_fmt_cost(totals['service_cost_usd'])} — это цена сжатия; "
+        f"на запросах при этом {verdict} "
+        f"≈{_fmt_int(abs(lifetime_saved))} токенов "
+        f"({_fmt_cost(estimate_cost_usd(model, abs(lifetime_saved), 0))} "
+        f"по входу)\n"
         f"- **💲 Стоимость:** {_fmt_cost(totals['cost_usd'])}"
     )
 
@@ -375,11 +587,11 @@ def _storage_md(state: dict, session_file: dict | None) -> str:
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 15 значений,
+    """Полный вид на состояние агента — фиксированный кортеж из 18 значений,
     позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
-    Значения обоих выпадающих списков — тоже часть вида: иначе после
+    Значения всех трёх выпадающих списков — тоже часть вида: иначе после
     переключения агента панель показывала бы одного, а списки — другого.
 
     `question` передаёт только обработчик кнопки «Набить контекст» — это
@@ -393,6 +605,11 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
     reasoning = (last_call or {}).get("reasoning") or ""
     title = _agent_title(agent)
     messages = state["messages"]
+    model = state["config"]["model"]
+    # Вид на контекст агент уже посчитал в `debug_state()` — второй раз его
+    # считать незачем. Исключение одно: заполнитель в поле ввода, ради
+    # которого весь бюджет и пересчитывается вместе с ним.
+    view = asdict(agent.context_view(question)) if question else state["context_view"]
     # Файл перечитывается на каждом событии интерфейса — поллинга и
     # автообновления, как и на дне 6, здесь нет.
     session_file = STORE.read_file(state["session_id"])
@@ -405,7 +622,7 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         status,                                  # 2. строка статуса
         state["config"],                         # 3. конфиг агента
         _metrics_md(last_call),                  # 4. метрики последнего вызова
-        _totals_md(title, state["totals"]),      # 5. за время жизни
+        _totals_md(title, state["totals"], model),  # 5. за время жизни
         _process_md(state["process"]),           # 6. счётчики процесса
         gr.update(visible=bool(reasoning)),      # 7. аккордеон с reasoning
         reasoning,                               # 8. текст reasoning
@@ -429,7 +646,7 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         # Значения дня 8 — в конце кортежа, как и ключи в `debug_state()`.
         # 14. бюджет контекста: оценка того, что уйдёт в модель
         _context_md(
-            agent.context_usage(question),
+            view["usage"],
             messages,
             state["calibration"],
             state["totals"]["calibration_calls"],
@@ -437,6 +654,13 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         ),
         # 15. рост по ходам: таблица из журнала агента
         gr.update(value=_turns_table(state["turns"])),
+        # Значения дня 9 — следом за ними, и тоже в конце.
+        # 16. список стратегий подтягивается к активной стратегии агента
+        gr.update(value=state["strategy"]),
+        # 17. «Контекст: что уходит в модель»
+        _flow_md(view, state["totals"], model),
+        # 18. «Память стратегии»: сводка текстом
+        _memory_update(view),
     )
 
 
@@ -456,7 +680,17 @@ def _new_agent(preset_name: str) -> Agent:
     успешного ответа не появляется: `create_session` только выдаёт номер.
     """
     session_id = STORE.create_session(preset_name)
-    return Agent(PRESETS[preset_name], session_id=session_id, store=STORE)
+    return Agent(
+        PRESETS[preset_name],
+        session_id=session_id,
+        store=STORE,
+        # Набор стратегий свой у каждого агента: у «Сводки» есть память, и
+        # относится она к конкретному диалогу.
+        strategies=make_strategies(),
+        # День 9 показывает «было → стало», и начинать надо с «было»:
+        # новый агент всегда стартует на «Всей истории».
+        strategy=DEFAULT_STRATEGY,
+    )
 
 
 def _spawn(preset_name: str, reason: str):
@@ -515,7 +749,14 @@ def _restore_agents() -> int:
             preset_name = DEFAULT_PRESET
         # Экземпляр никуда не присваивается намеренно: агент сам встаёт в
         # реестр процесса, и оттуда его берут `on_load` и переключатель.
-        Agent(PRESETS[preset_name], session_id=info.session_id, store=STORE)
+        # Стратегия здесь не передаётся: у восстановленного агента умолчания
+        # нет — он берёт ту, что записана в его файле сессии.
+        Agent(
+            PRESETS[preset_name],
+            session_id=info.session_id,
+            store=STORE,
+            strategies=make_strategies(),
+        )
         restored += 1
     logger.info(
         "старт процесса: восстановлено %d %s из %s",
@@ -631,6 +872,44 @@ def on_switch_agent(agent_number: int, preset_name: str):
     )
 
 
+def on_strategy_change(agent: Agent | None, strategy_name: str, preset_name: str):
+    """Переключение стратегии управления контекстом — единственный новый
+    обработчик дня 9.
+
+    Нового агента не создаёт и стек не трогает: меняется способ сборки
+    запроса, а не агент и не диалог. Этим переключатель стратегии и отличается
+    от соседнего списка пресетов, и сказать об этом надо вслух — в `info`
+    списка и в строке статуса.
+    """
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    agent.set_strategy(strategy_name)
+    view = agent.context_view()
+    if view.state.memory_text:
+        what = (
+            f"в запрос уйдут {view.state.memory_label.lower()} и "
+            f"{view.sent_messages} несвёрнутых сообщений из "
+            f"{view.history_messages}"
+        )
+    else:
+        # Сокращение «сообщ.» уже кончается точкой, поэтому фразу закрываем
+        # так, чтобы в статусе не выросло две подряд.
+        what = (
+            f"в запрос уйдут все {view.sent_messages} сообщ. стека, "
+            f"памяти у стратегии пока нет"
+        )
+    return (
+        agent,
+        gr.update(),
+        *_view(
+            agent,
+            f"Стратегия «{agent.strategy.name}»: {what}. Стек не тронут, "
+            f"история на диске полная.",
+        ),
+    )
+
+
 def on_send(agent: Agent | None, message: str, preset_name: str):
     """Ход диалога. Вся работа — один вызов `agent.ask()`: стек сообщений
     ведёт агент, интерфейс только перерисовывает его состояние.
@@ -655,6 +934,23 @@ def on_send(agent: Agent | None, message: str, preset_name: str):
             f"Ответ получен за {reply.elapsed:.2f} s. "
             f"В стеке агента {_agent_title(agent)} {len(agent.history)} сообщ."
         )
+        # Ход, на котором произошла свёртка, говорит об этом вслух: на видео
+        # момент должен читаться без панели.
+        service = reply.service_call
+        if service is not None and service.ok:
+            status += (
+                f" 🧵 Перед ответом сработала свёртка: {service.covers} сообщ. "
+                f"(≈{_fmt_int(service.folded_tokens)} токенов) уехали в "
+                f"сводку ≈{_fmt_int(estimate_tokens(service.text))} токенов "
+                f"за {_fmt_cost(service.cost_usd)}. Сам диалог цел — "
+                f"сжался запрос, а не память."
+            )
+        elif service is not None:
+            status += (
+                f" ⚠️ Свёртка не удалась ({service.error}) — ход состоялся, "
+                f"память стратегии не сдвинулась, в модель ушло всё "
+                f"несвёрнутое."
+            )
         # Поле ввода чистим только при успехе; при ошибке вопрос остаётся
         # в поле, чтобы его можно было отправить повторно.
         message_update = ""
@@ -750,14 +1046,15 @@ RESTORED_AT_START = _restore_agents()
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 8: агент считает токены **до** запроса, а не только после: в "
-        "панели видно, из чего складывается запрос (система + история + "
-        "вопрос), сколько это от контекстного окна модели и как токены со "
-        "стоимостью растут по ходам. Оценка до запроса и факт из `usage` "
-        "стоят рядом — точное число знает только токенизатор модели, а мы "
-        "калибруем эвристику по собственному трафику. Кнопка «Набить "
-        "контекст» доводит запрос до переполнения за один клик: он всё равно "
-        "отправляется и получает отказ целиком."
+        "День 9: агент управляет контекстом. Последние сообщения уходят в "
+        "модель как есть, всё, что старше, сворачивается в **сводку** — "
+        "отдельным вызовом модели, который виден в панели и оплачен по той же "
+        "таблице цен. Стратегия переключается слева на живом диалоге: стек "
+        "сообщений и файл сессии всегда полные, сжимается запрос, а не "
+        "память, поэтому один и тот же разговор можно отправить обоими "
+        "способами и сравнить ответы. В панели рядом стоят два числа — "
+        "сколько ушло в модель и сколько ушло бы без сжатия — и честный итог: "
+        "сэкономлено против потрачено на свёртки."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -783,6 +1080,25 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "Смена пресета создаёт нового агента и начинает новый "
                     "диалог: стек сообщений очищается. Предыдущий агент никуда "
                     "не девается — он остаётся в переключателе справа."
+                ),
+            )
+            # Второй список стоит вплотную к первому и означает совсем другое,
+            # поэтому разница подписана прямым текстом: пресет — это новый
+            # агент и новый диалог, стратегия — тот же агент и тот же диалог,
+            # собранный для модели иначе.
+            strategy_dropdown = gr.Dropdown(
+                choices=[
+                    (f"{name} ({description})", name)
+                    for name, description in STRATEGIES.items()
+                ],
+                value=DEFAULT_STRATEGY,
+                label="Стратегия контекста",
+                filterable=False,
+                info=(
+                    "Как из истории собирается запрос к модели. Переключение "
+                    "НЕ создаёт агента и НЕ трогает стек: диалог остаётся как "
+                    "есть, меняется только то, что из него уходит в модель "
+                    "начиная со следующего вопроса."
                 ),
             )
 
@@ -834,6 +1150,22 @@ with gr.Blocks(title="TooManyRules") as demo:
                 height=220,
             )
             metrics_md = gr.Markdown(_metrics_md(None))
+            # Сначала «что отправляем» (день 9), потом «сколько это от окна»
+            # (день 8): блок контекста стоит над бюджетом, а сводка — сразу
+            # под ним, потому что объясняет числа над собой.
+            flow_md = gr.Markdown("")
+            memory_box = gr.Textbox(
+                label="Память стратегии",
+                lines=6,
+                max_lines=14,
+                # Сводку не редактируют: это результат работы модели, и
+                # показывать надо её, а не отредактированную версию.
+                interactive=False,
+                # Кнопка копирования: в Gradio 6 (в проекте 6.26) она задаётся
+                # списком `buttons`, а не флагом `show_copy_button` — тот
+                # удалён, как и `type="messages"` у `gr.Chatbot`.
+                buttons=["copy"],
+            )
             # Бюджет контекста стоит сразу под метриками последнего вызова:
             # там факт после запроса, здесь оценка до него — один и тот же
             # запрос с двух сторон.
@@ -924,6 +1256,9 @@ with gr.Blocks(title="TooManyRules") as demo:
         session_file_json,
         context_md,
         turns_table,
+        strategy_dropdown,
+        flow_md,
+        memory_box,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
 
@@ -940,6 +1275,14 @@ with gr.Blocks(title="TooManyRules") as demo:
     preset_dropdown.select(
         on_preset_change,
         inputs=[preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # Третий список — с той же оговоркой про `select`: `_view()` синхронизирует
+    # и его значение на каждом событии, так что `change` срабатывал бы на
+    # программное обновление и переключал стратегию сам по себе.
+    strategy_dropdown.select(
+        on_strategy_change,
+        inputs=[agent_state, strategy_dropdown, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
     agent_dropdown.select(
