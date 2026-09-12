@@ -159,9 +159,16 @@ class ServiceCall:
     completion_tokens: int | None
     total_tokens: int | None
     cost_usd: float | None
-    covers: int                # сколько сообщений истории свёрнуто этим вызовом
+    # Сколько сообщений свёрнуто этим вызовом — количество, а не граница, как
+    # `ContextTask.covers`: панели нужно «6 сообщ. уехали в сводку», а не
+    # индекс, до которого теперь покрывает сводка.
+    covers: int
     folded_tokens: int         # оценка того, сколько эти сообщения весили
     text: str                  # что получилось — для панели
+    # В конце и с умолчанием, как поля дня 8 в `AgentReply`. "length" — сводка
+    # упёрлась в `max_tokens` и оборвана на полуслове: она всё равно применена,
+    # но панель и лог говорят об этом вслух (спецификация дня 9, §6.2).
+    finish_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -399,9 +406,11 @@ class Agent:
         self._client: OpenAI | None = None
         self._last_reply: AgentReply | None = None
         # Счётчики за время жизни агента. `reset()` их не трогает — он
-        # чистит только стек сообщений.
+        # чистит только диалог: стек сообщений и память стратегий.
         self._totals = {
-            "calls": 0,          # всего вызовов ask(), включая неуспешные
+            # Все вызовы модели: ходы `ask()`, включая неуспешные, и с дня 9 —
+            # служебные (свёртки), они считаются наравне с обычными.
+            "calls": 0,
             "errors": 0,         # из них закончившихся ошибкой
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -902,13 +911,15 @@ class Agent:
             self._record_service(call)
             logger.warning(
                 "[%s] свёртка не удалась: %s; ход не отменяется: память не "
-                "сдвинулась, в запрос уйдёт всё несвёрнутое (%d сообщ.)",
+                "сдвинулась, в запрос уйдёт всё несвёрнутое (%d сообщ.), "
+                "свёртка повторится на следующем ходе",
                 self._log_name, call.error, len(self._messages) - covered_before,
             )
             return call
 
         elapsed = time.perf_counter() - started
-        text = (response.choices[0].message.content or "").strip()
+        choice = response.choices[0]
+        text = (choice.message.content or "").strip()
         usage = response.usage
         prompt_tokens = getattr(usage, "prompt_tokens", None)
         completion_tokens = getattr(usage, "completion_tokens", None)
@@ -929,6 +940,7 @@ class Agent:
             covers=task.covers - covered_before if text else 0,
             folded_tokens=folded_tokens,
             text=text,
+            finish_reason=choice.finish_reason,
         )
         # Токены потрачены в любом случае — считаем их до того, как решим,
         # годится ли результат.
@@ -936,7 +948,8 @@ class Agent:
         if not text:
             logger.warning(
                 "[%s] свёртка: модель вернула пустой ответ — память не "
-                "сдвинулась, сообщения #%d-#%d останутся в запросе целиком",
+                "сдвинулась, сообщения #%d-#%d останутся в запросе целиком, "
+                "свёртка повторится на следующем ходе",
                 self._log_name, covered_before, task.covers - 1,
             )
             return call
@@ -952,6 +965,16 @@ class Agent:
             _num(folded_tokens), _num(tokens.estimate_tokens(text)), elapsed,
             prompt_tokens, completion_tokens, total_tokens, _cost_str(cost_usd),
         )
+        # Обрезанная сводка применена — отказ от неё оставил бы свёртку
+        # назревшей, и она повторялась бы каждый ход за деньги и с тем же
+        # итогом. Но молча это не проходит: штатно в потолок упираться нельзя.
+        if choice.finish_reason == "length":
+            logger.warning(
+                "[%s] свёртка: сводка упёрлась в max_tokens=%s и оборвана на "
+                "полуслове — применена как есть; если это повторяется, потолок "
+                "мал для реальной длины сводки (спецификация дня 9, §3.1)",
+                self._log_name, task.max_tokens,
+            )
         return call
 
     def _count_messages(self, messages: list[dict]) -> tokens.RequestTokens:
@@ -982,15 +1005,17 @@ class Agent:
     def _log_context(self, view: ContextView) -> None:
         """Строка стратегии перед строкой бюджета: что уходит в модель и
         сколько это против полного контекста. По логу должно быть видно, что
-        сжатие работает, — не открывая панель."""
+        сжатие работает, — не открывая панель.
+
+        Строки «свёртка назрела» здесь нет намеренно: после фазы подготовки
+        назревшая свёртка бывает только несостоявшейся, и строка про неё
+        противоречила бы предупреждению о сбое, которое уже в логе."""
         logger.info(
             "[%s] стратегия «%s»: в запросе %d сообщ. из %d, ≈%s вместо ≈%s (%s)",
             self._log_name, view.strategy, view.sent_messages,
             view.history_messages, _num(view.usage.estimated),
             _num(view.full.total), _saved_str(view.saved_tokens, view.full.total),
         )
-        if view.pending_label:
-            logger.info("[%s] %s", self._log_name, view.pending_label)
 
     def _log_budget(self, budget: tokens.ContextUsage) -> None:
         """Строка бюджета в лог перед вызовом API — и отдельное предупреждение,
@@ -1097,7 +1122,23 @@ class Agent:
                         f"стратегии в наборе нет — пропущена"
                     )
                     continue
-                strategy.load(dump if isinstance(dump, dict) else {})
+                if not isinstance(dump, dict):
+                    strategy.load({})
+                    self._startup_warnings.append(
+                        f"память стратегии «{name}» в файле имеет тип "
+                        f"{type(dump).__name__} вместо словаря — память пустая"
+                    )
+                    continue
+                strategy.load(dump)
+                # Стратегия переживает мусор молча: логов у `context.py` нет.
+                # Что прочитано не всё, агент узнаёт сам — память, прочитанная
+                # целиком, выгружается обратно ровно в тот же словарь.
+                if strategy.dump() != dump:
+                    self._startup_warnings.append(
+                        f"память стратегии «{name}» в файле прочитана не "
+                        f"целиком (битые или лишние поля) — работаем с тем, "
+                        f"что удалось разобрать"
+                    )
         elif memory is not None:
             self._startup_warnings.append(
                 f"ключ memory в файле сессии имеет тип "
@@ -1283,6 +1324,22 @@ def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:
     lowered = text.lower()
     if not any(marker in lowered for marker in CONTEXT_OVERFLOW_MARKERS):
         return f"Ошибка при обращении к DeepSeek API: {text}"
+    # Что делать дальше, зависит от того, что переполнило окно. Сжатие и сброс
+    # укорачивают историю, но не сам вопрос: заполнитель на 1.2 млн токенов
+    # не влезет ни в какой запрос, и обещать обратное было бы неправдой.
+    question = budget.request.question
+    if budget.available is not None and question >= budget.available:
+        advice = (
+            f"Окно переполняет сам вопрос (≈{_num(question)} токенов): ни сброс "
+            f"диалога, ни сжатие истории тут не помогут — вопрос придётся "
+            f"сократить."
+        )
+    else:
+        advice = (
+            "Вопрос можно задать заново, сбросив диалог или переключив стратегию "
+            "управления контекстом на сжимающую: тогда старая часть истории "
+            "уйдёт в запрос в сжатом виде."
+        )
     return (
         f"Запрос не влез в контекстное окно модели и отклонён целиком. "
         f"Мы насчитали ≈{_num(budget.used)} токенов "
@@ -1290,23 +1347,22 @@ def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:
         f"{_num(budget.limit)} и резерве {_num(budget.answer_reserve)} под "
         f"ответ — доступно было {_num(budget.available)}. "
         f"Ответа нет: превышенный контекст означает отказ, а не забывание "
-        f"начала диалога. Стек сообщений не изменился, файл сессии не тронут — "
-        f"вопрос можно задать заново, сбросив диалог или переключив стратегию "
-        f"управления контекстом: со сжатием в модель уходит сводка вместо "
-        f"старой части истории, и запрос снова влезает. Предохранителя перед "
-        f"вызовом нет намеренно. "
+        f"начала диалога. Стек сообщений не изменился, файл сессии не тронут. "
+        f"{advice} Предохранителя перед вызовом нет намеренно. "
         f"Текст ошибки API: {text}"
     )
 
 
 def _memory_note(state: context.StrategyState) -> str:
     """Кусок строки лога про память восстановленной стратегии: по логу должно
-    быть видно, приехала сводка из файла или нет."""
+    быть видно, приехала память из файла или нет. Как память называется,
+    говорит сама стратегия — агент не знает, сводка это или факты."""
     if not state.memory_text:
         return ""
     return (
-        f", память «{state.name}»: сводка ≈{tokens.estimate_tokens(state.memory_text)} "
-        f"токенов на {state.covered} сообщ."
+        f", память «{state.name}»: {state.memory_label.lower()} "
+        f"≈{tokens.estimate_tokens(state.memory_text)} токенов на "
+        f"{state.covered} сообщ."
     )
 
 

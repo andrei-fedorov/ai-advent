@@ -89,7 +89,7 @@ class JsonHistoryStore:
         """Каталог сессий — показывается в дебаг-панели."""
         return self._data_dir
 
-    # --- Протокол HistoryStore (объявлен на дне 6, не меняется) ----------
+    # --- Протокол HistoryStore (объявлен на дне 6, дополнен на дне 9) -----
 
     def load(self, session_id: str) -> list[dict]:
         """История сессии с диска.

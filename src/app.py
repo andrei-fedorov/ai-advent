@@ -155,12 +155,21 @@ def _metrics_md(last_call: dict | None) -> str:
             "`finish_reason`, токены и стоимость."
         )
     if not last_call["ok"]:
-        return (
-            f"{header}\n\n"
-            f"❌ **Ошибка:** {last_call['error']}\n\n"
+        lines = [
+            header,
+            "",
+            f"❌ **Ошибка:** {last_call['error']}",
+            "",
             "Стек сообщений при ошибке не меняется — вопрос можно отправить "
-            "повторно, история не задвоится."
-        )
+            "повторно, история не задвоится.",
+        ]
+        # Свёртка перед упавшим вызовом оплачена и уже применена, а строки
+        # журнала у несостоявшегося хода нет: не показать её здесь — значит
+        # не показать нигде, кроме накопленных счётчиков.
+        service = _service_lines(last_call.get("service_call"))
+        if service:
+            lines += ["", *service]
+        return "\n".join(lines)
     request = last_call.get("request_tokens") or {}
     estimated_prompt = request.get("total")
     lines = [
@@ -214,26 +223,36 @@ def _service_lines(service: dict | None) -> list[str]:
             f"несвёрнутое. Потрачено "
             f"{_fmt_int(service['total_tokens'] or 0)} токенов."
         ]
-    return [
+    line = (
         f"- **🧵 Свёртка:** {service['covers']} сообщ. "
         f"(≈{_fmt_int(service['folded_tokens'])} токенов) → сводка "
         f"≈{_fmt_int(estimate_tokens(service['text']))} токенов; служебный "
         f"вызов {_fmt_int(service['total_tokens'])} токенов, "
         f"{_fmt_cost(service['cost_usd'])}, {service['elapsed']:.2f} s"
-    ]
+    )
+    if service.get("finish_reason") == "length":
+        # Обрезанная сводка применена, но выдавать её за нормальную нельзя:
+        # штатно в потолок служебного вызова упираться не должно.
+        line += (
+            " — ⚠️ **сводка упёрлась в потолок `max_tokens` и оборвана на "
+            "полуслове**, применена как есть"
+        )
+    return [line]
 
 
 _LEVEL_MARKERS = {"ok": "🟢", "warn": "🟡", "danger": "🔴", "over": "🔴"}
 
+# Тексты предупреждений не называют стратегий: панель не знает, какие они
+# бывают, и новые стратегии не должны требовать правок здесь.
 _LEVEL_WARNINGS = {
     "warn": (
-        "⚠️ **Занято больше 70% окна.** Дальше будет только быстрее — если "
-        "запрос собирается стратегией «Вся история»."
+        "⚠️ **Занято больше 70% окна.** Если активная стратегия историю не "
+        "сжимает, дальше будет только быстрее."
     ),
     "danger": (
         "🔴 **Занято больше 90% окна.** Ещё пара ходов — и запрос перестанет "
-        "влезать. Сжатие истории с дня 9 есть, но включается оно вручную: "
-        "переключателем стратегии слева."
+        "влезать. Сжатие само не включается: стратегия контекста "
+        "переключается слева."
     ),
     "over": (
         "🔴 **Оценка превышает окно модели.** Запрос всё равно будет отправлен "
@@ -301,16 +320,19 @@ def _context_md(
             else f"{_fmt_int(usage['limit'])} токенов"
         )
         + f", резерв под ответ {_fmt_int(usage['answer_reserve'])}",
-        f"- **В запросе:** система {_fmt_int(request['system'])} + история "
+        # Память стратегии (день 9) — слагаемое наравне с остальными: без неё
+        # сумма в строке не сходилась бы с итогом ровно на размер сводки.
+        f"- **В запросе:** система {_fmt_int(request['system'])} + память "
+        f"{_fmt_int(request['memory'])} + история "
         f"{_fmt_int(request['history'])} ({len(request['per_message'])} сообщ.) + "
         f"вопрос {_fmt_int(request['question'])} + служебные "
         f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(request['total'])}**",
-        # Строка дня 9: память стратегии — отдельная корзина, историей она не
-        # считается.
+        # Отдельная корзина, а не история: что это за память и куда встаёт.
         f"- **Память стратегии в запросе:** "
         + (
             f"≈{_fmt_int(request['memory'])} токенов — она уходит ведущим "
-            f"`system`-сообщением сразу после системного промпта"
+            f"`system`-сообщением сразу после системного промпта и в историю "
+            f"не входит"
             if request["memory"]
             else "ничего: у активной стратегии памяти нет или она пуста"
         ),
@@ -886,27 +908,35 @@ def on_strategy_change(agent: Agent | None, strategy_name: str, preset_name: str
 
     agent.set_strategy(strategy_name)
     view = agent.context_view()
-    if view.state.memory_text:
-        what = (
-            f"в запрос уйдут {view.state.memory_label.lower()} и "
-            f"{view.sent_messages} несвёрнутых сообщений из "
-            f"{view.history_messages}"
+    state = view.state
+    if view.pending_label:
+        # Свёртка назрела — типичный случай, когда на сжатие переключаются
+        # после нескольких ходов без него. Следующий запрос уйдёт уже после
+        # свёртки, и «все сообщения стека» были бы неправдой.
+        label = view.pending_label[:1].upper() + view.pending_label[1:]
+        status = (
+            f"Стратегия «{agent.strategy.name}». ⏳ {label} перед следующим "
+            f"ответом, и в запрос уйдут {state.memory_label.lower()} и "
+            f"{view.sent_messages - view.pending_messages} несвёрнутых "
+            f"сообщений из {view.history_messages}."
+        )
+    elif state.memory_text:
+        status = (
+            f"Стратегия «{agent.strategy.name}»: в запрос уйдут "
+            f"{state.memory_label.lower()} и {view.sent_messages} несвёрнутых "
+            f"сообщений из {view.history_messages}."
         )
     else:
         # Сокращение «сообщ.» уже кончается точкой, поэтому фразу закрываем
         # так, чтобы в статусе не выросло две подряд.
-        what = (
-            f"в запрос уйдут все {view.sent_messages} сообщ. стека, "
-            f"памяти у стратегии пока нет"
+        status = (
+            f"Стратегия «{agent.strategy.name}»: в запрос уйдут все "
+            f"{view.sent_messages} сообщ. стека, памяти у стратегии пока нет."
         )
     return (
         agent,
         gr.update(),
-        *_view(
-            agent,
-            f"Стратегия «{agent.strategy.name}»: {what}. Стек не тронут, "
-            f"история на диске полная.",
-        ),
+        *_view(agent, f"{status} Стек не тронут, история на диске полная."),
     )
 
 
@@ -945,17 +975,32 @@ def on_send(agent: Agent | None, message: str, preset_name: str):
                 f"за {_fmt_cost(service.cost_usd)}. Сам диалог цел — "
                 f"сжался запрос, а не память."
             )
+            if service.finish_reason == "length":
+                status += (
+                    " ⚠️ Сводка упёрлась в потолок служебного вызова и оборвана "
+                    "на полуслове — применена как есть."
+                )
         elif service is not None:
             status += (
                 f" ⚠️ Свёртка не удалась ({service.error}) — ход состоялся, "
                 f"память стратегии не сдвинулась, в модель ушло всё "
-                f"несвёрнутое."
+                f"несвёрнутое; свёртка повторится на следующем ходе."
             )
         # Поле ввода чистим только при успехе; при ошибке вопрос остаётся
         # в поле, чтобы его можно было отправить повторно.
         message_update = ""
     else:
         status = f"❌ {reply.error}"
+        service = reply.service_call
+        if service is not None and service.ok:
+            # Свёртка до упавшего вызова оплачена и уже применена: следующий
+            # вопрос уйдёт со сводкой, и это не должно стать сюрпризом.
+            status += (
+                f" 🧵 Свёртка перед вызовом при этом состоялась: "
+                f"{service.covers} сообщ. уехали в сводку за "
+                f"{_fmt_cost(service.cost_usd)} — она сохранена и уйдёт со "
+                f"следующим вопросом."
+            )
         message_update = gr.update()
 
     return (agent, message_update, *_view(agent, status))
@@ -1166,9 +1211,10 @@ with gr.Blocks(title="TooManyRules") as demo:
                 # удалён, как и `type="messages"` у `gr.Chatbot`.
                 buttons=["copy"],
             )
-            # Бюджет контекста стоит сразу под метриками последнего вызова:
-            # там факт после запроса, здесь оценка до него — один и тот же
-            # запрос с двух сторон.
+            # Бюджет контекста — под блоками дня 9: сначала «что отправляем»,
+            # потом «сколько это от окна». С метриками последнего вызова выше
+            # это один и тот же запрос с двух сторон: там факт после вызова,
+            # здесь оценка до него.
             context_md = gr.Markdown("")
             with gr.Row():
                 filler_size = gr.Number(
