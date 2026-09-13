@@ -1,5 +1,6 @@
 # TooManyRules — сущность агента (день 6, неделя 2; день 8 — работа с токенами,
-# день 9 — управление контекстом).
+# день 9 — управление контекстом, день 10 — общий служебный вызов, checkpoint'ы
+# и ветки диалога).
 #
 # Единственное место в проекте, где происходят вызовы LLM API. Модуль
 # намеренно ничего не знает ни про Gradio, ни про Too Many Bones: внутри
@@ -12,17 +13,26 @@
 # которые сами не импортируют ничего: `tokens.py` (день 8) и `context.py`
 # (день 9); замороженный `app_week1.py` не импортируется по-прежнему — см.
 # `docs/TooManyRules — Неделя 2 архитектура.md`, §3, и спецификации дня 8, §4,
-# и дня 9, §4.
+# дня 9, §4, и дня 10, §5.
 #
-# С дня 9 вызовов LLM API здесь два: основной (ответ игроку) и служебный
-# (свёртка старой части диалога в сводку, которую попросила стратегия). Оба —
-# в этом модуле: правило «вызовы LLM API только в `agent.py`» не нарушено.
+# С дня 9 вызовов LLM API здесь два: основной (ответ игроку) и служебный —
+# до дня 10 он был «свёрткой», а с дня 10 обслуживает любую стратегию с
+# памятью (сводку и факты) одним и тем же путём, а слова для лога и панели
+# берёт у стратегии. Оба вызова — в этом модуле: правило «вызовы LLM API
+# только в `agent.py`» не нарушено.
+#
+# День 10 также добавляет операцию над самой историей — checkpoint и ветку:
+# агент фиксирует точку диалога вместе со снимком памяти стратегий и порождает
+# от неё нового агента с общим началом истории. Это не стратегия и не вызов
+# API — обычная работа со стеком сообщений и с реестром агентов.
 
+import copy
 import logging
 import os
 import threading
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Protocol
 
 from dotenv import load_dotenv
@@ -165,10 +175,16 @@ class ServiceCall:
     covers: int
     folded_tokens: int         # оценка того, сколько эти сообщения весили
     text: str                  # что получилось — для панели
-    # В конце и с умолчанием, как поля дня 8 в `AgentReply`. "length" — сводка
-    # упёрлась в `max_tokens` и оборвана на полуслове: она всё равно применена,
+    # В конце и с умолчанием, как поля дня 8 в `AgentReply`. "length" — ответ
+    # упёрлась в `max_tokens` и оборван на полуслове: он всё равно применён,
     # но панель и лог говорят об этом вслух (спецификация дня 9, §6.2).
     finish_reason: str | None = None
+    # Поля дня 10 — тоже в конце и с умолчанием: как стратегия называет свою
+    # память («Сводка», «Факты») и чем отчиталось последнее применённое
+    # обновление (`StrategyState.last_update`). Панель показывает служебный
+    # вызов по ним и по `label`, не зная, какая стратегия его сделала.
+    memory_label: str = ""
+    memory_update: str = ""
 
 
 @dataclass(frozen=True)
@@ -236,6 +252,11 @@ class TurnStats:
     full_prompt_tokens: int = 0     # оценка «сколько ушло бы без сжатия»
     service_tokens: int = 0         # служебные токены, потраченные на этом ходе
     service_cost_usd: float | None = None
+    # Поля дня 10 — в конце: удобство для пользователя — один из пунктов
+    # сравнения стратегий, и «факты делают ход двумя вызовами» должно быть
+    # видно числом, а не на слово.
+    elapsed: float = 0.0            # время основного вызова
+    service_elapsed: float = 0.0    # время служебного вызова на этом ходе
 
 
 @dataclass(frozen=True)
@@ -254,8 +275,42 @@ class ContextView:
     sent_messages: int             # сообщений истории в запросе
     history_messages: int          # сообщений в стеке
     saved_tokens: int              # full.total - usage.estimated, может быть < 0
-    pending_label: str             # «свёртка назрела: …», "" — не назрела
+    pending_label: str             # «свёртка сообщений …», "" — задачи нет
     pending_messages: int
+    # Поле дня 10 — в конце: `ContextTask.sends` назревшей задачи (сколько
+    # сообщений истории уйдёт в запрос, когда она применится); 0, если задачи
+    # нет. Статус при переключении стратегии берёт число отсюда, а не считает
+    # его сам, — правило это знает только стратегия (спецификация дня 10, §4.1).
+    pending_sent_messages: int = 0
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    """Зафиксированная точка текущей сессии (день 10): сколько сообщений в
+    истории, какая стратегия активна и снимок памяти всех стратегий на этот
+    момент. Сами сообщения не копируются — история от checkpoint'а не
+    укорачивается, поэтому «первые 12 сообщений» остаются первыми двенадцатью
+    навсегда. Ставится только в конце истории: снимок памяти согласован с
+    историей лишь в этой точке (спецификация дня 10, §2.3)."""
+
+    id: str             # "cp1", "cp2", … в пределах сессии
+    messages: int        # длина истории в точке сохранения, > 0
+    strategy: str        # активная стратегия в этой точке
+    memory: dict          # снимок памяти стратегий — тот же вид, что context["memory"]
+    created_at: str      # время сохранения, ISO до секунд
+
+
+@dataclass(frozen=True)
+class BranchOrigin:
+    """Происхождение ветки: от какого checkpoint'а какой сессии она создана.
+    Ссылка историческая — родителя могли сбросить или удалить, и ветка живёт
+    дальше как самостоятельный диалог (спецификация дня 10, §2.3)."""
+
+    parent: str          # session_id сессии, от checkpoint'а которой создана ветка
+    checkpoint: str      # id этого checkpoint'а
+    messages: int         # длина общего префикса
+    created_at: str      # время этого checkpoint'а: id после сброса родителя
+                          # повторяются, время — нет
 
 
 class HistoryStore(Protocol):
@@ -368,6 +423,53 @@ def delete_agent(number: int) -> bool:
     return True
 
 
+def _family_root(agent: "Agent", by_session: dict[str, "Agent"]) -> str:
+    """`session_id` корня семейства веток: поднимаемся по `branch.parent`,
+    пока родитель есть в реестре. Последний известный `session_id` и есть
+    ключ семейства — даже если такого агента в реестре уже нет (родителя
+    сбросили или удалили). `visited` защищает от битой ссылки, где родитель
+    ссылается сам на себя или на собственного потомка."""
+    session = agent.session_id
+    visited = {session}
+    node: "Agent | None" = agent
+    while node is not None and node.branch is not None:
+        session = node.branch.parent
+        if session in visited:
+            break
+        visited.add(session)
+        node = by_session.get(session)
+    return session
+
+
+def branch_family(agent: "Agent") -> list["Agent"]:
+    """Исходный диалог и все его ветки из реестра, в порядке создания
+    (спецификация дня 10, §5.2). Агент без происхождения и без веток —
+    семейство из одного."""
+    registry = agents()
+    by_session = {a.session_id: a for a in registry}
+    root = _family_root(agent, by_session)
+    return [a for a in registry if _family_root(a, by_session) == root]
+
+
+def branch_parent(agent: "Agent") -> "Agent | None":
+    """Родитель ветки, если связь с ним жива: агент с `session_id ==
+    branch.parent` есть в реестре, и среди его checkpoint'ов есть checkpoint
+    с тем же `id` и тем же `created_at` (спецификация дня 10, §5.2). Иначе
+    `None` — родителя сбросили или удалили (после сброса у него новый диалог
+    и, возможно, новый `cp1`, но уже с другим временем)."""
+    branch = agent.branch
+    if branch is None:
+        return None
+    for candidate in agents():
+        if candidate.session_id != branch.parent:
+            continue
+        for checkpoint in candidate.checkpoints:
+            if checkpoint.id == branch.checkpoint and checkpoint.created_at == branch.created_at:
+                return candidate
+        return None
+    return None
+
+
 def _register_agent(agent: "Agent") -> int:
     """Регистрирует созданного агента и возвращает его порядковый номер.
     Нумерация сквозная, с 1: номер — это значение счётчика `agents_created` на
@@ -399,6 +501,12 @@ class Agent:
         store: HistoryStore | None = None,
         strategies: dict[str, context.ContextStrategy] | None = None,
         strategy: str | None = None,
+        # Начальное состояние ветки (день 10, §5.2): передаёт только `fork()`,
+        # `app.py` агентов с `seed` не создаёт. Единственный способ собрать
+        # ветку — регистрация в реестре должна остаться последним шагом
+        # конструктора (день 6), а ветка, созданная обычным конструктором и
+        # дописанная потом, успела бы побыть в реестре пустой.
+        seed: dict | None = None,
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -466,10 +574,30 @@ class Agent:
         # работает целиком в памяти процесса (это и есть режим дня 6).
         self._messages: list[dict] = []
         self._store_error: str | None = None
+        # Checkpoint'ы и происхождение ветки (день 10) — пустые до чтения
+        # хранилища/`seed`: `_load_context()` заполняет их из блока `context`
+        # тем же кодом, что и память стратегий.
+        self._checkpoints: list[Checkpoint] = []
+        self._branch: BranchOrigin | None = None
         # Запись выключается ровно в одном случае — если не удалось прочитать
         # свою историю: агент, не прочитавший файл, не должен его затирать.
         self._store_writable = store is not None
-        if store is not None and config.keep_history:
+
+        if seed is not None:
+            # Ветка (день 10, §5.2): начальное состояние приходит параметром,
+            # а не из хранилища, но читается тем же кодом, которым агент
+            # читает файл сессии — `_normalize_messages()` и `_load_context()`.
+            # Хранилище на чтение не трогается: у ветки может ещё не быть
+            # ничего своего на диске.
+            self._messages = _normalize_messages(seed.get("messages") or [])
+            try:
+                self._load_context(seed.get("context") or {})
+            except Exception as exc:
+                self._startup_warnings.append(
+                    f"память стратегий ветки не прочиталась, стартуем с "
+                    f"пустой: {exc}"
+                )
+        elif store is not None and config.keep_history:
             try:
                 self._messages = _normalize_messages(store.load(session_id))
             except Exception as exc:
@@ -480,10 +608,11 @@ class Agent:
                 self._store_error = (
                     f"история не загрузилась, запись выключена: {exc}"
                 )
-            # Память стратегий и имя активной — отдельным чтением и отдельным
-            # try: сбой контекста не должен отменять чтение истории. Не
-            # прочиталось — стартуем с пустой памятью и предупреждением в лог,
-            # файл при этом не трогаем.
+            # Память стратегий, checkpoint'ы, происхождение ветки и имя
+            # активной стратегии — отдельным чтением и отдельным try: сбой
+            # контекста не должен отменять чтение истории. Не прочиталось —
+            # стартуем с пустой памятью и предупреждением в лог, файл при
+            # этом не трогаем.
             try:
                 self._load_context(store.load_context(session_id))
             except Exception as exc:
@@ -492,8 +621,9 @@ class Agent:
                 )
         # Сколько сообщений пришло из хранилища: после первого же хода
         # `len(history)` растёт, и «сколько было восстановлено» иначе не
-        # показать.
-        self._restored_messages = len(self._messages)
+        # показать. У ветки — всегда 0: из хранилища ей ничего не пришло,
+        # сколько сообщений скопировано из checkpoint'а, говорит `branch.messages`.
+        self._restored_messages = 0 if seed is not None else len(self._messages)
 
         # Регистрация в реестре — последним шагом конструктора, когда все
         # поля уже проставлены: наружу не должен попасть недособранный агент.
@@ -502,14 +632,24 @@ class Agent:
         # ничего не различает, а с дня 7 у каждого агента ещё и свой файл —
         # поэтому в префиксе и номер, и сессия.
         self._log_name = f"#{self._number} {config.name} · {session_id}"
-        logger.info(
-            "[%s] агент создан: model=%s thinking=%s стратегия=«%s» "
-            "восстановлено из хранилища=%d сообщ.%s, живых агентов: %d",
-            self._log_name, config.model, _thinking_label(config.thinking),
-            self._strategy_name, self._restored_messages,
-            _memory_note(self.strategy.describe(self._messages)),
-            process_stats()["agents_alive"],
-        )
+        if seed is not None and self._branch is not None:
+            logger.info(
+                "[%s] агент создан как ветка от %s · %s: общий префикс %d "
+                "сообщ., стратегия «%s», память стратегий из снимка "
+                "checkpoint'а; живых агентов: %d",
+                self._log_name, self._branch.parent, self._branch.checkpoint,
+                self._branch.messages, self._strategy_name,
+                process_stats()["agents_alive"],
+            )
+        else:
+            logger.info(
+                "[%s] агент создан: model=%s thinking=%s стратегия=«%s» "
+                "восстановлено из хранилища=%d сообщ.%s, живых агентов: %d",
+                self._log_name, config.model, _thinking_label(config.thinking),
+                self._strategy_name, self._restored_messages,
+                _memory_note(self.strategy.describe(self._messages)),
+                process_stats()["agents_alive"],
+            )
         # Сбой загрузки логируется здесь, а не на месте: до регистрации в
         # реестре у агента ещё нет номера, а без номера строка в логе
         # ничего не опознаёт.
@@ -517,6 +657,12 @@ class Agent:
             logger.warning("[%s] %s", self._log_name, self._store_error)
         for warning in self._startup_warnings:
             logger.warning("[%s] %s", self._log_name, warning)
+
+        if seed is not None:
+            # История у ветки уже есть и должна пережить перезапуск до
+            # первого вопроса — файл пишется сразу, а не после первого
+            # успешного ответа (спецификация дня 10, §5.2).
+            self._persist()
 
     # --- Публичный контракт ---------------------------------------------
 
@@ -578,6 +724,19 @@ class Agent:
         """Сколько сообщений пришло из хранилища при создании агента. Ноль —
         и когда хранилища нет, и когда файла сессии ещё не было."""
         return self._restored_messages
+
+    @property
+    def checkpoints(self) -> list[Checkpoint]:
+        """Checkpoint'ы этой сессии, по порядку сохранения. Копия списка, как
+        `history` — наружу сам список не уезжает."""
+        return list(self._checkpoints)
+
+    @property
+    def branch(self) -> BranchOrigin | None:
+        """Происхождение этой сессии, если она ветка. `None` — это не ветка,
+        а не «связь с родителем потеряна»: то, жива ли связь, знает только
+        `branch_parent()`, у него для этого есть реестр агентов."""
+        return self._branch
 
     @property
     def turns(self) -> list[TurnStats]:
@@ -752,22 +911,126 @@ class Agent:
         return reply
 
     def reset(self) -> None:
-        """Очищает стек сообщений и память всех стратегий. Счётчики за время
-        жизни агента, журнал ходов и метрики последнего вызова сохраняются —
-        это разные вещи: сброшен диалог, а не агент.
+        """Очищает стек сообщений, память всех стратегий, checkpoint'ы и
+        происхождение ветки. Счётчики за время жизни агента, журнал ходов и
+        метрики последнего вызова сохраняются — это разные вещи: сброшен
+        диалог, а не агент.
 
         Память чистится вся, а не только у активной стратегии: сводка
         удалённого диалога не должна пережить сброс и уехать в запрос после
-        переключения.
+        переключения. Checkpoint'ы и происхождение ветки чистятся вместе со
+        стеком по той же причине — они ссылаются на диалог, которого больше
+        нет (спецификация дня 10, §5.2). Ветки, созданные раньше, это не
+        задевает: у них свои файлы.
         """
         self._messages = []
         for strategy in self._strategies.values():
             strategy.reset()
+        self._checkpoints = []
+        self._branch = None
         self._persist()
         logger.info(
-            "[%s] стек сообщений очищен (reset); память стратегий (%s) "
-            "очищена вместе с ним",
+            "[%s] стек сообщений очищен (reset); память стратегий (%s), "
+            "checkpoint'ы и происхождение ветки очищены вместе с ним",
             self._log_name, ", ".join(f"«{name}»" for name in self._strategies),
+        )
+
+    def save_checkpoint(self) -> Checkpoint | None:
+        """Фиксирует конец текущей истории вместе со снимком памяти всех
+        стратегий (спецификация дня 10, §5.2).
+
+        Пустой стек — ветвиться не от чего, `None`. Повторное сохранение без
+        изменений (та же длина истории, та же стратегия, тот же снимок
+        памяти, что у последнего checkpoint'а) не плодит одинаковых
+        checkpoint'ов — возвращается уже существующий.
+        """
+        if not self._messages or not self._config.keep_history:
+            logger.info(
+                "[%s] checkpoint не сохранён: стек пуст, ветвиться не от чего",
+                self._log_name,
+            )
+            return None
+
+        # Глубокая копия: память стратегий дальше меняется, снимок — нет.
+        memory = copy.deepcopy(self._context_dump()["memory"])
+        existing = self._unchanged_checkpoint(memory)
+        if existing is not None:
+            logger.info(
+                "[%s] checkpoint не сохранён: совпадает с существующим %s",
+                self._log_name, existing.id,
+            )
+            return existing
+
+        checkpoint = Checkpoint(
+            id=f"cp{self._next_checkpoint_number()}",
+            messages=len(self._messages),
+            strategy=self._strategy_name,
+            memory=memory,
+            created_at=_now_iso(),
+        )
+        self._checkpoints.append(checkpoint)
+        self._persist()
+        logger.info(
+            "[%s] checkpoint %s: %d сообщ., стратегия «%s», снимок памяти "
+            "стратегий: %s",
+            self._log_name, checkpoint.id, checkpoint.messages,
+            checkpoint.strategy, ", ".join(memory) if memory else "нет памяти",
+        )
+        return checkpoint
+
+    def fork(
+        self,
+        checkpoint_id: str,
+        session_id: str,
+        strategies: dict[str, context.ContextStrategy] | None = None,
+    ) -> "Agent | None":
+        """Создаёт ветку от одного из checkpoint'ов этой сессии: новый агент
+        с новой сессией, в историю которого скопирован префикс до
+        checkpoint'а, а память стратегий и активная стратегия — из снимка
+        (спецификация дня 10, §5.2).
+
+        Родителя (эту сессию) не трогает никак: ни стек, ни память, ни файл —
+        семейство веток вычисляется по происхождению, а не хранится у
+        родителя (`branch_family()`).
+        """
+        checkpoint = next(
+            (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
+        )
+        if (
+            checkpoint is None
+            or not self._config.keep_history
+            or checkpoint.messages > len(self._messages)
+        ):
+            logger.warning(
+                "[%s] ветка от checkpoint'а «%s» не создана: такого "
+                "checkpoint'а нет или он устарел",
+                self._log_name, checkpoint_id,
+            )
+            return None
+
+        origin = BranchOrigin(
+            parent=self._session_id,
+            checkpoint=checkpoint.id,
+            messages=checkpoint.messages,
+            created_at=checkpoint.created_at,
+        )
+        seed = {
+            "messages": self._messages[:checkpoint.messages],
+            "context": {
+                "strategy": checkpoint.strategy,
+                "memory": copy.deepcopy(checkpoint.memory),
+                "branch": asdict(origin),
+                # Ключа `checkpoints` здесь нет: список checkpoint'ов у ветки
+                # пустой (спецификация дня 10, §2.3) — checkpoint'ы не
+                # наследуются.
+            },
+        }
+        return Agent(
+            self._config,
+            session_id=session_id,
+            store=self._store,
+            strategies=strategies,
+            seed=seed,
         )
 
     def debug_state(self) -> dict:
@@ -800,6 +1063,19 @@ class Agent:
             # весить сотни килобайт, и в панель им не место.
             "strategy": self._strategy_name,
             "context_view": asdict(view),
+            # Ключи дня 10 — в конце. Снимок памяти в `checkpoints` панели не
+            # нужен (весит килобайты) и не отдаётся — только id, длина,
+            # стратегия и время.
+            "checkpoints": [
+                {
+                    "id": cp.id,
+                    "messages": cp.messages,
+                    "strategy": cp.strategy,
+                    "created_at": cp.created_at,
+                }
+                for cp in self._checkpoints
+            ],
+            "branch": asdict(self._branch) if self._branch is not None else None,
         }
 
     # --- Внутреннее ------------------------------------------------------
@@ -810,8 +1086,10 @@ class Agent:
         С дня 9 сборку делает стратегия: агент отдаёт ей системный промпт,
         весь стек и новый вопрос, а что из этого уедет в модель — решает она
         (`context.py`, §4). Сам стек при этом не меняется: сжимается запрос,
-        а не память. День 10 добавит сюда ещё три стратегии, не тронув ни
-        строчки в этом методе.
+        а не память. День 10 добавил сюда «Скользящее окно» и «Факты +
+        последние N», не тронув ни строчки в этом методе — обе встают в тот
+        же протокол `ContextStrategy`. Ветки — операция над самой историей
+        (`fork()`), а не способ собрать запрос, и этого метода не касаются.
         """
         return self.strategy.build(
             self._config.system_prompt, self._messages, user_message
@@ -857,23 +1135,27 @@ class Agent:
             # Экономия — по сырым оценкам обеих сборок: калибровка это общий
             # множитель, в отношении он бы сократился.
             saved_tokens=full.total - usage.estimated,
-            # В панель уходит описание назревшей свёртки, а не сама задача:
-            # её `messages` могут весить сотни килобайт.
+            # В панель уходит описание назревшей задачи, а не она сама: её
+            # `messages` могут весить сотни килобайт.
             pending_label=task.label if task else "",
             pending_messages=task.covers - state.covered if task else 0,
+            pending_sent_messages=task.sends if task else 0,
         )
 
     def _run_context_task(
         self, client: OpenAI, question: str
     ) -> ServiceCall | None:
-        """Служебный вызов, если стратегия его попросила: свернуть старую
-        часть диалога в сводку.
+        """Служебный вызов, если стратегия его попросила: обновление памяти —
+        свёртка в сводку или разбор фактов, в зависимости от активной
+        стратегии (день 10). Метод один на обе: слова для лога и панели
+        приходят от стратегии (`task.label`, `StrategyState.memory_label`,
+        `StrategyState.last_update`) — агент не знает, сводка это или факты.
 
         Второе (и последнее) место в проекте, где вызывается
         `chat.completions.create`. Набор параметров у него намеренно другой:
         сообщения из задачи, `thinking` всегда выключен (скрытые
         reasoning-токены тратят тот же бюджет `max_tokens`, что и видимый
-        ответ, и на маленьком лимите сводка пришла бы пустой), `max_tokens` из
+        ответ, и на маленьком лимите ответ пришёл бы пустым), `max_tokens` из
         задачи, ни температуры, ни `stop`.
 
         Это настоящий вызов, но не ход: в стек сообщений он не пишет, строку
@@ -883,7 +1165,8 @@ class Agent:
         if task is None:
             return None
 
-        covered_before = self.strategy.describe(self._messages).covered
+        before = self.strategy.describe(self._messages)
+        covered_before = before.covered
         folded = self._messages[covered_before:task.covers]
         folded_tokens = sum(
             tokens.estimate_tokens(message.get("content")) for message in folded
@@ -907,13 +1190,15 @@ class Agent:
                 elapsed=time.perf_counter() - started,
                 prompt_tokens=None, completion_tokens=None, total_tokens=None,
                 cost_usd=None, covers=0, folded_tokens=folded_tokens, text="",
+                memory_label=before.memory_label,
             )
             self._record_service(call)
             logger.warning(
-                "[%s] свёртка не удалась: %s; ход не отменяется: память не "
-                "сдвинулась, в запрос уйдёт всё несвёрнутое (%d сообщ.), "
-                "свёртка повторится на следующем ходе",
-                self._log_name, call.error, len(self._messages) - covered_before,
+                "[%s] служебный вызов — %s: не удался (%s); ход не "
+                "отменяется: память не сдвинулась, в запрос уйдёт всё "
+                "неучтённое (%d сообщ.), вызов повторится на следующем ходе",
+                self._log_name, task.label, call.error,
+                len(self._messages) - covered_before,
             )
             return call
 
@@ -927,53 +1212,82 @@ class Agent:
         cost_usd = estimate_cost_usd(
             self._config.model, prompt_tokens, completion_tokens
         )
+
+        if not text:
+            call = ServiceCall(
+                kind=task.kind, label=task.label, ok=False,
+                error="модель вернула пустой ответ",
+                elapsed=elapsed,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                total_tokens=total_tokens, cost_usd=cost_usd,
+                covers=0, folded_tokens=folded_tokens, text="",
+                finish_reason=choice.finish_reason,
+                memory_label=before.memory_label,
+            )
+            self._record_service(call)
+            logger.warning(
+                "[%s] служебный вызов — %s: модель вернула пустой ответ — "
+                "память не сдвинулась, сообщения #%d-#%d останутся в запросе "
+                "целиком, вызов повторится на следующем ходе",
+                self._log_name, task.label, covered_before, task.covers - 1,
+            )
+            return call
+
+        # `apply()` — единственный, кто знает, разобралась ли хоть одна
+        # строка (день 10, §5.1): непустой ответ ещё не значит успех.
+        applied = self.strategy.apply(task, text)
+        after = self.strategy.describe(self._messages)
         call = ServiceCall(
             kind=task.kind,
             label=task.label,
-            ok=bool(text),
-            error=None if text else "модель вернула пустую сводку",
+            ok=applied,
+            error=None if applied else "ответ модели не разобран",
             elapsed=elapsed,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             cost_usd=cost_usd,
-            covers=task.covers - covered_before if text else 0,
+            covers=task.covers - covered_before if applied else 0,
             folded_tokens=folded_tokens,
             text=text,
             finish_reason=choice.finish_reason,
+            memory_label=after.memory_label,
+            memory_update=after.last_update if applied else "",
         )
         # Токены потрачены в любом случае — считаем их до того, как решим,
         # годится ли результат.
         self._record_service(call)
-        if not text:
+        if not applied:
             logger.warning(
-                "[%s] свёртка: модель вернула пустой ответ — память не "
-                "сдвинулась, сообщения #%d-#%d останутся в запросе целиком, "
-                "свёртка повторится на следующем ходе",
-                self._log_name, covered_before, task.covers - 1,
+                "[%s] служебный вызов — %s: ответ модели не разобран — "
+                "память не сдвинулась, начало ответа: %r; в запрос уйдёт "
+                "всё неучтённое, вызов повторится на следующем ходе",
+                self._log_name, task.label, text[:200],
             )
             return call
 
-        self.strategy.apply(task, text)
-        # Немедленное сохранение: свёртка уже оплачена, и падение до основного
-        # вызова не должно её терять.
+        # Немедленное сохранение: обновление уже оплачено, и падение до
+        # основного вызова не должно его терять.
         self._persist()
         logger.info(
-            "[%s] свёртка: сообщения #%d-#%d (%d шт., ≈%s токенов) → сводка "
-            "≈%s токенов; служебный вызов %.2fs, tokens=%s/%s/%s, cost=%s",
-            self._log_name, covered_before, task.covers - 1, call.covers,
-            _num(folded_tokens), _num(tokens.estimate_tokens(text)), elapsed,
+            "[%s] служебный вызов — %s: учтено ≈%s токенов истории → %s "
+            "≈%s токенов (%s); %.2fs, tokens=%s/%s/%s, cost=%s",
+            self._log_name, task.label, _num(folded_tokens),
+            after.memory_label.lower(),
+            _num(tokens.estimate_tokens(after.memory_text)),
+            after.last_update, elapsed,
             prompt_tokens, completion_tokens, total_tokens, _cost_str(cost_usd),
         )
-        # Обрезанная сводка применена — отказ от неё оставил бы свёртку
+        # Обрезанный ответ применён — отказ от него оставил бы задачу
         # назревшей, и она повторялась бы каждый ход за деньги и с тем же
         # итогом. Но молча это не проходит: штатно в потолок упираться нельзя.
         if choice.finish_reason == "length":
             logger.warning(
-                "[%s] свёртка: сводка упёрлась в max_tokens=%s и оборвана на "
-                "полуслове — применена как есть; если это повторяется, потолок "
-                "мал для реальной длины сводки (спецификация дня 9, §3.1)",
-                self._log_name, task.max_tokens,
+                "[%s] служебный вызов — %s: ответ упёрся в max_tokens=%s и "
+                "оборван на полуслове — применён как есть; если это "
+                "повторяется, потолок мал для реальной длины (спецификации "
+                "дня 9, §3.1, и дня 10, §3.1)",
+                self._log_name, task.label, task.max_tokens,
             )
         return call
 
@@ -1090,17 +1404,26 @@ class Agent:
             self._store_error = None
 
     def _context_dump(self) -> dict:
-        """Память стратегий и имя активной — одним блоком для хранилища.
+        """Память стратегий, имя активной, checkpoint'ы и происхождение ветки —
+        одним блоком для хранилища.
 
         Пустые памяти в файл не пишутся: у «Всей истории» её нет вовсе, и
-        строчка `{}` в файле сессии только мешала бы читать его глазами.
+        строчка `{}` в файле сессии только мешала бы читать его глазами. Так
+        же не пишутся пустой список checkpoint'ов и отсутствующее
+        происхождение ветки (день 10) — хранилище про них ничего не знает,
+        блок `context` для него непрозрачен целиком.
         """
         memory = {
             name: dump
             for name, strategy in self._strategies.items()
             if (dump := strategy.dump())
         }
-        return {"strategy": self._strategy_name, "memory": memory}
+        data: dict = {"strategy": self._strategy_name, "memory": memory}
+        if self._checkpoints:
+            data["checkpoints"] = [asdict(cp) for cp in self._checkpoints]
+        if self._branch is not None:
+            data["branch"] = asdict(self._branch)
+        return data
 
     def _load_context(self, data: dict) -> None:
         """Память стратегий из файла сессии.
@@ -1147,6 +1470,132 @@ class Agent:
         saved = data.get("strategy")
         if isinstance(saved, str) and saved:
             self._strategy_name = self._known_strategy(saved)
+        # Checkpoint'ы и происхождение ветки (день 10) — тем же приёмом, что
+        # память стратегий: мусор переживается с предупреждением, историю
+        # читать это не мешает. `self._messages` здесь уже проставлены — и при
+        # чтении из хранилища, и из `seed` (порядок в `__init__` гарантирует
+        # это в обоих случаях).
+        self._checkpoints = self._parse_checkpoints(data.get("checkpoints"))
+        self._branch = self._parse_branch(data.get("branch"))
+
+    def _parse_checkpoints(self, data: object) -> list[Checkpoint]:
+        """Checkpoint'ы из файла сессии. Файл дня 9 (ключа нет) даёт пустой
+        список без предупреждений; переживает мусор: не список, не словарь,
+        чужие типы, пустые строки, `messages` вне `1..len(history)`,
+        повторяющиеся `id`, `memory` не словарь — такой checkpoint
+        пропускается с предупреждением, остальные читаются (спецификация
+        дня 10, §5.2)."""
+        if data is None:
+            return []
+        if not isinstance(data, list):
+            self._startup_warnings.append(
+                f"ключ checkpoints в файле имеет тип {type(data).__name__} "
+                f"вместо списка — checkpoint'ы не прочитаны"
+            )
+            return []
+        history_len = len(self._messages)
+        result: list[Checkpoint] = []
+        seen_ids: set[str] = set()
+        for item in data:
+            checkpoint = self._parse_one_checkpoint(item, history_len, seen_ids)
+            if checkpoint is not None:
+                result.append(checkpoint)
+                seen_ids.add(checkpoint.id)
+        return result
+
+    def _parse_one_checkpoint(
+        self, item: object, history_len: int, seen_ids: set[str]
+    ) -> Checkpoint | None:
+        if not isinstance(item, dict):
+            self._startup_warnings.append(
+                f"checkpoint в файле имеет тип {type(item).__name__} вместо "
+                f"словаря — пропущен"
+            )
+            return None
+        checkpoint_id = item.get("id")
+        messages = item.get("messages")
+        strategy = item.get("strategy")
+        memory = item.get("memory")
+        created_at = item.get("created_at")
+        valid = (
+            isinstance(checkpoint_id, str) and checkpoint_id
+            and checkpoint_id not in seen_ids
+            and isinstance(messages, int) and not isinstance(messages, bool)
+            and 1 <= messages <= history_len
+            and isinstance(strategy, str) and strategy
+            and isinstance(memory, dict)
+            and isinstance(created_at, str) and created_at
+        )
+        if not valid:
+            self._startup_warnings.append(
+                f"checkpoint «{checkpoint_id}» в файле битый — пропущен"
+            )
+            return None
+        return Checkpoint(
+            id=checkpoint_id, messages=messages, strategy=strategy,
+            memory=memory, created_at=created_at,
+        )
+
+    def _parse_branch(self, data: object) -> BranchOrigin | None:
+        """Происхождение ветки из файла сессии. Битое происхождение (не
+        словарь, пустые `parent`/`checkpoint`/`created_at`, `messages` вне
+        `1..len(history)`) — не ветка, с предупреждением (спецификация
+        дня 10, §5.2): эта сессия тогда считается самостоятельным диалогом.
+        Снимок памяти внутри checkpoint'а здесь не разбирается — он
+        непрозрачен так же, как `context` для хранилища."""
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            self._startup_warnings.append(
+                f"ключ branch в файле имеет тип {type(data).__name__} вместо "
+                f"словаря — происхождение не прочитано"
+            )
+            return None
+        parent = data.get("parent")
+        checkpoint = data.get("checkpoint")
+        messages = data.get("messages")
+        created_at = data.get("created_at")
+        valid = (
+            isinstance(parent, str) and parent
+            and isinstance(checkpoint, str) and checkpoint
+            and isinstance(messages, int) and not isinstance(messages, bool)
+            and 1 <= messages <= len(self._messages)
+            and isinstance(created_at, str) and created_at
+        )
+        if not valid:
+            self._startup_warnings.append(
+                "происхождение ветки в файле битое — эта сессия считается "
+                "самостоятельным диалогом"
+            )
+            return None
+        return BranchOrigin(
+            parent=parent, checkpoint=checkpoint, messages=messages,
+            created_at=created_at,
+        )
+
+    def _next_checkpoint_number(self) -> int:
+        """Следующий свободный номер checkpoint'а этой сессии, с 1."""
+        numbers = [
+            int(cp.id[2:]) for cp in self._checkpoints
+            if cp.id.startswith("cp") and cp.id[2:].isdigit()
+        ]
+        return max(numbers, default=0) + 1
+
+    def _unchanged_checkpoint(self, memory: dict) -> Checkpoint | None:
+        """Последний checkpoint, если он совпадает с тем, что получился бы
+        сейчас, — та же длина истории, та же стратегия, тот же снимок памяти.
+        Только последний: более ранний совпадающий checkpoint не должен
+        мешать завести новый в другой точке истории."""
+        if not self._checkpoints:
+            return None
+        last = self._checkpoints[-1]
+        if (
+            last.messages == len(self._messages)
+            and last.strategy == self._strategy_name
+            and last.memory == memory
+        ):
+            return last
+        return None
 
     def _known_strategy(self, name: str) -> str:
         """Имя стратегии из файла или от вызывающей стороны, приведённое к
@@ -1226,6 +1675,8 @@ class Agent:
                 full_prompt_tokens=view.full.total,
                 service_tokens=(service.total_tokens or 0) if service else 0,
                 service_cost_usd=service.cost_usd if service else None,
+                elapsed=reply.elapsed,
+                service_elapsed=service.elapsed if service else 0.0,
             )
         )
         # Экономия копится по ходам и может быть отрицательной: на коротком
@@ -1303,13 +1754,20 @@ class Agent:
 
 
 def _normalize_messages(messages: list[dict]) -> list[dict]:
-    """Приводит загруженную из хранилища историю к тому же виду, в котором
-    её ведёт агент: только user/assistant, только role и content."""
+    """Приводит загруженную из хранилища историю (или префикс `seed` ветки,
+    день 10) к тому же виду, в котором её ведёт агент: только user/assistant,
+    только role и content."""
     return [
         {"role": message["role"], "content": message["content"]}
         for message in messages
         if message.get("role") in ("user", "assistant")
     ]
+
+
+def _now_iso() -> str:
+    """Время для checkpoint'а и происхождения ветки, ISO до секунд — тем же
+    форматом, что `storage.py` пишет `created_at`/`updated_at`."""
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:
@@ -1335,10 +1793,12 @@ def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:
             f"сократить."
         )
     else:
+        # День 10: совет не про «сжимающую» стратегию — окно историю не
+        # сжимает, а отбрасывает, но тоже не отправляет всю историю целиком.
         advice = (
-            "Вопрос можно задать заново, сбросив диалог или переключив стратегию "
-            "управления контекстом на сжимающую: тогда старая часть истории "
-            "уйдёт в запрос в сжатом виде."
+            "Вопрос можно задать заново, сбросив диалог или переключив "
+            "стратегию управления контекстом на такую, что не отправляет всю "
+            "историю целиком (сжатие в сводку или окно последних сообщений)."
         )
     return (
         f"Запрос не влез в контекстное окно модели и отклонён целиком. "

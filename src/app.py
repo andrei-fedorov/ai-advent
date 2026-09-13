@@ -1,4 +1,5 @@
-# TooManyRules — приложение недели 2 (день 9): чат через агента + дебаг-панель.
+# TooManyRules — приложение недели 2 (день 9: чат через агента + дебаг-панель;
+# день 10: четыре стратегии, checkpoint'ы и ветки диалога).
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
@@ -9,9 +10,13 @@
 # контекстом — в `context.py`, и напрямую он отсюда тоже не импортируется:
 # набор стратегий агенту выдаёт `presets.make_strategies()`.
 #
-# Панель не знает, какие бывают стратегии и что такое сводка: она рисует то,
-# что вернули `debug_state()` и `ContextView` — имя, описание словами, текст
-# памяти и числа. День 10 добавит стратегий, не тронув здесь ни строчки.
+# Панель не знает, какие бывают стратегии и что такое сводка или факты: она
+# рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
+# словами, текст памяти и числа. День 10 добавил в переключатель ещё две
+# стратегии и не тронул код, который их рисует, — но тронул слова: «свёртка»,
+# «сводка», «несвёрнутых» были зашиты в тексты панели, и для окна и фактов это
+# было неправдой (спецификация дня 10, §7.1). Сегодня в текстах интерфейса нет
+# ни одного слова, верного только для одной стратегии.
 #
 # Интерфейс — это вид на состояние агента: содержимое чата на каждом шаге
 # рендерится из `agent.history`, своей копии переписки Gradio не ведёт.
@@ -23,6 +28,11 @@
 # переключаются чат, стек сообщений, конфиг и метрики. С дня 7 агенты
 # переживают перезапуск: при старте процесса они поднимаются по файлам
 # сессий, и открытая страница сразу показывает диалог.
+#
+# День 10 добавляет операцию над самой историей — checkpoint и ветку: ветка
+# диалога — это **отдельная сессия и отдельный агент**, а не пункт списка
+# стратегий (спецификация дня 10, §2.2). У неё свой переключатель («Ветка
+# диалога»), устроенный так же, как переключатель агентов.
 #
 # Вкладок больше нет: дни недели 2 наращивают одну и ту же сущность, и
 # «что нового сегодня» показывает дебаг-панель. Дни 1-5 живут в
@@ -40,11 +50,17 @@ from agent import (
     Agent,
     agent_by_number,
     agents,
+    branch_family,
+    branch_parent,
     delete_agent,
     estimate_cost_usd,
     process_stats,
 )
 from presets import (
+    BRANCH_QUESTION,
+    BRANCH_STEPS,
+    COMPARISON_SCENARIO,
+    CONTROL_QUESTIONS,
     DEFAULT_PRESET,
     DEFAULT_STRATEGY,
     PRESETS,
@@ -106,13 +122,6 @@ def _fmt_saved(saved: int, full_total: int) -> str:
     return f"{sign}{abs(saved) / full_total * 100:.0f}%"
 
 
-def _times_word(count: int) -> str:
-    """«1 раз» / «2 раза» / «5 раз»: строку в панели читает человек."""
-    if 11 <= count % 100 <= 14:
-        return "раз"
-    return "раза" if count % 10 in (2, 3, 4) else "раз"
-
-
 def _agent_title(agent: Agent) -> str:
     """Как агент называется в подписях и статусах: номер отличает инстансы
     друг от друга, имя пресета говорит, чем они отличаются."""
@@ -137,12 +146,20 @@ def _agent_choices(active: Agent) -> list[tuple[str, int]]:
         entries.insert(0, (active, " · удалён"))
     return [
         (
-            f"#{agent.number} · {agent.config.name} · {agent.session_id} · "
-            f"{len(agent.history)} сообщ.{suffix}",
+            f"#{agent.number} · {agent.config.name} · {agent.session_id}"
+            # День 10: подпись дополняется происхождением, если это ветка.
+            + (f" · ветка от {agent.branch.parent}" if agent.branch else "")
+            + f" · {len(agent.history)} сообщ.{suffix}",
             agent.number,
         )
         for agent, suffix in entries
     ]
+
+
+def _time_of(iso: str) -> str:
+    """Время из ISO-строки (`created_at` checkpoint'а/ветки) — только часы,
+    минуты и секунды: панель уже показывает сессию и её дату отдельно."""
+    return iso.split("T", 1)[1] if "T" in iso else iso
 
 
 def _metrics_md(last_call: dict | None) -> str:
@@ -163,9 +180,10 @@ def _metrics_md(last_call: dict | None) -> str:
             "Стек сообщений при ошибке не меняется — вопрос можно отправить "
             "повторно, история не задвоится.",
         ]
-        # Свёртка перед упавшим вызовом оплачена и уже применена, а строки
-        # журнала у несостоявшегося хода нет: не показать её здесь — значит
-        # не показать нигде, кроме накопленных счётчиков.
+        # Применённое обновление памяти перед упавшим вызовом оплачено и уже
+        # применено, а строки журнала у несостоявшегося хода нет: не
+        # показать её здесь — значит не показать нигде, кроме накопленных
+        # счётчиков.
         service = _service_lines(last_call.get("service_call"))
         if service:
             lines += ["", *service]
@@ -210,32 +228,43 @@ def _metrics_md(last_call: dict | None) -> str:
 def _service_lines(service: dict | None) -> list[str]:
     """Служебный вызов этого хода — отдельной строкой в «Последнем вызове».
 
-    `None` означает, что стратегия свёртки не просила. Сбой свёртки
-    показывается здесь же и за ошибку ответа не выдаётся: ход состоялся,
-    ответ игроку пришёл.
+    `None` означает, что стратегия ничего не просила. Сбой (или неразобранный
+    ответ) показывается здесь же и за ошибку ответа не выдаётся: ход
+    состоялся, ответ игроку пришёл. Панель не знает, какая стратегия сделала
+    вызов и что за память он обновляет, — слова приходят из `service['label']`
+    и `service['memory_label']`/`service['memory_update']` (день 10, §5.1), в
+    том числе когда стратегию после хода уже переключили.
     """
     if not service:
         return []
     if not service["ok"]:
-        return [
-            f"- **🧵 Свёртка не удалась:** {service['error']} — память "
-            f"стратегии не сдвинулась, ход состоялся, в запрос ушло всё "
-            f"несвёрнутое. Потрачено "
-            f"{_fmt_int(service['total_tokens'] or 0)} токенов."
-        ]
+        line = (
+            f"- **🧵 Служебный вызов не удался — {service['label']}:** "
+            f"{service['error']}"
+        )
+        if service["text"]:
+            # Ответ, который не разобрался, — начало текста, чтобы было
+            # видно, что именно не разобралось.
+            line += f" (начало ответа: «{service['text'][:120]}»)"
+        line += (
+            f" — память не сдвинулась, ход состоялся, в запрос ушло всё "
+            f"неучтённое. Потрачено {_fmt_int(service['total_tokens'] or 0)} "
+            f"токенов."
+        )
+        return [line]
     line = (
-        f"- **🧵 Свёртка:** {service['covers']} сообщ. "
-        f"(≈{_fmt_int(service['folded_tokens'])} токенов) → сводка "
-        f"≈{_fmt_int(estimate_tokens(service['text']))} токенов; служебный "
-        f"вызов {_fmt_int(service['total_tokens'])} токенов, "
+        f"- **🧵 Служебный вызов — {service['label']}:** "
+        f"{service['memory_label']} — {service['memory_update']}; ответ "
+        f"≈{_fmt_int(estimate_tokens(service['text']))} токенов, вызов "
+        f"{_fmt_int(service['total_tokens'])} токенов, "
         f"{_fmt_cost(service['cost_usd'])}, {service['elapsed']:.2f} s"
     )
     if service.get("finish_reason") == "length":
-        # Обрезанная сводка применена, но выдавать её за нормальную нельзя:
+        # Обрезанный ответ применён, но выдавать его за нормальный нельзя:
         # штатно в потолок служебного вызова упираться не должно.
         line += (
-            " — ⚠️ **сводка упёрлась в потолок `max_tokens` и оборвана на "
-            "полуслове**, применена как есть"
+            " — ⚠️ **ответ упёрся в потолок `max_tokens` и оборван на "
+            "полуслове**, применён как есть"
         )
     return [line]
 
@@ -251,8 +280,8 @@ _LEVEL_WARNINGS = {
     ),
     "danger": (
         "🔴 **Занято больше 90% окна.** Ещё пара ходов — и запрос перестанет "
-        "влезать. Сжатие само не включается: стратегия контекста "
-        "переключается слева."
+        "влезать. Стратегия сама не переключается: выбрать её можно слева, "
+        "в списке «Стратегия контекста»."
     ),
     "over": (
         "🔴 **Оценка превышает окно модели.** Запрос всё равно будет отправлен "
@@ -279,8 +308,9 @@ def _bar(usage: dict) -> str:
 
 def _heaviest_message(usage: dict, messages: list[dict]) -> str:
     """Самое тяжёлое сообщение стека — по `per_message`, который идёт в том же
-    порядке, что **отправленная** часть истории: сообщения, уехавшие в сводку,
-    в этом ряду не участвуют."""
+    порядке, что **отправленная** часть истории: сообщения, оставшиеся за
+    пределами отправленного хвоста (свёрнутые в сводку, разобранные в факты
+    или просто отброшенные окном), в этом ряду не участвуют."""
     per_message = usage["request"]["per_message"]
     if not per_message:
         return "- **Самое тяжёлое сообщение стека:** стек пуст"
@@ -320,8 +350,9 @@ def _context_md(
             else f"{_fmt_int(usage['limit'])} токенов"
         )
         + f", резерв под ответ {_fmt_int(usage['answer_reserve'])}",
-        # Память стратегии (день 9) — слагаемое наравне с остальными: без неё
-        # сумма в строке не сходилась бы с итогом ровно на размер сводки.
+        # Память стратегии (день 9: сводка; день 10: факты) — слагаемое
+        # наравне с остальными: без неё сумма в строке не сходилась бы с
+        # итогом ровно на размер этой памяти.
         f"- **В запросе:** система {_fmt_int(request['system'])} + память "
         f"{_fmt_int(request['memory'])} + история "
         f"{_fmt_int(request['history'])} ({len(request['per_message'])} сообщ.) + "
@@ -411,18 +442,38 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
         f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(estimated)}**",
     ]
 
-    if view["sent_messages"] >= view["history_messages"] and not request["memory"]:
-        # Сюда попадает и «Вся история», и «Сводка» до первой свёртки: в обоих
-        # случаях в модель уходит весь стек, и врать про экономию нечего.
-        lines.append(
-            f"- **За бортом:** ничего — все {view['history_messages']} сообщ. "
-            f"стека ушли в запрос целиком, экономии нет"
-        )
+    # «За бортом» (день 10, §7.1): панель не знает, какие бывают стратегии, —
+    # ушло всё / ушло не всё, и есть ли поверх хвоста память, решают числа
+    # `ContextView`, а не имя стратегии.
+    dropped = view["history_messages"] - view["sent_messages"]
+    memory_tokens = request["memory"]
+    if dropped <= 0:
+        if memory_tokens:
+            lines.append(
+                f"- **За бортом:** ничего — все {view['history_messages']} "
+                f"сообщ. стека в запросе, поверх них — {memory_name} "
+                f"≈{_fmt_int(memory_tokens)} токенов"
+            )
+        else:
+            lines.append(
+                f"- **За бортом:** ничего, все {view['history_messages']} "
+                f"сообщ. стека в запросе"
+            )
     else:
-        lines.append(
-            f"- **За бортом:** свёрнуто {state['covered']} сообщ. из "
-            f"{view['history_messages']}, отправлено {view['sent_messages']}"
+        replacement = (
+            f"вместо них — {memory_name} ≈{_fmt_int(memory_tokens)} токенов"
+            if memory_tokens
+            else "вместо них — ничего: отброшены без замены"
         )
+        lines.append(
+            f"- **За бортом:** не ушли в запрос {dropped} сообщ. из "
+            f"{view['history_messages']}; {replacement}"
+        )
+
+    # Экономию есть смысл показывать только там, где что-то действительно
+    # изменилось против полного контекста — либо часть истории не ушла в
+    # запрос, либо поверх неё встала память.
+    if dropped > 0 or memory_tokens:
         if saved >= 0:
             share = f"{estimated / full_total * 100:.0f}%" if full_total else "н/д"
             lines.append(
@@ -432,8 +483,9 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
                 f"(≈{_fmt_cost(estimate_cost_usd(model, saved, 0))} по входу)"
             )
         else:
-            # Так бывает: сводка длиннее того, что она заменила. Показываем
-            # честно — это и есть цена приёма на коротком диалоге.
+            # Так бывает: память (сводка, факты) весит больше того, что она
+            # заменила. Показываем честно — это и есть цена приёма на
+            # коротком диалоге.
             lines.append(
                 f"- **Экономия:** её нет — запрос ≈{_fmt_int(estimated)} "
                 f"токенов, то есть дороже полного контекста на "
@@ -447,8 +499,9 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
         f"- **За время жизни агента:** {verdict} ≈{_fmt_int(abs(lifetime_saved))} "
         f"токенов "
         f"(≈{_fmt_cost(estimate_cost_usd(model, abs(lifetime_saved), 0))} по "
-        f"входу), потрачено на свёртки {_fmt_int(totals['service_tokens'])} "
-        f"токенов ({_fmt_cost(totals['service_cost_usd'])}) за "
+        f"входу), потрачено на служебные вызовы "
+        f"{_fmt_int(totals['service_tokens'])} токенов "
+        f"({_fmt_cost(totals['service_cost_usd'])}) за "
         f"{totals['service_calls']} {_service_word(totals['service_calls'])}"
     )
     if view["pending_label"]:
@@ -457,33 +510,37 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
         lines.append(f"- **Дальше:** {state['note']}")
     lines += [
         "",
-        "_Сжимается запрос, а не память: стек сообщений и файл сессии всегда "
-        "полные. Переключение стратегии диалог не трогает — один и тот же "
-        "разговор можно отправить двумя способами и сравнить ответы._",
+        "_Стратегия меняет запрос, а не память: стек сообщений и файл сессии "
+        "всегда полные. Переключение стратегии диалог не трогает — один и "
+        "тот же разговор можно отправить разными способами и сравнить "
+        "ответы._",
     ]
     return "\n".join(lines)
 
 
 def _service_word(count: int) -> str:
-    """«1 свёртку» / «2 свёртки» / «5 свёрток»."""
+    """«1 служебный вызов» / «2 служебных вызова» / «5 служебных вызовов» —
+    слово общее для обеих стратегий с памятью (день 10): панель не говорит
+    «свёртка» там, где это могут быть факты."""
     if 11 <= count % 100 <= 14:
-        return "свёрток"
+        return "служебных вызовов"
     match count % 10:
         case 1:
-            return "свёртку"
+            return "служебный вызов"
         case 2 | 3 | 4:
-            return "свёртки"
+            return "служебных вызова"
         case _:
-            return "свёрток"
+            return "служебных вызовов"
 
 
 def _memory_update(view: dict) -> dict:
-    """Блок «Память стратегии»: сама сводка текстом — то самое «храните summary
-    отдельно», которое должно быть видно.
+    """Блок «Память стратегии»: сама память текстом — то самое «храните
+    summary отдельно», которое должно быть видно.
 
     Подпись и содержимое приходят из `StrategyState`: панель не знает, что
     внутри — сводка, факты или ничего. Памяти нет — в поле стоит объяснение
-    почему, а не пустота.
+    почему, а не пустота. Подпись без рода и числа (день 10, §7.1): у
+    «Сводки» и «Фактов» они разные, а панель этого не знает.
     """
     state = view["state"]
     text = state["memory_text"]
@@ -492,13 +549,13 @@ def _memory_update(view: dict) -> dict:
             value=state["note"],
             label=f"{state['memory_label']}: пусто",
         )
+    last = f" · последнее: {state['last_update']}" if state["last_update"] else ""
     return gr.update(
         value=text,
         label=(
-            f"{state['memory_label']}: покрывает {state['covered']} сообщ. из "
-            f"{view['history_messages']}, обновлялась {state['updated_turns']} "
-            f"{_times_word(state['updated_turns'])}, "
-            f"≈{estimate_tokens(text)} токенов"
+            f"{state['memory_label']}: учтено сообщений {state['covered']} из "
+            f"{view['history_messages']} · обновлений {state['updated_turns']} "
+            f"· ≈{estimate_tokens(text)} токенов{last}"
         ),
     )
 
@@ -525,11 +582,13 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             "стоимость": _fmt_cost(turn["cost_usd"]),
             "накопительно": _fmt_cost(turn["cumulative_cost_usd"]),
             # Колонки дня 9 — в конце: существующие не переставляются.
-            # «без сжатия» и «служебные» рядом отвечают на главный вопрос дня:
-            # экономия минус плата за свёртку.
+            # «вся история» и «служебные» рядом отвечают на главный вопрос
+            # дня: экономия минус плата за служебный вызов. Название колонки
+            # день 10 меняет: «без сжатия» было бы неправдой для окна — оно
+            # не сжимает, а отбрасывает (спецификация дня 10, §7.1).
             "стратегия": turn["strategy"],
             "отправлено сообщ.": turn["sent_messages"],
-            "без сжатия": turn["full_prompt_tokens"],
+            "вся история": turn["full_prompt_tokens"],
             "служебные": turn["service_tokens"],
         }
         for turn in turns
@@ -538,7 +597,7 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
         rows,
         columns=["ход", "стек до хода", "оценка", "prompt", "completion",
                  "total", "оценка/факт", "стоимость", "накопительно",
-                 "стратегия", "отправлено сообщ.", "без сжатия", "служебные"],
+                 "стратегия", "отправлено сообщ.", "вся история", "служебные"],
     )
 
 
@@ -554,9 +613,9 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"- **🔢 Токены:** prompt={totals['prompt_tokens']} / "
         f"completion={totals['completion_tokens']} / "
         f"total={totals['total_tokens']}\n"
-        f"- **🧵 Свёртки:** {_fmt_int(totals['service_tokens'])} токенов, "
-        f"{_fmt_cost(totals['service_cost_usd'])} — это цена сжатия; "
-        f"на запросах при этом {verdict} "
+        f"- **🧵 Служебные вызовы:** {_fmt_int(totals['service_tokens'])} "
+        f"токенов, {_fmt_cost(totals['service_cost_usd'])} — это цена памяти "
+        f"стратегий; на запросах при этом {verdict} "
         f"≈{_fmt_int(abs(lifetime_saved))} токенов "
         f"({_fmt_cost(estimate_cost_usd(model, abs(lifetime_saved), 0))} "
         f"по входу)\n"
@@ -608,12 +667,184 @@ def _storage_md(state: dict, session_file: dict | None) -> str:
     return "\n".join(lines)
 
 
-def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 18 значений,
-    позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
-    обработчиков ниже.
+# --- Ветки диалога (день 10) ----------------------------------------------
+# Ветка — отдельная сессия и отдельный агент, а не пункт списка стратегий
+# (спецификация дня 10, §2.2): у неё свой переключатель, устроенный так же,
+# как переключатель агентов, и свой блок в панели.
 
-    Значения всех трёх выпадающих списков — тоже часть вида: иначе после
+def _origin_label(member: Agent) -> str:
+    """Одна строка происхождения сессии — используется и в переключателе
+    «Ветка диалога», и в блоке «Ветки диалога»."""
+    if member.branch is None:
+        return f"{member.session_id} · исходный диалог · {len(member.history)} сообщ."
+    return (
+        f"{member.session_id} · ветка от {member.branch.parent} · "
+        f"{member.branch.checkpoint} · {len(member.history)} сообщ."
+    )
+
+
+def _branch_choices(agent: Agent) -> list[tuple[str, int]]:
+    """Варианты переключателя «Ветка диалога» — исходный диалог и все его
+    ветки (`branch_family()`), в порядке создания. Значение — номер агента,
+    как у переключателя агентов (день 6)."""
+    family = branch_family(agent)
+    entries = [(_origin_label(member), member.number) for member in family]
+    if agent not in family:
+        # Активный агент, удалённый из реестра в другой вкладке, — правило
+        # переключателя агентов (день 6): отдельный пункт с пометкой.
+        entries.insert(0, (f"{agent.session_id} · удалён", agent.number))
+    return entries
+
+
+def _checkpoint_choices(agent: Agent) -> list[str]:
+    """Варианты переключателя «Checkpoint» — checkpoint'ы активного агента,
+    по порядку сохранения; значение по умолчанию (последний) задаёт вызывающий
+    код. Список служебный — значений-кортежей с отдельной подписью не нужно,
+    id читается напрямую и используется тем же текстом, что и подпись."""
+    return [
+        f"{cp.id} · {cp.messages} сообщ. · «{cp.strategy}» · "
+        f"{_time_of(cp.created_at)}"
+        for cp in agent.checkpoints
+    ]
+
+
+def _checkpoint_id_from_choice(choice: str | None) -> str | None:
+    """Список «Checkpoint» показывает составную подпись, а не голый id —
+    id из неё же и извлекается: разводить два разных значения (то, что видно,
+    и то, что выбрано) незачем при таком маленьком списке."""
+    if not choice:
+        return None
+    return choice.split(" · ", 1)[0]
+
+
+def _branches_md(agent: Agent) -> str:
+    """Блок «Ветки диалога» (спецификация дня 10, §7.3): что это за сессия,
+    какие у неё checkpoint'ы и какие ветки от них уже созданы, и всё
+    семейство целиком. Ни своей копии переписки, ни своего списка веток
+    интерфейс не ведёт — всё здесь читается из агента и реестра заново."""
+    family = branch_family(agent)
+    lines = ["### Ветки диалога", ""]
+
+    if agent.branch is None:
+        lines.append("- **Эта сессия:** исходный диалог.")
+    else:
+        own = len(agent.history) - agent.branch.messages
+        parent = branch_parent(agent)
+        alive = (
+            f"родитель {_agent_title(parent)} в процессе, checkpoint на месте"
+            if parent is not None
+            else "родителя в процессе нет или его checkpoint'а больше нет — "
+                 "ветка живёт сама по себе"
+        )
+        lines.append(
+            f"- **Эта сессия:** ветка от {agent.branch.parent} · "
+            f"{agent.branch.checkpoint} ({_time_of(agent.branch.created_at)}): "
+            f"первые {agent.branch.messages} сообщ. скопированы при создании, "
+            f"своих — {own}. {alive[:1].upper()}{alive[1:]}."
+        )
+
+    if agent.checkpoints:
+        lines.append("- **Checkpoint'ы этой сессии:**")
+        for cp in agent.checkpoints:
+            children = [
+                member.session_id
+                for member in family
+                if member.branch is not None
+                and member.branch.parent == agent.session_id
+                and member.branch.checkpoint == cp.id
+            ]
+            branches_note = (
+                f"ветки: {', '.join(children)}" if children else "веток ещё нет"
+            )
+            lines.append(
+                f"  - `{cp.id}` · {cp.messages} сообщ. · «{cp.strategy}» · "
+                f"{_time_of(cp.created_at)} · {branches_note}"
+            )
+    else:
+        lines.append(
+            "- **Checkpoint'ы этой сессии:** нет — «Сохранить checkpoint» "
+            "зафиксирует конец текущей истории."
+        )
+
+    lines.append("- **Семейство:**")
+    for member in family:
+        marker = " ← активна" if member.number == agent.number else ""
+        lines.append(f"  - {_origin_label(member)} · «{member.strategy.name}»{marker}")
+
+    lines += [
+        "",
+        "_Ветка — отдельная сессия с копией общего начала истории, со своим "
+        "файлом, своей стратегией и своими счётчиками; стратегия решает, что "
+        "из истории отправить, ветка — какая это история._",
+    ]
+    return "\n".join(lines)
+
+
+# --- «Агенты процесса»: расход по журналам всех агентов реестра -----------
+
+def _turn_strategies_label(agent: Agent) -> str:
+    """Стратегии, на которых прошли ходы этого агента, в порядке появления.
+    Ходов не было — активная стратегия с пометкой, а не пустая строка: агент
+    без единого хода тоже стоит в таблице."""
+    turns = agent.turns
+    if not turns:
+        return f"{agent.strategy.name} (ходов не было)"
+    seen: list[str] = []
+    for turn in turns:
+        if not seen or seen[-1] != turn.strategy:
+            seen.append(turn.strategy)
+    return " → ".join(seen)
+
+
+def _agents_table() -> pd.DataFrame:
+    """«Агенты процесса»: по строке на агента реестра, расход по его журналу
+    ходов (спецификация дня 10, §7.5) — первое место, где агенты процесса
+    сравниваются в одной таблице. Считается только по `agent.turns`, без
+    `debug_state()` и без сборки запросов: таблица перерисовывается на каждом
+    событии интерфейса. Никакой подсветки и сортировки по «эффективности» —
+    порядок строк совпадает с порядком реестра."""
+    columns = [
+        "агент", "сессия", "ветка от", "стратегии ходов", "ходов",
+        "prompt", "completion", "служебные токены", "стоимость",
+        "среднее время хода, s",
+    ]
+    rows = []
+    for a in agents():
+        turns = a.turns
+        if not turns or all(t.cost_usd is None for t in turns):
+            cost_str = "н/д"
+        else:
+            total_cost = sum(t.cost_usd or 0.0 for t in turns) + sum(
+                t.service_cost_usd or 0.0 for t in turns
+            )
+            cost_str = _fmt_cost(total_cost)
+        avg_time = (
+            f"{sum(t.elapsed + t.service_elapsed for t in turns) / len(turns):.2f}"
+            if turns else "н/д"
+        )
+        rows.append({
+            "агент": _agent_title(a),
+            "сессия": a.session_id,
+            "ветка от": (
+                f"{a.branch.parent} · {a.branch.checkpoint}" if a.branch else "—"
+            ),
+            "стратегии ходов": _turn_strategies_label(a),
+            "ходов": len(turns),
+            "prompt": sum(t.prompt_tokens for t in turns),
+            "completion": sum(t.completion_tokens for t in turns),
+            "служебные токены": sum(t.service_tokens for t in turns),
+            "стоимость": cost_str,
+            "среднее время хода, s": avg_time,
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _view(agent: Agent, status: str, question: str = "") -> tuple:
+    """Полный вид на состояние агента — фиксированный кортеж из 22 значений
+    (18 — до дня 10), позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок —
+    часть контракта обработчиков ниже.
+
+    Значения всех выпадающих списков — тоже часть вида: иначе после
     переключения агента панель показывала бы одного, а списки — другого.
 
     `question` передаёт только обработчик кнопки «Набить контекст» — это
@@ -635,6 +866,9 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
     # Файл перечитывается на каждом событии интерфейса — поллинга и
     # автообновления, как и на дне 6, здесь нет.
     session_file = STORE.read_file(state["session_id"])
+    # Checkpoint'ы посчитаны заранее: список «Checkpoint» открывает значением
+    # последний (§7.2), и вычислять это внутри самого кортежа было бы нечитаемо.
+    checkpoint_choices = _checkpoint_choices(agent)
     return (
         # 1. чат = стек агента; номер в подписи — чей именно диалог показан
         gr.update(
@@ -683,6 +917,19 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         _flow_md(view, state["totals"], model),
         # 18. «Память стратегии»: сводка текстом
         _memory_update(view),
+        # Значения дня 10 — в конце кортежа и в конце VIEW_OUTPUTS (§7.6).
+        # 19. переключатель «Ветка диалога» — семейство агента, живой список
+        gr.update(choices=_branch_choices(agent), value=agent.number),
+        # 20. переключатель «Checkpoint» — у списка своего обработчика нет,
+        #     это вход кнопки «Ветка от checkpoint'а»; значение — последний
+        gr.update(
+            choices=checkpoint_choices,
+            value=checkpoint_choices[-1] if checkpoint_choices else None,
+        ),
+        # 21. блок «Ветки диалога»
+        _branches_md(agent),
+        # 22. таблица «Агенты процесса»
+        gr.update(value=_agents_table()),
     )
 
 
@@ -896,7 +1143,9 @@ def on_switch_agent(agent_number: int, preset_name: str):
 
 def on_strategy_change(agent: Agent | None, strategy_name: str, preset_name: str):
     """Переключение стратегии управления контекстом — единственный новый
-    обработчик дня 9.
+    обработчик дня 9; день 10 добавляет ему два новых пункта в списке (окно,
+    факты) и переписывает статус без арифметики и без слова «свёртка»
+    (спецификация дня 10, §7.1).
 
     Нового агента не создаёт и стек не трогает: меняется способ сборки
     запроса, а не агент и не диалог. Этим переключатель стратегии и отличается
@@ -910,29 +1159,34 @@ def on_strategy_change(agent: Agent | None, strategy_name: str, preset_name: str
     view = agent.context_view()
     state = view.state
     if view.pending_label:
-        # Свёртка назрела — типичный случай, когда на сжатие переключаются
-        # после нескольких ходов без него. Следующий запрос уйдёт уже после
-        # свёртки, и «все сообщения стека» были бы неправдой.
+        # Задача назрела — типичный случай, когда на стратегию с памятью
+        # переключаются после нескольких ходов без неё (а у фактов задача
+        # назревает на каждом ходе — это её штатное состояние). Следующий
+        # запрос уйдёт уже после служебного вызова, и «все сообщения стека»
+        # были бы неправдой. Число сообщений — из `pending_sent_messages`,
+        # который знает стратегия; арифметики в интерфейсе больше нет.
         label = view.pending_label[:1].upper() + view.pending_label[1:]
         status = (
             f"Стратегия «{agent.strategy.name}». ⏳ {label} перед следующим "
             f"ответом, и в запрос уйдут {state.memory_label.lower()} и "
-            f"{view.sent_messages - view.pending_messages} несвёрнутых "
-            f"сообщений из {view.history_messages}."
+            f"{view.pending_sent_messages} сообщ. из {view.history_messages}."
         )
     elif state.memory_text:
         status = (
             f"Стратегия «{agent.strategy.name}»: в запрос уйдут "
-            f"{state.memory_label.lower()} и {view.sent_messages} несвёрнутых "
-            f"сообщений из {view.history_messages}."
+            f"{state.memory_label.lower()} и {view.sent_messages} сообщ. из "
+            f"{view.history_messages}."
         )
     else:
-        # Сокращение «сообщ.» уже кончается точкой, поэтому фразу закрываем
-        # так, чтобы в статусе не выросло две подряд.
+        # У стратегии без памяти (окно, вся история) сообщений уходит ровно
+        # `sent_messages`; если это меньше стека — остальное отброшено, и
+        # молчать об этом нечестно (окно теряет детали, а не сжимает).
         status = (
-            f"Стратегия «{agent.strategy.name}»: в запрос уйдут все "
-            f"{view.sent_messages} сообщ. стека, памяти у стратегии пока нет."
+            f"Стратегия «{agent.strategy.name}»: в запрос уйдут "
+            f"{view.sent_messages} сообщ. из {view.history_messages}."
         )
+        if view.sent_messages < view.history_messages:
+            status += " Остальные отброшены из запроса без замены."
     return (
         agent,
         gr.update(),
@@ -964,27 +1218,26 @@ def on_send(agent: Agent | None, message: str, preset_name: str):
             f"Ответ получен за {reply.elapsed:.2f} s. "
             f"В стеке агента {_agent_title(agent)} {len(agent.history)} сообщ."
         )
-        # Ход, на котором произошла свёртка, говорит об этом вслух: на видео
-        # момент должен читаться без панели.
+        # Ход, на котором сработал служебный вызов, говорит об этом вслух: на
+        # видео момент должен читаться без панели. Одной короткой фразой,
+        # словами стратегии (`label`, `memory_update`) — не словом «свёртка»:
+        # у фактов эта строка появляется на каждом ходе (день 10, §7.1).
         service = reply.service_call
         if service is not None and service.ok:
             status += (
-                f" 🧵 Перед ответом сработала свёртка: {service.covers} сообщ. "
-                f"(≈{_fmt_int(service.folded_tokens)} токенов) уехали в "
-                f"сводку ≈{_fmt_int(estimate_tokens(service.text))} токенов "
-                f"за {_fmt_cost(service.cost_usd)}. Сам диалог цел — "
-                f"сжался запрос, а не память."
+                f" 🧵 Перед ответом — {service.label}: {service.memory_update}, "
+                f"{_fmt_cost(service.cost_usd)}."
             )
             if service.finish_reason == "length":
                 status += (
-                    " ⚠️ Сводка упёрлась в потолок служебного вызова и оборвана "
-                    "на полуслове — применена как есть."
+                    " ⚠️ Ответ служебного вызова упёрся в потолок и оборван "
+                    "на полуслове — применён как есть."
                 )
         elif service is not None:
             status += (
-                f" ⚠️ Свёртка не удалась ({service.error}) — ход состоялся, "
-                f"память стратегии не сдвинулась, в модель ушло всё "
-                f"несвёрнутое; свёртка повторится на следующем ходе."
+                f" ⚠️ Служебный вызов не удался ({service.error}) — ход "
+                f"состоялся, память стратегии не сдвинулась, в модель ушло "
+                f"всё неучтённое; вызов повторится на следующем ходе."
             )
         # Поле ввода чистим только при успехе; при ошибке вопрос остаётся
         # в поле, чтобы его можно было отправить повторно.
@@ -993,13 +1246,13 @@ def on_send(agent: Agent | None, message: str, preset_name: str):
         status = f"❌ {reply.error}"
         service = reply.service_call
         if service is not None and service.ok:
-            # Свёртка до упавшего вызова оплачена и уже применена: следующий
-            # вопрос уйдёт со сводкой, и это не должно стать сюрпризом.
+            # Применённое обновление до упавшего вызова уже оплачено и
+            # сохранено: следующий вопрос уйдёт с ним, и это не должно стать
+            # сюрпризом.
             status += (
-                f" 🧵 Свёртка перед вызовом при этом состоялась: "
-                f"{service.covers} сообщ. уехали в сводку за "
-                f"{_fmt_cost(service.cost_usd)} — она сохранена и уйдёт со "
-                f"следующим вопросом."
+                f" 🧵 Перед вызовом при этом сработал служебный вызов — "
+                f"{service.label}: {service.memory_update} — применённая "
+                f"память уйдёт со следующим вопросом."
             )
         message_update = gr.update()
 
@@ -1060,13 +1313,24 @@ def on_reset(agent: Agent | None, preset_name: str):
     """«Сбросить диалог» очищает стек сообщений агента. Тот же вызов удаляет
     и файл сессии — следствие правила «пустой список сообщений удаляет файл»:
     нет контекста, нет и сессии. Счётчики за время жизни агента при этом
-    сохраняются."""
+    сохраняются, а checkpoint'ы и происхождение ветки уходят вместе с
+    диалогом (день 10) — они ссылались на диалог, которого больше нет; ветки,
+    созданные раньше, при этом не трогаются, у них свои файлы."""
     if agent is None:  # страховка на случай сессии без сработавшего load
         agent = _new_agent(preset_name)
         note = "агент поднят заново"
     else:
+        # Есть что сказать про checkpoint'ы — сравниваем до и после reset().
+        had_checkpoints = bool(agent.checkpoints)
+        family_before = len(branch_family(agent)) - 1
         agent.reset()
         note = f"файл сессии `{agent.session_id}` удалён"
+        if had_checkpoints:
+            note += ", checkpoint'ы и происхождение ветки очищены вместе с диалогом"
+        if family_before:
+            note += (
+                f" (веток от этого диалога — {family_before}, они не тронуты)"
+            )
     return (
         agent,
         gr.update(),
@@ -1076,6 +1340,107 @@ def on_reset(agent: Agent | None, preset_name: str):
             f"{note}, счётчики агента сохранены.",
         ),
     )
+
+
+# --- Ветки диалога: обработчики (день 10) ---------------------------------
+
+def on_save_checkpoint(agent: Agent | None, preset_name: str):
+    """«Сохранить checkpoint» — фиксирует конец текущей истории вместе со
+    снимком памяти стратегий. Диалог продолжать можно: checkpoint останется
+    тем, каким был, — ветвиться от него можно и после десяти новых ходов."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    before = {cp.id for cp in agent.checkpoints}
+    checkpoint = agent.save_checkpoint()
+    if checkpoint is None:
+        status = (
+            f"Checkpoint не сохранён: в стеке агента {_agent_title(agent)} "
+            f"нет сообщений — сохранять нечего."
+        )
+    elif checkpoint.id in before:
+        status = (
+            f"Такой checkpoint уже есть: {checkpoint.id} — история и память "
+            f"стратегий с прошлого сохранения не изменились, новый не создан."
+        )
+    else:
+        status = (
+            f"Checkpoint {checkpoint.id} сохранён: {checkpoint.messages} "
+            f"сообщ., стратегия «{checkpoint.strategy}», снимок памяти "
+            f"стратегий. Ветку от него создаёт «Ветка от checkpoint'а»; "
+            f"диалог можно продолжать — checkpoint останется тем, каким был."
+        )
+    return (agent, gr.update(), *_view(agent, status))
+
+
+def on_fork(agent: Agent | None, checkpoint_choice: str | None, preset_name: str):
+    """«Ветка от checkpoint'а» — новая сессия с общим началом истории.
+
+    Номер сессии заводится только после того, как checkpoint найден: впустую
+    он не пропадает. Ветка становится активной, исходный диалог остаётся в
+    реестре и в списке «Ветка диалога» нетронутым.
+    """
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    checkpoint_id = _checkpoint_id_from_choice(checkpoint_choice)
+    if checkpoint_id is None or checkpoint_id not in {cp.id for cp in agent.checkpoints}:
+        return (
+            agent,
+            gr.update(),
+            *_view(
+                agent,
+                "Ветка не создана: сначала выберите checkpoint в списке "
+                "«Checkpoint» (кнопка «Сохранить checkpoint» — если его ещё нет).",
+            ),
+        )
+
+    session_id = STORE.create_session(agent.config.name)
+    branch = agent.fork(checkpoint_id, session_id, make_strategies())
+    if branch is None:
+        return (
+            agent,
+            gr.update(),
+            *_view(
+                agent,
+                f"Ветка от checkpoint'а «{checkpoint_id}» не создана — см. лог.",
+            ),
+        )
+    return (
+        branch,
+        gr.update(),
+        *_view(
+            branch,
+            f"Создана ветка {branch.session_id} от {agent.session_id} · "
+            f"{checkpoint_id}: общие {branch.branch.messages} сообщ. "
+            f"скопированы, стратегия «{branch.strategy.name}», файл уже на "
+            f"диске. Исходный диалог не тронут — он в списке «Ветка диалога».",
+        ),
+    )
+
+
+def on_switch_branch(agent_number: int, preset_name: str):
+    """Переключатель «Ветка диалога» — то же самое, что переключатель
+    агентов (`on_switch_agent`), со своим статусом: диалог — это про то, какая
+    история лежит в стеке, а не про то, что это отдельный агент."""
+    target = agent_by_number(agent_number)
+    if target is None:
+        return _spawn(preset_name, "Выбранного диалога в процессе больше нет.")
+
+    if target.branch is not None:
+        status = (
+            f"Активна ветка {target.session_id} (от {target.branch.parent} · "
+            f"{target.branch.checkpoint}): в стеке {len(target.history)} "
+            f"сообщ., из них общих {target.branch.messages}; следующий "
+            f"вопрос уйдёт в неё."
+        )
+    else:
+        branches = len(branch_family(target)) - 1
+        status = (
+            f"Активен исходный диалог {target.session_id}: "
+            f"{len(target.history)} сообщ., веток от него — {branches}."
+        )
+    return (target, gr.update(), *_view(target, status))
 
 
 # --- Старт процесса ------------------------------------------------------
@@ -1088,18 +1453,50 @@ RESTORED_AT_START = _restore_agents()
 
 # --- Интерфейс -----------------------------------------------------------
 
+# --- Сценарий сравнения стратегий: тексты для gr.Examples (день 10, §7.4) --
+# Порядок прогона (§9.2): шаги 1-6, К1-К3, В2, КВ — В1 отдельным пунктом не
+# нужен, это шаг 6 дословно. Сами тексты — контент проекта, живут в
+# `presets.py` и отправляются на всех прогонах одинаково до буквы; здесь
+# только подписи для примеров и порядок их показа.
+_SCENARIO_TEXTS: list[str] = [
+    *COMPARISON_SCENARIO,
+    *CONTROL_QUESTIONS,
+    BRANCH_STEPS[1],
+    BRANCH_QUESTION,
+]
+_SCENARIO_LABELS: list[str] = [
+    "Шаг 1 · цель и состав",
+    "Шаг 2 · коробки и время",
+    "Шаг 3 · формат и договорённость",
+    "Шаг 4 · герои",
+    "Шаг 5 · поправка коробок",
+    "Шаг 6 / В1 · тиран Goultar",
+    "К1 · контроль: время и состав",
+    "К2 · контроль: договорённость",
+    "К3 · контроль: поправка коробок",
+    "В2 · тиран Nom",
+    "КВ · сводный сетап",
+]
+
+
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 9: агент управляет контекстом. Последние сообщения уходят в "
-        "модель как есть, всё, что старше, сворачивается в **сводку** — "
-        "отдельным вызовом модели, который виден в панели и оплачен по той же "
-        "таблице цен. Стратегия переключается слева на живом диалоге: стек "
-        "сообщений и файл сессии всегда полные, сжимается запрос, а не "
-        "память, поэтому один и тот же разговор можно отправить обоими "
-        "способами и сравнить ответы. В панели рядом стоят два числа — "
-        "сколько ушло в модель и сколько ушло бы без сжатия — и честный итог: "
-        "сэкономлено против потрачено на свёртки."
+        "День 10: четыре способа отправить историю в модель и один способ её "
+        "разветвить. Стратегия слева переключается на живом диалоге: стек "
+        "сообщений и файл сессии всегда полные, меняется только то, что из "
+        "них уходит в запрос, — «Вся история» и «Сводка + последние N» "
+        "(день 9) стоят рядом со **«Скользящим окном»** (последние N сообщ., "
+        "остальное отброшено без замены — плата деталями, а не токенами) и "
+        "**«Фактами + последними N»** (блок «ключ — значение», который "
+        "обновляет служебный вызов перед каждым ответом — плата вызовом на "
+        "каждом ходе). Одна и та же история отправляется разными способами, "
+        "и ответы можно сравнить. Ниже чата — «Сохранить checkpoint» и "
+        "«Ветка от checkpoint'а»: они заводят от текущей точки диалога "
+        "независимое продолжение — отдельную сессию со своим файлом, своей "
+        "стратегией и своими счётчиками; переключатель «Ветка диалога» стоит "
+        "рядом со стратегией контекста. Сравнение всех стратегий на одном "
+        "сценарии — в `docs/TooManyRules — День 10 сравнение стратегий.md`."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -1146,6 +1543,21 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "начиная со следующего вопроса."
                 ),
             )
+            # Третий список рядом — снова другая семантика (день 10, §2.2):
+            # ветка — не пункт списка стратегий, а отдельная сессия с копией
+            # общего начала истории; переключает её этот список, устроенный
+            # так же, как переключатель агентов справа.
+            branch_dropdown = gr.Dropdown(
+                choices=[],
+                label="Ветка диалога",
+                filterable=False,
+                info=(
+                    "Какая история лежит в стеке. Пресет создаёт нового "
+                    "агента; стратегия меняет запрос у того же агента; ветка "
+                    "переключает на другую историю — отдельную сессию со "
+                    "своим файлом, своей стратегией и своими счётчиками."
+                ),
+            )
 
             # Формат значения — список сообщений {"role", "content"}, то есть
             # ровно `agent.history`. Аргумент `type="messages"` из спецификации
@@ -1170,6 +1582,21 @@ with gr.Blocks(title="TooManyRules") as demo:
                 delete_agent_btn = gr.Button(
                     "Удалить агент", variant="stop", scale=1
                 )
+            # Ряд checkpoint'ов и веток (день 10): своя строка под кнопками
+            # чата — жест здесь другой, чем у кнопок выше (они не трогают
+            # историю, «Ветка от checkpoint'а» заводит новую сессию).
+            with gr.Row():
+                save_checkpoint_btn = gr.Button("Сохранить checkpoint", scale=1)
+                checkpoint_dropdown = gr.Dropdown(
+                    choices=[],
+                    label="Checkpoint",
+                    filterable=False,
+                    scale=2,
+                    # У списка нет своего обработчика — это вход кнопки
+                    # «Ветка от checkpoint'а», и правило «слушать select»
+                    # к нему не относится.
+                )
+                fork_btn = gr.Button("Ветка от checkpoint'а", scale=1)
             status_md = gr.Markdown("")
 
             gr.Examples(
@@ -1182,6 +1609,24 @@ with gr.Blocks(title="TooManyRules") as demo:
                 label=(
                     "Примеры (второй вопрос ссылается на первый — так видно, "
                     "что контекст держит агент)"
+                ),
+            )
+
+            # Сценарий сравнения стратегий (день 10, §7.4, §9.1): шаги 1-6,
+            # К1-К3, В2 и КВ — В1 не нужен отдельным пунктом, это шаг 6
+            # дословно (`BRANCH_STEPS[0] is COMPARISON_SCENARIO[5]`). Клик
+            # кладёт текст в поле ввода, отправляет человек — автоматического
+            # прогона в проекте нет. `examples_per_page` задан явно: по
+            # умолчанию их 10, а пунктов 11.
+            gr.Examples(
+                examples=[[text] for text in _SCENARIO_TEXTS],
+                inputs=[question_input],
+                example_labels=_SCENARIO_LABELS,
+                examples_per_page=len(_SCENARIO_TEXTS),
+                label=(
+                    "Сценарий сравнения стратегий (шаги 1-6, контрольные "
+                    "вопросы К1-К3, вторая ветка В2 и общий вопрос КВ — "
+                    "см. docs/TooManyRules — День 10 сравнение стратегий.md)"
                 ),
             )
 
@@ -1245,6 +1690,17 @@ with gr.Blocks(title="TooManyRules") as demo:
                 max_height=260,
                 wrap=True,
             )
+            # «Агенты процесса» (день 10, §7.5) — сразу под «Ростом по
+            # ходам»: первое место, где агенты сравниваются в одной таблице,
+            # день 8 от этого сознательно отказался, день 10 делает — расход
+            # токенов между стратегиями сравнивать нужно. Никакой подсветки.
+            gr.Markdown("### Агенты процесса")
+            agents_table = gr.Dataframe(
+                value=_agents_table(),
+                label="Расход по журналам ходов всех агентов реестра",
+                max_height=260,
+                wrap=True,
+            )
             # Аккордеон появляется только тогда, когда модель вернула
             # reasoning_content (пресет «Флагман + thinking»).
             with gr.Accordion(
@@ -1253,6 +1709,10 @@ with gr.Blocks(title="TooManyRules") as demo:
                 visible=False,
             ) as reasoning_accordion:
                 reasoning_md = gr.Markdown("")
+            # «Ветки диалога» (день 10, §7.3) — над переключателем агентов и
+            # стеком сообщений: ветка — это про то, какая история лежит в
+            # стеке, и этот блок готовит к чтению того, что ниже.
+            branches_md = gr.Markdown("")
             # Переключатель стоит вплотную к стеку сообщений: смысл именно
             # в том, что стек — не «стек приложения», а стек конкретного
             # инстанса, и при переключении он меняется целиком.
@@ -1285,7 +1745,8 @@ with gr.Blocks(title="TooManyRules") as demo:
                 max_height=420,
             )
 
-    # Порядок выходов совпадает с порядком значений в `_view()`.
+    # Порядок выходов совпадает с порядком значений в `_view()`. Значения
+    # дня 10 — в конце списка, как и в кортеже `_view()` (§7.6).
     VIEW_OUTPUTS = [
         chatbot,
         status_md,
@@ -1305,6 +1766,10 @@ with gr.Blocks(title="TooManyRules") as demo:
         strategy_dropdown,
         flow_md,
         memory_box,
+        branch_dropdown,
+        checkpoint_dropdown,
+        branches_md,
+        agents_table,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
 
@@ -1336,6 +1801,13 @@ with gr.Blocks(title="TooManyRules") as demo:
         inputs=[agent_dropdown, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
+    # «Ветка диалога» — тоже `select`, тем же правилом: `_view()`
+    # синхронизирует его значение на каждом событии.
+    branch_dropdown.select(
+        on_switch_branch,
+        inputs=[branch_dropdown, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
     new_agent_btn.click(
         on_new_agent,
         inputs=[preset_dropdown],
@@ -1359,6 +1831,17 @@ with gr.Blocks(title="TooManyRules") as demo:
     reset_btn.click(
         on_reset,
         inputs=[agent_state, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    save_checkpoint_btn.click(
+        on_save_checkpoint,
+        inputs=[agent_state, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # «Checkpoint» — вход этой кнопки, у списка своего обработчика нет.
+    fork_btn.click(
+        on_fork,
+        inputs=[agent_state, checkpoint_dropdown, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
     # Единственный обработчик, который сам знает содержимое поля ввода и
