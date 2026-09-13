@@ -644,6 +644,8 @@ class SummaryStrategy:
     # --- Память на диск и обратно ----------------------------------------
 
     def dump(self) -> dict:
+        if not self._summary:
+            return {}
         return {
             "summary": self._summary,
             "covered": self._covered,
