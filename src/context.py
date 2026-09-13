@@ -67,9 +67,13 @@ _NO_PREVIOUS_SUMMARY = "предыдущей сводки нет — это пе
 
 # Разбор ответа фактов (спецификация дня 10, §3.4): маркеры списков и
 # нумерации перед ключом, схлопывание пробелов, распознавание «нет изменений»
-# и «удалить» без учёта регистра и завершающей точки.
+# и «удалить» без учёта регистра и завершающей точки. Обрамляющие выделение и
+# кавычки срезаются: модель может ответить markdown'ом или повторить
+# оформление промпта, и «**тиран**» не должен встать отдельным ключом рядом с
+# «тиран» — слияние такой дубль никогда бы не убрало.
 _LIST_MARKER_RE = re.compile(r"^(?:[-*•]|\d+[.)])\s*")
 _WHITESPACE_RE = re.compile(r"\s+")
+_EDGE_MARKUP = "`*«»\""
 _NO_CHANGES_TEXT = "нет изменений"
 _DELETE_VALUE = "удалить"
 
@@ -388,41 +392,47 @@ class StickyFacts:
 
         Слияние, а не замена: новые ключи добавляются в конец, изменившиеся
         заменяют значение на месте, остальные остаются как были — это и
-        делает факты «липкими».
+        делает факты «липкими». Сливается копия, и факты подменяются целиком
+        в конце: панель соседней вкладки читает их без замков, и словарь не
+        должен меняться у неё под руками (спецификация дня 10, §4.4).
         """
-        text = (text or "").strip()
-        if not text:
-            return False
-        if _strip_trailing_dot(text).casefold() == _NO_CHANGES_TEXT:
-            self._covered = max(0, int(task.covers))
-            self._updated_turns += 1
-            self._last_update = "без изменений"
-            return True
-
+        facts = dict(self._facts)
         changes: list[str] = []
-        parsed_any = False
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not line or ":" not in line:
+        understood = False
+        for raw_line in (text or "").splitlines():
+            line = _unwrap(raw_line)
+            if not line:
+                continue
+            # «Нет изменений» — и одной строкой, и с пояснением через
+            # двоеточие или тире, и пунктом списка: ключом такая строка не
+            # становится.
+            bare = _unwrap(_LIST_MARKER_RE.sub("", line, count=1))
+            if bare.casefold().startswith(_NO_CHANGES_TEXT):
+                understood = True
+                continue
+            if ":" not in line:
                 continue
             raw_key, raw_value = line.split(":", 1)
             key = _LIST_MARKER_RE.sub("", raw_key.strip(), count=1)
-            key = _WHITESPACE_RE.sub(" ", key).strip().lower()
-            value = raw_value.strip()
+            key = _WHITESPACE_RE.sub(" ", _unwrap(key)).lower()
+            value = _unwrap(raw_value)
             if not key or not value:
                 continue
-            parsed_any = True
+            understood = True
             if _strip_trailing_dot(value).casefold() == _DELETE_VALUE:
-                if key in self._facts:
-                    del self._facts[key]
+                if key in facts:
+                    del facts[key]
                     changes.append(f"−{key}")
                 continue  # удаление несуществующего ключа — не ошибка
-            marker = "~" if key in self._facts else "+"
-            self._facts[key] = value
+            if facts.get(key) == value:
+                continue  # повтор факта слово в слово — не изменение
+            marker = "~" if key in facts else "+"
+            facts[key] = value
             changes.append(f"{marker}{key}")
 
-        if not parsed_any:
+        if not understood:
             return False
+        self._facts = facts
         self._covered = max(0, int(task.covers))
         self._updated_turns += 1
         self._last_update = "; ".join(changes) if changes else "без изменений"
@@ -738,6 +748,12 @@ def _facts_label(covered: int, total: int, has_question: bool) -> str:
 def _strip_trailing_dot(text: str) -> str:
     text = text.strip()
     return text[:-1].strip() if text.endswith(".") else text
+
+
+def _unwrap(text: str) -> str:
+    """Строка без обрамляющих пробелов, выделения и кавычек: «`тиран: Nom`»,
+    «**тиран**» и «"Nom"» разбираются так же, как «тиран: Nom»."""
+    return text.strip().strip(_EDGE_MARKUP).strip()
 
 
 def _fold_label(start: int, end: int) -> str:

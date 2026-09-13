@@ -275,8 +275,8 @@ _LEVEL_MARKERS = {"ok": "🟢", "warn": "🟡", "danger": "🔴", "over": "🔴"
 # бывают, и новые стратегии не должны требовать правок здесь.
 _LEVEL_WARNINGS = {
     "warn": (
-        "⚠️ **Занято больше 70% окна.** Если активная стратегия историю не "
-        "сжимает, дальше будет только быстрее."
+        "⚠️ **Занято больше 70% окна.** Если активная стратегия отправляет "
+        "всю историю, дальше будет только быстрее."
     ),
     "danger": (
         "🔴 **Занято больше 90% окна.** Ещё пара ходов — и запрос перестанет "
@@ -287,8 +287,8 @@ _LEVEL_WARNINGS = {
         "🔴 **Оценка превышает окно модели.** Запрос всё равно будет отправлен "
         "и, скорее всего, отклонён целиком: ответа не будет, ход не "
         "состоится, стек сообщений и файл сессии останутся как есть. "
-        "Предохранителя здесь нет намеренно: сжатие — способ до переполнения "
-        "не доходить, а не проверка перед вызовом."
+        "Предохранителя здесь нет намеренно: стратегия контекста — способ до "
+        "переполнения не доходить, а не проверка перед вызовом."
     ),
 }
 
@@ -590,6 +590,12 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             "отправлено сообщ.": turn["sent_messages"],
             "вся история": turn["full_prompt_tokens"],
             "служебные": turn["service_tokens"],
+            # Колонки дня 10 — снова в конце: у фактов ход идёт двумя
+            # вызовами, и в журнале это должно читаться числом (спецификация
+            # дня 10, §5.3). Неудачный служебный вызов тоже занял время — оно
+            # в колонке есть.
+            "время ответа, s": f"{turn['elapsed']:.2f}",
+            "время служебного, s": f"{turn['service_elapsed']:.2f}",
         }
         for turn in turns
     ]
@@ -597,7 +603,8 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
         rows,
         columns=["ход", "стек до хода", "оценка", "prompt", "completion",
                  "total", "оценка/факт", "стоимость", "накопительно",
-                 "стратегия", "отправлено сообщ.", "вся история", "служебные"],
+                 "стратегия", "отправлено сообщ.", "вся история", "служебные",
+                 "время ответа, s", "время служебного, s"],
     )
 
 
@@ -717,12 +724,28 @@ def _checkpoint_id_from_choice(choice: str | None) -> str | None:
     return choice.split(" · ", 1)[0]
 
 
+def _live_branches(agent: Agent) -> list[Agent]:
+    """Ветки, созданные от checkpoint'ов этого диалога, связь с которыми жива.
+
+    Связь проверяет только `branch_parent()` — по id **и** времени
+    checkpoint'а (спецификация дня 10, §5.2): одного `session_id` мало, после
+    сброса диалога его старые ветки уже не «от этого диалога», а одного id
+    checkpoint'а мало тем более — новый `cp1` сброшенного родителя получил бы
+    ветки прежнего. Правило живёт в `agent.py`, панель его не повторяет."""
+    return [
+        member
+        for member in branch_family(agent)
+        if member.branch is not None and branch_parent(member) is agent
+    ]
+
+
 def _branches_md(agent: Agent) -> str:
     """Блок «Ветки диалога» (спецификация дня 10, §7.3): что это за сессия,
     какие у неё checkpoint'ы и какие ветки от них уже созданы, и всё
     семейство целиком. Ни своей копии переписки, ни своего списка веток
     интерфейс не ведёт — всё здесь читается из агента и реестра заново."""
     family = branch_family(agent)
+    live = _live_branches(agent)
     lines = ["### Ветки диалога", ""]
 
     if agent.branch is None:
@@ -748,10 +771,8 @@ def _branches_md(agent: Agent) -> str:
         for cp in agent.checkpoints:
             children = [
                 member.session_id
-                for member in family
-                if member.branch is not None
-                and member.branch.parent == agent.session_id
-                and member.branch.checkpoint == cp.id
+                for member in live
+                if member.branch.checkpoint == cp.id
             ]
             branches_note = (
                 f"ветки: {', '.join(children)}" if children else "веток ещё нет"
@@ -1051,11 +1072,19 @@ def on_load(preset_name: str):
 
     target = registry[-1]
     if RESTORED_AT_START:
+        # Активным может оказаться агент, созданный уже в этом процессе, —
+        # например ветка: у неё `restored_messages` всегда 0 (день 10, §5.2),
+        # и «0 сообщ. из файла» рядом с непустым чатом было бы неправдой.
+        from_file = (
+            f", из файла при старте — {target.restored_messages}"
+            if target.restored_messages
+            else ""
+        )
         status = (
             f"Восстановлено {RESTORED_AT_START} "
             f"{_agents_word(RESTORED_AT_START)} из {display_path(STORE.data_dir)}. "
             f"Активен {_agent_title(target)} · `{target.session_id}`: "
-            f"{target.restored_messages} сообщ. из файла."
+            f"в стеке {len(target.history)} сообщ.{from_file}."
         )
     else:
         status = (
@@ -1320,17 +1349,24 @@ def on_reset(agent: Agent | None, preset_name: str):
         agent = _new_agent(preset_name)
         note = "агент поднят заново"
     else:
-        # Есть что сказать про checkpoint'ы — сравниваем до и после reset().
+        # Что сказать про checkpoint'ы, происхождение и ветки, считается до
+        # reset(): после него у агента нет ни checkpoint'ов, ни происхождения,
+        # и живую связь с ветками уже не проверить. Ветки «от этого диалога» —
+        # только живые (`_live_branches`): родитель и соседние ветки
+        # сбрасываемой ветки к ним не относятся (спецификация дня 10, §7.2).
         had_checkpoints = bool(agent.checkpoints)
-        family_before = len(branch_family(agent)) - 1
+        was_branch = agent.branch is not None
+        branches = len(_live_branches(agent))
         agent.reset()
         note = f"файл сессии `{agent.session_id}` удалён"
-        if had_checkpoints:
+        if had_checkpoints and was_branch:
             note += ", checkpoint'ы и происхождение ветки очищены вместе с диалогом"
-        if family_before:
-            note += (
-                f" (веток от этого диалога — {family_before}, они не тронуты)"
-            )
+        elif had_checkpoints:
+            note += ", checkpoint'ы очищены вместе с диалогом"
+        elif was_branch:
+            note += ", происхождение ветки очищено вместе с диалогом"
+        if branches:
+            note += f" (веток от этого диалога — {branches}, они не тронуты)"
     return (
         agent,
         gr.update(),
@@ -1470,7 +1506,7 @@ _SCENARIO_LABELS: list[str] = [
     "Шаг 3 · формат и договорённость",
     "Шаг 4 · герои",
     "Шаг 5 · поправка коробок",
-    "Шаг 6 / В1 · тиран Goultar",
+    "Шаг 6 / В1 · тиран Drellen",
     "К1 · контроль: время и состав",
     "К2 · контроль: договорённость",
     "К3 · контроль: поправка коробок",
@@ -1697,7 +1733,14 @@ with gr.Blocks(title="TooManyRules") as demo:
             gr.Markdown("### Агенты процесса")
             agents_table = gr.Dataframe(
                 value=_agents_table(),
-                label="Расход по журналам ходов всех агентов реестра",
+                # Служебный вызов хода, основной вызов которого упал, в журнал
+                # не попадает, а деньги за него потрачены — подпись говорит об
+                # этом прямо (спецификация дня 10, §7.5).
+                label=(
+                    "Расход по состоявшимся ходам всех агентов реестра; полные "
+                    "числа, со служебными вызовами упавших ходов, — в "
+                    "«Накоплено агентом»"
+                ),
                 max_height=260,
                 wrap=True,
             )

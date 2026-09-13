@@ -27,6 +27,7 @@
 # API — обычная работа со стеком сообщений и с реестром агентов.
 
 import copy
+import functools
 import logging
 import os
 import threading
@@ -486,6 +487,27 @@ def _bump_process_stats(**deltas) -> None:
             _process_stats[key] += delta
 
 
+def _locked(method):
+    """Метод агента, который меняет его состояние, — под замком этого агента
+    (день 10, §5.2).
+
+    Gradio выполняет обработчики разных кнопок параллельно: у каждой функции
+    своя очередь. Без замка «Сохранить checkpoint», нажатый во время ответа,
+    снял бы память стратегий, уже обновлённую служебным вызовом по вопросу,
+    которого в истории ещё нет, — и ветка от такого checkpoint'а знала бы
+    решение из будущего. С замком клик дожидается конца хода. Чтение
+    (`debug_state()`, `context_view()`, свойства) замка не берёт: рендер
+    панели не должен ждать ответа модели.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class Agent:
     """Агент: конфиг + собственный стек сообщений + вызов LLM.
 
@@ -511,6 +533,9 @@ class Agent:
         self._config = config
         self._session_id = session_id
         self._store = store
+        # Замок методов, меняющих состояние агента (`_locked`, день 10):
+        # реентрантный, чтобы метод под замком мог позвать другой такой же.
+        self._lock = threading.RLock()
         self._client: OpenAI | None = None
         self._last_reply: AgentReply | None = None
         # Счётчики за время жизни агента. `reset()` их не трогает — он
@@ -689,6 +714,7 @@ class Agent:
         """Имена стратегий, между которыми умеет переключаться этот агент."""
         return list(self._strategies)
 
+    @_locked
     def set_strategy(self, name: str) -> bool:
         """Переключение стратегии на живом агенте; возвращает, произошло ли оно.
 
@@ -783,6 +809,7 @@ class Agent:
         памяти — панель зовёт его на каждый свой рендер."""
         return self._context_view(question)[1]
 
+    @_locked
     def ask(self, user_message: str) -> AgentReply:
         """Один ход диалога: подготовить контекст, собрать сообщения, сходить
         в API, дописать пару «вопрос/ответ» в стек.
@@ -910,6 +937,7 @@ class Agent:
         )
         return reply
 
+    @_locked
     def reset(self) -> None:
         """Очищает стек сообщений, память всех стратегий, checkpoint'ы и
         происхождение ветки. Счётчики за время жизни агента, журнал ходов и
@@ -935,9 +963,12 @@ class Agent:
             self._log_name, ", ".join(f"«{name}»" for name in self._strategies),
         )
 
+    @_locked
     def save_checkpoint(self) -> Checkpoint | None:
         """Фиксирует конец текущей истории вместе со снимком памяти всех
-        стратегий (спецификация дня 10, §5.2).
+        стратегий (спецификация дня 10, §5.2). Под замком агента: во время
+        хода checkpoint дожидается его конца, иначе снимок памяти опередил
+        бы историю.
 
         Пустой стек — ветвиться не от чего, `None`. Повторное сохранение без
         изменений (та же длина истории, та же стратегия, тот же снимок
@@ -978,6 +1009,7 @@ class Agent:
         )
         return checkpoint
 
+    @_locked
     def fork(
         self,
         checkpoint_id: str,
@@ -1193,12 +1225,14 @@ class Agent:
                 memory_label=before.memory_label,
             )
             self._record_service(call)
+            # Сколько сообщений уйдёт в запрос, здесь не пишется: у фактов
+            # хвост не короче окна, и число неучтённых разошлось бы со
+            # строкой стратегии, которая идёт в лог следом.
             logger.warning(
                 "[%s] служебный вызов — %s: не удался (%s); ход не "
                 "отменяется: память не сдвинулась, в запрос уйдёт всё "
-                "неучтённое (%d сообщ.), вызов повторится на следующем ходе",
+                "неучтённое, вызов повторится на следующем ходе",
                 self._log_name, task.label, call.error,
-                len(self._messages) - covered_before,
             )
             return call
 
