@@ -33,6 +33,12 @@
 # непустой ответ), у `ContextTask` появилось поле `sends`, у `StrategyState` —
 # `last_update`. Ветки диалога сюда не входят: это операция над историей
 # агента, а не способ собрать запрос, и живёт она в `agent.py`.
+#
+# День 11 выносит разбор строк «ключ: значение» из `StickyFacts.apply()` в
+# публичную `parse_changes()` (спецификация дня 11, §4.5): ею же модель памяти
+# (`memory.py`) разбирает ответ служебного вызова «разбор памяти». Это
+# выделение кода, а не правка правил — поведение фактов не меняется. Модуль
+# остаётся листом графа: `memory.py` импортирует его, а не наоборот.
 
 import re
 from dataclasses import dataclass
@@ -395,31 +401,17 @@ class StickyFacts:
         делает факты «липкими». Сливается копия, и факты подменяются целиком
         в конце: панель соседней вкладки читает их без замков, и словарь не
         должен меняться у неё под руками (спецификация дня 10, §4.4).
+
+        Сами строки разбирает `parse_changes()` (день 11, §4.5) — здесь
+        только слияние разобранного.
         """
+        parsed = parse_changes(text)
+        if parsed is None:
+            return False
         facts = dict(self._facts)
         changes: list[str] = []
-        understood = False
-        for raw_line in (text or "").splitlines():
-            line = _unwrap(raw_line)
-            if not line:
-                continue
-            # «Нет изменений» — и одной строкой, и с пояснением через
-            # двоеточие или тире, и пунктом списка: ключом такая строка не
-            # становится.
-            bare = _unwrap(_LIST_MARKER_RE.sub("", line, count=1))
-            if bare.casefold().startswith(_NO_CHANGES_TEXT):
-                understood = True
-                continue
-            if ":" not in line:
-                continue
-            raw_key, raw_value = line.split(":", 1)
-            key = _LIST_MARKER_RE.sub("", raw_key.strip(), count=1)
-            key = _WHITESPACE_RE.sub(" ", _unwrap(key)).lower()
-            value = _unwrap(raw_value)
-            if not key or not value:
-                continue
-            understood = True
-            if _strip_trailing_dot(value).casefold() == _DELETE_VALUE:
+        for key, value in parsed:
+            if value is None:
                 if key in facts:
                     del facts[key]
                     changes.append(f"−{key}")
@@ -430,8 +422,6 @@ class StickyFacts:
             facts[key] = value
             changes.append(f"{marker}{key}")
 
-        if not understood:
-            return False
         self._facts = facts
         self._covered = max(0, int(task.covers))
         self._updated_turns += 1
@@ -728,6 +718,58 @@ class SummaryStrategy:
             "Новые сообщения диалога (свернуть вместе с предыдущей сводкой):\n"
             + "\n".join(lines)
         )
+
+
+def parse_changes(text: str) -> list[tuple[str, str | None]] | None:
+    """Строки «ключ: значение» из ответа служебного вызова, по порядку.
+    Значение None — «удалить». [] — ответ «нет изменений» (и ничего
+    больше не разобралось). None — не разобралось ни одной строки.
+
+    Вынесено из `StickyFacts.apply()` на дне 11 без изменения правил
+    (спецификация дня 11, §4.5): маркеры списков и нумерации, срезанные
+    выделение и кавычки, первое двоеточие, «нет изменений» с пояснением,
+    «удалить» без учёта регистра и завершающей точки. Правила выстраданы
+    ревью дня 10 (комментарии у `_EDGE_MARKUP` и у `FACTS_PROMPT`), поэтому
+    копия у модели памяти не заводится — она зовёт эту функцию.
+    """
+    changes: list[tuple[str, str | None]] = []
+    understood = False
+    for raw_line in (text or "").splitlines():
+        line = _unwrap(raw_line)
+        if not line:
+            continue
+        # «Нет изменений» — и одной строкой, и с пояснением через
+        # двоеточие или тире, и пунктом списка: ключом такая строка не
+        # становится.
+        bare = _unwrap(_LIST_MARKER_RE.sub("", line, count=1))
+        if bare.casefold().startswith(_NO_CHANGES_TEXT):
+            understood = True
+            continue
+        if ":" not in line:
+            continue
+        raw_key, raw_value = line.split(":", 1)
+        key = normalize_key(raw_key)
+        value = _unwrap(raw_value)
+        if not key or not value:
+            continue
+        understood = True
+        if _strip_trailing_dot(value).casefold() == _DELETE_VALUE:
+            changes.append((key, None))
+        else:
+            changes.append((key, value))
+    if not understood:
+        return None
+    return changes
+
+
+def normalize_key(text: str) -> str:
+    """Ключ так, как его понимает разбор ответа: без маркера списка, без
+    обрамляющего выделения и кавычек, со схлопнутыми пробелами, в нижнем
+    регистре. Часть `parse_changes()`; модель памяти нормализует ею же ключи
+    своей карты (спецификация дня 11, §4.3), чтобы ключ карты и ключ ответа
+    сравнивались одним правилом."""
+    key = _LIST_MARKER_RE.sub("", (text or "").strip(), count=1)
+    return _WHITESPACE_RE.sub(" ", _unwrap(key)).lower()
 
 
 def _facts_label(covered: int, total: int, has_question: bool) -> str:

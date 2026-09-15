@@ -1,6 +1,6 @@
 # TooManyRules — сущность агента (день 6, неделя 2; день 8 — работа с токенами,
 # день 9 — управление контекстом, день 10 — общий служебный вызов, checkpoint'ы
-# и ветки диалога).
+# и ветки диалога; день 11 — модель памяти: рабочая и долговременная память).
 #
 # Единственное место в проекте, где происходят вызовы LLM API. Модуль
 # намеренно ничего не знает ни про Gradio, ни про Too Many Bones: внутри
@@ -9,22 +9,36 @@
 # (`AgentReply`) и своё состояние для дебага (`debug_state`).
 #
 # Направление зависимостей одностороннее: app.py → presets.py → agent.py →
-# tokens.py, context.py. Из проекта здесь импортируются только листья графа,
-# которые сами не импортируют ничего: `tokens.py` (день 8) и `context.py`
-# (день 9); замороженный `app_week1.py` не импортируется по-прежнему — см.
-# `docs/TooManyRules — Неделя 2 архитектура.md`, §3, и спецификации дня 8, §4,
-# дня 9, §4, и дня 10, §5.
+# tokens.py, context.py, memory.py → context.py. Из проекта здесь
+# импортируются листья графа, которые сами не импортируют ничего, —
+# `tokens.py` (день 8) и `context.py` (день 9), — и `memory.py` (день 11),
+# который зависит только от листа `context.py`; замороженный `app_week1.py`
+# не импортируется по-прежнему — см. `docs/TooManyRules — Неделя 2
+# архитектура.md`, §3, и спецификации дня 8, §4, дня 9, §4, дня 10, §5, и
+# дня 11, §5.
 #
-# С дня 9 вызовов LLM API здесь два: основной (ответ игроку) и служебный —
-# до дня 10 он был «свёрткой», а с дня 10 обслуживает любую стратегию с
-# памятью (сводку и факты) одним и тем же путём, а слова для лога и панели
-# берёт у стратегии. Оба вызова — в этом модуле: правило «вызовы LLM API
-# только в `agent.py`» не нарушено.
+# С дня 9 вызовов LLM API здесь два места: основной вызов (ответ игроку) и
+# служебный. До дня 10 служебный был «свёрткой», с дня 10 обслуживает любую
+# стратегию с памятью (сводку и факты) одним путём, а с дня 11 — две работы:
+# служебный вызов стратегии и разбор памяти. Поэтому сам вызов вынесен в
+# `_call_service_model()`, а работы вокруг него — `_run_context_task()` и
+# `_run_memory_task()`. Правило «вызовы LLM API — только в `agent.py`, в двух
+# местах» остаётся буквальным.
 #
 # День 10 также добавляет операцию над самой историей — checkpoint и ветку:
 # агент фиксирует точку диалога вместе со снимком памяти стратегий и порождает
 # от неё нового агента с общим началом истории. Это не стратегия и не вызов
 # API — обычная работа со стеком сообщений и с реестром агентов.
+#
+# День 11 разводит память агента по времени жизни на три слоя (спецификация
+# дня 11, §2.1): краткосрочная — разговор (стек и память стратегий, как на
+# днях 6-10), рабочая — данные текущей задачи (живёт в файле сессии, в
+# `context.working`), долговременная — пользователь вообще (отдельный файл,
+# один на процесс). Модель памяти (`memory.AgentMemory`) и хранилище
+# долговременной памяти — ещё две необязательные зависимости агента: без них
+# агент ведёт себя ровно как на дне 10. Что куда пишется, решает карта памяти,
+# а в долговременную память — только человек: разбор предлагает кандидатов,
+# сохраняет их `accept_candidates()`.
 
 import copy
 import functools
@@ -32,7 +46,8 @@ import logging
 import os
 import threading
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Protocol
 
@@ -40,6 +55,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 import context
+import memory
 import tokens
 
 # Ключ читается только здесь, поэтому и .env подхватывается здесь же —
@@ -95,6 +111,15 @@ CONTEXT_OVERFLOW_MARKERS = (
     "context_length_exceeded",
     "too long",
 )
+
+# Как разбор памяти (день 11) подписан в `ServiceCall.memory_label`: панель
+# показывает служебные вызовы по этим словам, не зная, кто их сделал.
+MEMORY_CALL_LABEL = "Слои памяти"
+
+# Слои в запросе по умолчанию — все переключаемые. Отдельное имя, а не
+# `memory.REQUEST_LAYERS` на месте: в конструкторе и в `fork()` имя `memory`
+# занято параметром — моделью памяти агента.
+_DEFAULT_REQUEST_LAYERS = memory.REQUEST_LAYERS
 
 
 def estimate_cost_usd(
@@ -152,8 +177,8 @@ class AgentConfig:
 
 @dataclass(frozen=True)
 class ServiceCall:
-    """Служебный вызов модели, сделанный стратегией до основного запроса
-    (день 9).
+    """Служебный вызов модели, сделанный до основного запроса: стратегией
+    (день 9) или моделью памяти — разбор памяти (день 11, `kind="memory"`).
 
     Это настоящий вызов: он считается в счётчиках агента и процесса наравне с
     обычными и логируется так же. Но это не ход — он не пишет в стек
@@ -161,7 +186,7 @@ class ServiceCall:
     в блоке «Последний вызов» должен оставаться ответ игроку, а не сводка.
     """
 
-    kind: str                  # из ContextTask
+    kind: str                  # из ContextTask; "memory" — разбор памяти (день 11)
     label: str
     ok: bool
     error: str | None
@@ -228,6 +253,10 @@ class AgentReply:
     # служебного вызова не просила», а не «свёртка не удалась»: неудачная
     # свёртка приезжает сюда объектом с `ok=False`.
     service_call: ServiceCall | None = None
+    # Поле дня 11 — в конце: разбор памяти этого хода. `service_call`
+    # остаётся за стратегией — у хода бывает оба служебных вызова сразу.
+    # `None` — разбора не было (у агента нет модели памяти или истории).
+    memory_call: ServiceCall | None = None
 
 
 @dataclass(frozen=True)
@@ -258,6 +287,16 @@ class TurnStats:
     # видно числом, а не на слово.
     elapsed: float = 0.0            # время основного вызова
     service_elapsed: float = 0.0    # время служебного вызова на этом ходе
+    # Поля дня 11 — снова в конце. Разбор памяти — отдельные колонки, а не
+    # часть `service_*`: те с дня 9 — «цена памяти стратегий» рядом с их
+    # экономией, а разбор ничего не экономит, он добавляет. Две последние —
+    # корзины слоёв в оценке запроса этого хода: в журнале видно, сколько
+    # стоил каждый слой.
+    memory_tokens: int = 0
+    memory_cost_usd: float | None = None
+    memory_elapsed: float = 0.0
+    long_term_tokens: int = 0
+    working_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -299,6 +338,36 @@ class Checkpoint:
     strategy: str        # активная стратегия в этой точке
     memory: dict          # снимок памяти стратегий — тот же вид, что context["memory"]
     created_at: str      # время сохранения, ISO до секунд
+    # Поле дня 11 — в конце и с умолчанием: снимок рабочей памяти
+    # (`AgentMemory.dump()`) на момент сохранения. Рабочая память — состояние
+    # сессии, и ветка получает её копию из снимка; checkpoint дня 10 без
+    # этого ключа даёт ветку с пустой рабочей памятью (спецификация дня 11,
+    # §5.7). Кандидатов в снимке нет — они вопрос к человеку, а не память.
+    working: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    """Чем закончилось решение человека по кандидатам в долговременную
+    память (день 11, §5.5)."""
+
+    keys: list[str]            # по каким ключам решение исполнено: записаны (accept) или отклонены (reject)
+    error: str | None          # причина, если решение не исполнено
+
+
+@dataclass(frozen=True)
+class _ServiceResponse:
+    """Что вернул служебный вызов модели (`Agent._call_service_model()`):
+    текст, `finish_reason`, `usage` и время — всё, из чего работы вокруг
+    вызова собирают свой `ServiceCall`."""
+
+    text: str
+    finish_reason: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    cost_usd: float | None
+    elapsed: float
 
 
 @dataclass(frozen=True)
@@ -336,6 +405,21 @@ class HistoryStore(Protocol):
         context: dict | None = None,
     ) -> None: ...
     def load_context(self, session_id: str) -> dict: ...
+
+
+class LongTermStore(Protocol):
+    """Долговременная память (реализация — `storage.JsonLongTermStore`,
+    спецификация дня 11, §6). Одна на процесс и общая для всех агентов.
+
+    Объявлен здесь, как `HistoryStore`: обмен идёт словарями, и реализация
+    протокол не импортирует. Рабочая память сюда не относится — она
+    состояние сессии и едет в файл сессии через `HistoryStore`.
+    """
+
+    def entries(self) -> dict: ...                              # ключ → {"value", "session_id", "updated_at"}, копия
+    def apply(self, changes: dict[str, str | None], session_id: str) -> dict: ...  # None — удалить; бросает при сбое записи
+    @property
+    def path(self) -> str: ...                                  # для логов и панели
 
 
 # --- Счётчики процесса и реестр агентов ----------------------------------
@@ -529,10 +613,27 @@ class Agent:
         # конструктора (день 6), а ветка, созданная обычным конструктором и
         # дописанная потом, успела бы побыть в реестре пустой.
         seed: dict | None = None,
+        # Зависимости дня 11 (§5.1) — в конце и необязательные, как
+        # хранилище и стратегии: `memory=None` — слоёв нет, агент ведёт себя
+        # ровно как на дне 10. Экземпляр модели памяти свой у каждого агента
+        # (`presets.make_memory()`): рабочая память относится к конкретной
+        # сессии. Хранилище долговременной памяти одно на процесс и
+        # передаётся всем агентам тем же объектом.
+        memory: "memory.AgentMemory | None" = None,
+        long_term: LongTermStore | None = None,
     ) -> None:
         self._config = config
         self._session_id = session_id
         self._store = store
+        # Модель памяти и долговременная память (день 11) проставляются до
+        # чтения хранилища и `seed`: рабочую память читает тот же
+        # `_load_context()`, что память стратегий.
+        self._memory = memory
+        self._long_term = long_term
+        # Какие слои уходят в запрос — состояние агента, но не диалога
+        # (§2.5): на диск не едет, в checkpoint не входит, у нового,
+        # восстановленного агента и у ветки включены оба.
+        self._request_layers: tuple[str, ...] = _DEFAULT_REQUEST_LAYERS
         # Замок методов, меняющих состояние агента (`_locked`, день 10):
         # реентрантный, чтобы метод под замком мог позвать другой такой же.
         self._lock = threading.RLock()
@@ -567,6 +668,13 @@ class Agent:
             # «сколько ушло». На коротком диалоге бывает отрицательной — так и
             # показываем.
             "saved_tokens": 0,
+            # Счётчики дня 11: разбор памяти. Как любой вызов, он считается и
+            # в общих счётчиках выше, но **не** в `service_*`: те — цена
+            # памяти стратегий рядом с их экономией, а разбор ничего не
+            # экономит, он добавляет (спецификация дня 11, §5.8).
+            "memory_calls": 0,
+            "memory_tokens": 0,
+            "memory_cost_usd": 0.0,
         }
         # Журнал ходов (день 8). Ведёт себя как счётчики агента, а не как стек
         # сообщений: `reset()` его не чистит, на диск он не едет, и после
@@ -661,18 +769,19 @@ class Agent:
             logger.info(
                 "[%s] агент создан как ветка от %s · %s: общий префикс %d "
                 "сообщ., стратегия «%s», память стратегий из снимка "
-                "checkpoint'а; живых агентов: %d",
+                "checkpoint'а%s; живых агентов: %d",
                 self._log_name, self._branch.parent, self._branch.checkpoint,
-                self._branch.messages, self._strategy_name,
+                self._branch.messages, self._strategy_name, self._layers_note(),
                 process_stats()["agents_alive"],
             )
         else:
             logger.info(
                 "[%s] агент создан: model=%s thinking=%s стратегия=«%s» "
-                "восстановлено из хранилища=%d сообщ.%s, живых агентов: %d",
+                "восстановлено из хранилища=%d сообщ.%s%s, живых агентов: %d",
                 self._log_name, config.model, _thinking_label(config.thinking),
                 self._strategy_name, self._restored_messages,
                 _memory_note(self.strategy.describe(self._messages)),
+                self._layers_note(),
                 process_stats()["agents_alive"],
             )
         # Сбой загрузки логируется здесь, а не на месте: до регистрации в
@@ -765,6 +874,21 @@ class Agent:
         return self._branch
 
     @property
+    def memory_state(self) -> "memory.MemoryState | None":
+        """Рабочая память, кандидаты и последний разбор (день 11); `None` —
+        модели памяти у агента нет. Чистое чтение, без замка: панель зовёт его
+        на каждый рендер."""
+        if self._memory is None:
+            return None
+        return self._memory.describe(self._messages)
+
+    @property
+    def request_layers(self) -> tuple[str, ...]:
+        """Какие слои уходят в запрос — в порядке их блоков
+        (`memory.REQUEST_LAYERS`); по умолчанию оба."""
+        return self._request_layers
+
+    @property
     def turns(self) -> list[TurnStats]:
         """Копия журнала ходов — как `history`, наружу список не уезжает.
 
@@ -814,9 +938,11 @@ class Agent:
         """Один ход диалога: подготовить контекст, собрать сообщения, сходить
         в API, дописать пару «вопрос/ответ» в стек.
 
-        С дня 9 фаз две: сначала стратегии дают возможность попросить
-        служебный вызов (свёртку), и только потом собирается и уходит основной
-        запрос. Служебный вызов ходом не является и через `ask()` не идёт.
+        С дня 9 фаз подготовки было две: сначала стратегии дают возможность
+        попросить служебный вызов (свёртку), и только потом собирается и
+        уходит основной запрос. С дня 11 их три (спецификация дня 11, §5.2):
+        служебный вызов стратегии, разбор памяти, сборка запроса со слоями.
+        Служебные вызовы ходом не являются и через `ask()` не идут.
 
         Исключений не бросает: ошибка API или отсутствующий ключ возвращаются
         как `AgentReply(ok=False, error=...)` — в том числе при сбое
@@ -840,11 +966,25 @@ class Agent:
         # того, что `covered` не сдвинулся.
         service = self._run_context_task(client, user_message)
 
+        # Разбор памяти (день 11, §5.2) — после служебного вызова стратегии и
+        # до сборки: основной запрос должен увидеть рабочую память, обновлённую
+        # по этому же вопросу. Порядок двух служебных вызовов на результат не
+        # влияет (они читают одну историю и пишут разное), но фиксирован —
+        # чтобы логи ходов читались одинаково. Разбор идёт при любом положении
+        # «слоёв в запросе»: переключатель меняет запрос, а не память.
+        #
+        # Долговременная память читается один раз за ход, до разбора: снимок
+        # на ход, а не два чтения, между которыми соседняя вкладка могла
+        # что-то сохранить. Тот же снимок уходит и во вход разбора, и в блок
+        # основного запроса.
+        long_term = self._long_term_entries()
+        memory_call = self._run_memory_task(client, user_message, long_term)
+
         # Счёт до запроса (день 8): считаем ровно тот список сообщений, который
         # сейчас уйдёт в API, — и логируем бюджет до вызова, а не после.
         # Сборка и расчёт идут одним вызовом, чтобы «что отправляем» и «что
         # показываем в панели» не считались двумя путями.
-        messages, view = self._context_view(user_message)
+        messages, view = self._context_view(user_message, long_term)
         request = view.usage.request
         budget = view.usage
         self._log_context(view)
@@ -875,6 +1015,7 @@ class Agent:
                 elapsed=time.perf_counter() - started,
                 request=request,
                 service=service,
+                memory_call=memory_call,
             )
         elapsed = time.perf_counter() - started
 
@@ -911,6 +1052,7 @@ class Agent:
             prompt_cache_hit_tokens=getattr(usage, "prompt_cache_hit_tokens", None),
             prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
             service_call=service,
+            memory_call=memory_call,
         )
 
         if self._config.keep_history:
@@ -919,7 +1061,7 @@ class Agent:
             self._persist()
 
         self._record(reply)
-        self._record_turn(reply, history_before, view, service)
+        self._record_turn(reply, history_before, view, service, memory_call)
         logger.info(
             "[%s] model=%s thinking=%s finish_reason=%s time=%.2fs "
             "tokens(prompt/completion/total)=%s/%s/%s "
@@ -950,17 +1092,30 @@ class Agent:
         стеком по той же причине — они ссылаются на диалог, которого больше
         нет (спецификация дня 10, §5.2). Ветки, созданные раньше, это не
         задевает: у них свои файлы.
+
+        С дня 11 вместе с диалогом уходят рабочая память и кандидаты — они
+        пришли из диалога. **Долговременную память сброс не трогает**: это и
+        есть разница времени жизни слоёв (спецификация дня 11, §5.7). Слои в
+        запросе сброс тоже не меняет — это инструмент проверки, а не диалог.
         """
         self._messages = []
         for strategy in self._strategies.values():
             strategy.reset()
+        if self._memory is not None:
+            self._memory.reset()
         self._checkpoints = []
         self._branch = None
         self._persist()
         logger.info(
             "[%s] стек сообщений очищен (reset); память стратегий (%s), "
-            "checkpoint'ы и происхождение ветки очищены вместе с ним",
+            "checkpoint'ы и происхождение ветки очищены вместе с ним%s",
             self._log_name, ", ".join(f"«{name}»" for name in self._strategies),
+            (
+                f"; рабочая память и кандидаты — тоже, долговременная память "
+                f"не тронута ({self._long_term_count_str()})"
+                if self._memory is not None
+                else ""
+            ),
         )
 
     @_locked
@@ -984,7 +1139,13 @@ class Agent:
 
         # Глубокая копия: память стратегий дальше меняется, снимок — нет.
         memory = copy.deepcopy(self._context_dump()["memory"])
-        existing = self._unchanged_checkpoint(memory)
+        # Снимок рабочей памяти (день 11, §5.7) — тем же приёмом. Разбор
+        # меняет рабочую память и без удлинения истории (разбор применился,
+        # основной вызов упал), поэтому совпадение сравнивает и его.
+        working = (
+            copy.deepcopy(self._memory.dump()) if self._memory is not None else {}
+        )
+        existing = self._unchanged_checkpoint(memory, working)
         if existing is not None:
             logger.info(
                 "[%s] checkpoint не сохранён: совпадает с существующим %s",
@@ -998,14 +1159,21 @@ class Agent:
             strategy=self._strategy_name,
             memory=memory,
             created_at=_now_iso(),
+            working=working,
         )
         self._checkpoints.append(checkpoint)
         self._persist()
         logger.info(
             "[%s] checkpoint %s: %d сообщ., стратегия «%s», снимок памяти "
-            "стратегий: %s",
+            "стратегий: %s%s",
             self._log_name, checkpoint.id, checkpoint.messages,
             checkpoint.strategy, ", ".join(memory) if memory else "нет памяти",
+            (
+                f", снимок рабочей памяти: "
+                f"{len(working.get('entries') or {})} зап."
+                if self._memory is not None
+                else ""
+            ),
         )
         return checkpoint
 
@@ -1015,6 +1183,7 @@ class Agent:
         checkpoint_id: str,
         session_id: str,
         strategies: dict[str, context.ContextStrategy] | None = None,
+        memory: "memory.AgentMemory | None" = None,
     ) -> "Agent | None":
         """Создаёт ветку от одного из checkpoint'ов этой сессии: новый агент
         с новой сессией, в историю которого скопирован префикс до
@@ -1024,6 +1193,12 @@ class Agent:
         Родителя (эту сессию) не трогает никак: ни стек, ни память, ни файл —
         семейство веток вычисляется по происхождению, а не хранится у
         родителя (`branch_family()`).
+
+        С дня 11 (§5.7) ветка получает свежую модель памяти (`memory`) с
+        рабочей памятью из снимка checkpoint'а и то же хранилище
+        долговременной памяти, что у родителя, — тем же объектом.
+        Кандидаты не копируются: они вопрос к человеку в этой сессии, а не
+        память.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -1057,18 +1232,144 @@ class Agent:
                 # наследуются.
             },
         }
+        if checkpoint.working:
+            # Рабочая память ветки — копия снимка, а не ссылка: дальше у
+            # родителя и у ветки она пишется независимо (день 11, §5.7).
+            seed["context"]["working"] = copy.deepcopy(checkpoint.working)
         return Agent(
             self._config,
             session_id=session_id,
             store=self._store,
             strategies=strategies,
             seed=seed,
+            memory=memory,
+            long_term=self._long_term,
+        )
+
+    @_locked
+    def set_request_layers(self, layers: Sequence[str]) -> bool:
+        """Какие слои памяти уходят в запрос (день 11, §5.5); возвращает,
+        изменилось ли что-нибудь.
+
+        Значения вне `memory.REQUEST_LAYERS` отбрасываются, порядок
+        приводится к порядку констант. Меняется запрос, а не память (§2.5):
+        стек, файл сессии, рабочая память и кандидаты не трогаются, на диск
+        ничего не пишется, и разбор памяти идёт при любом положении — включённый
+        обратно слой сразу полон.
+        """
+        chosen = set(layers or ())
+        wanted = tuple(layer for layer in memory.REQUEST_LAYERS if layer in chosen)
+        if wanted == self._request_layers:
+            return False
+        previous = self._request_layers
+        self._request_layers = wanted
+        logger.info(
+            "[%s] слои в запросе: %s → %s; стек и память не тронуты",
+            self._log_name, _layers_str(previous), _layers_str(wanted),
+        )
+        return True
+
+    @_locked
+    def accept_candidates(self, keys: Sequence[str]) -> CandidateDecision:
+        """«Сохранить в долговременную» — решение человека по отмеченным
+        кандидатам (день 11, §5.5).
+
+        Одна запись в долговременную память на всех отмеченных, и только
+        **после успешной записи** кандидаты убираются: сбой записи оставляет
+        их на месте — решение человека не должно теряться из-за диска. Под
+        замком агента: разбор между отбором и записью кандидатов не поменяет —
+        он идёт в `ask()` под тем же замком.
+
+        Долговременную память тем временем мог поменять другой агент — запись
+        всё равно идёт: последнее решение человека побеждает, и лог это
+        показывает.
+        """
+        if self._memory is None:
+            return CandidateDecision(keys=[], error="у агента нет модели памяти")
+        wanted = {context.normalize_key(key) for key in keys or () if isinstance(key, str)}
+        pending = [
+            candidate
+            for candidate in self._memory.describe(self._messages).candidates
+            if candidate.key in wanted
+        ]
+        if not pending:
+            return CandidateDecision(keys=[], error=None)
+        names = ", ".join(candidate.key for candidate in pending)
+        if self._long_term is None:
+            logger.warning(
+                "[%s] долговременная память не подключена — кандидаты не "
+                "сохранены и ждут решения: %s",
+                self._log_name, names,
+            )
+            return CandidateDecision(
+                keys=[], error="долговременная память не подключена"
+            )
+
+        before = self._long_term.entries()
+        try:
+            self._long_term.apply(
+                {candidate.key: candidate.value for candidate in pending},
+                self._session_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] долговременная память: сохранить не удалось (%s) — "
+                "кандидаты не тронуты и ждут решения: %s",
+                self._log_name, exc, names,
+            )
+            return CandidateDecision(keys=[], error=str(exc))
+
+        taken = self._memory.take_candidates([candidate.key for candidate in pending])
+        for candidate in taken:
+            entry = before.get(candidate.key)
+            actual = entry.get("value") if isinstance(entry, dict) else None
+            race = (
+                f"; пока кандидат ждал, значение в памяти поменялось: при "
+                f"предложении {_quoted(candidate.previous)}, перед записью "
+                f"{_quoted(actual)} — решение человека побеждает"
+                if actual != candidate.previous
+                else ""
+            )
+            logger.info(
+                "[%s] долговременная память: %s%s",
+                self._log_name, _candidate_str(candidate), race,
+            )
+        logger.info(
+            "[%s] долговременная память: сохранено %d — %s; решение человека → %s",
+            self._log_name, len(taken),
+            ", ".join(candidate.key for candidate in taken), self._long_term.path,
+        )
+        return CandidateDecision(
+            keys=[candidate.key for candidate in taken], error=None
+        )
+
+    @_locked
+    def reject_candidates(self, keys: Sequence[str]) -> CandidateDecision:
+        """«Отклонить» — отмеченные кандидаты убираются, в память ничего не
+        пишется (день 11, §5.5). Сказанное игроком от этого не теряется: оно
+        в полной истории разговора."""
+        if self._memory is None:
+            return CandidateDecision(keys=[], error="у агента нет модели памяти")
+        dropped = self._memory.drop_candidates(keys)
+        for candidate in dropped:
+            logger.info(
+                "[%s] долговременная память: отклонено — %s; в память не "
+                "попало, сказанное осталось в истории разговора",
+                self._log_name, _candidate_str(candidate),
+            )
+        return CandidateDecision(
+            keys=[candidate.key for candidate in dropped], error=None
         )
 
     def debug_state(self) -> dict:
         """Состояние агента для дебаг-панели: конфиг, стек, метрики
         последнего вызова, накопленное за время жизни и счётчики процесса."""
-        view = self.context_view()
+        # Один снимок долговременной памяти на рендер (день 11): и в бюджет,
+        # и в ключ `long_term` ниже — чтобы «что уходит» и «что лежит» не
+        # разъехались между двумя чтениями. Это копия словаря из памяти
+        # процесса, файл при этом не читается.
+        long_term = self._long_term_entries()
+        view = self._context_view("", long_term)[1]
         return {
             "number": self._number,
             "config": asdict(self._config),
@@ -1108,11 +1409,28 @@ class Agent:
                 for cp in self._checkpoints
             ],
             "branch": asdict(self._branch) if self._branch is not None else None,
+            # Ключи дня 11 — в конце. `memory` — рабочая память, кандидаты и
+            # последний разбор; `long_term` — путь и тот же снимок записей,
+            # по которому посчитан бюджет выше. `None` — модели памяти или
+            # долговременной памяти у агента нет.
+            "memory": (
+                asdict(self._memory.describe(self._messages))
+                if self._memory is not None
+                else None
+            ),
+            "request_layers": list(self._request_layers),
+            "long_term": (
+                {"path": self._long_term.path, "entries": long_term}
+                if self._long_term is not None
+                else None
+            ),
         }
 
     # --- Внутреннее ------------------------------------------------------
 
-    def _build_messages(self, user_message: str) -> list[dict]:
+    def _build_messages(
+        self, user_message: str, long_term: dict | None = None
+    ) -> list[dict]:
         """Единственное место, где собирается список сообщений для запроса.
 
         С дня 9 сборку делает стратегия: агент отдаёт ей системный промпт,
@@ -1122,12 +1440,55 @@ class Agent:
         последние N», не тронув ни строчки в этом методе — обе встают в тот
         же протокол `ContextStrategy`. Ветки — операция над самой историей
         (`fork()`), а не способ собрать запрос, и этого метода не касаются.
+
+        День 11 дописывает сюда слои памяти (§5.4): поверх того, что вернула
+        стратегия, `_with_layers()` вставляет блоки долговременной и рабочей
+        памяти. Стратегии о слоях не знают. `long_term` — снимок записей
+        долговременной памяти этого хода; `None` — взять свежий.
         """
-        return self.strategy.build(
+        if long_term is None:
+            long_term = self._long_term_entries()
+        messages = self.strategy.build(
             self._config.system_prompt, self._messages, user_message
         )
+        return self._with_layers(messages, long_term)
 
-    def _context_view(self, question: str = "") -> tuple[list[dict], ContextView]:
+    def _with_layers(self, messages: list[dict], long_term: dict) -> list[dict]:
+        """Блоки слоёв памяти в готовом списке сообщений — единственное место,
+        где они туда попадают (спецификация дня 11, §5.4).
+
+        Сразу после первого сообщения (системного промпта): долговременная,
+        потом рабочая — от самого устойчивого к самому изменчивому (§3.5),
+        каждый блок только если слой в запросе и блок не пуст. Память
+        стратегии и хвост истории идут дальше как были: ведущие
+        `system`-сообщения стратегии оказываются сразу после блоков слоёв.
+        """
+        if self._memory is None or not messages:
+            return messages
+        blocks: list[dict] = []
+        if memory.LAYER_LONG_TERM in self._request_layers:
+            block = memory.long_term_block(long_term, self._memory.slots)
+            if block is not None:
+                blocks.append(block)
+        if memory.LAYER_WORKING in self._request_layers:
+            block = self._memory.working_block()
+            if block is not None:
+                blocks.append(block)
+        if not blocks:
+            return messages
+        return messages[:1] + blocks + messages[1:]
+
+    def _long_term_entries(self) -> dict:
+        """Снимок записей долговременной памяти — копия словаря из памяти
+        процесса (файл хранилище читает один раз, при создании); `{}` —
+        долговременная память не подключена."""
+        if self._long_term is None:
+            return {}
+        return self._long_term.entries()
+
+    def _context_view(
+        self, question: str = "", long_term: dict | None = None
+    ) -> tuple[list[dict], ContextView]:
         """Сборка запроса и всё, что про неё нужно знать панели и логам, —
         одним проходом.
 
@@ -1137,8 +1498,12 @@ class Agent:
 
         Чистый метод: `describe()`, `prepare()` и `build()` ничего не меняют и
         в сеть не ходят, поэтому его безопасно звать на каждый рендер панели.
+        `long_term` — снимок долговременной памяти (день 11): `ask()` передаёт
+        снимок этого хода, панель — `None`, и тогда берётся свежий.
         """
-        messages = self._build_messages(question)
+        if long_term is None:
+            long_term = self._long_term_entries()
+        messages = self._build_messages(question, long_term)
         usage = tokens.context_usage(
             self._count_messages(messages),
             model=self._config.model,
@@ -1147,10 +1512,14 @@ class Agent:
         )
         # База для сравнения: во сколько обошёлся бы тот же ход без всякого
         # управления контекстом. Считается тем же счётчиком по той же сборке,
-        # только стратегией «Вся история».
+        # только стратегией «Вся история». С дня 11 — с теми же слоями памяти:
+        # экономия говорит только о стратегии, а не о том, что слои добавили.
         full = self._count_messages(
-            _FULL_HISTORY.build(
-                self._config.system_prompt, self._messages, question
+            self._with_layers(
+                _FULL_HISTORY.build(
+                    self._config.system_prompt, self._messages, question
+                ),
+                long_term,
             )
         )
         state = self.strategy.describe(self._messages)
@@ -1183,12 +1552,9 @@ class Agent:
         приходят от стратегии (`task.label`, `StrategyState.memory_label`,
         `StrategyState.last_update`) — агент не знает, сводка это или факты.
 
-        Второе (и последнее) место в проекте, где вызывается
-        `chat.completions.create`. Набор параметров у него намеренно другой:
-        сообщения из задачи, `thinking` всегда выключен (скрытые
-        reasoning-токены тратят тот же бюджет `max_tokens`, что и видимый
-        ответ, и на маленьком лимите ответ пришёл бы пустым), `max_tokens` из
-        задачи, ни температуры, ни `stop`.
+        Сам вызов модели делает `_call_service_model()` (день 11): через него
+        же идёт разбор памяти. Поведение, логи и `ServiceCall` стратегии от
+        этого не изменились.
 
         Это настоящий вызов, но не ход: в стек сообщений он не пишет, строку
         журнала ходов не создаёт и `_last_reply` не трогает.
@@ -1206,12 +1572,7 @@ class Agent:
 
         started = time.perf_counter()
         try:
-            response = client.chat.completions.create(
-                model=self._config.model,
-                messages=task.messages,
-                extra_body={"thinking": {"type": "disabled"}},
-                **({"max_tokens": task.max_tokens} if task.max_tokens else {}),
-            )
+            result = self._call_service_model(client, task.messages, task.max_tokens)
         except Exception as exc:
             logger.exception("[%s] служебный вызов упал", self._log_name)
             call = ServiceCall(
@@ -1236,26 +1597,17 @@ class Agent:
             )
             return call
 
-        elapsed = time.perf_counter() - started
-        choice = response.choices[0]
-        text = (choice.message.content or "").strip()
-        usage = response.usage
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
-        cost_usd = estimate_cost_usd(
-            self._config.model, prompt_tokens, completion_tokens
-        )
-
+        text = result.text
         if not text:
             call = ServiceCall(
                 kind=task.kind, label=task.label, ok=False,
                 error="модель вернула пустой ответ",
-                elapsed=elapsed,
-                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
-                total_tokens=total_tokens, cost_usd=cost_usd,
+                elapsed=result.elapsed,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens, cost_usd=result.cost_usd,
                 covers=0, folded_tokens=folded_tokens, text="",
-                finish_reason=choice.finish_reason,
+                finish_reason=result.finish_reason,
                 memory_label=before.memory_label,
             )
             self._record_service(call)
@@ -1276,15 +1628,15 @@ class Agent:
             label=task.label,
             ok=applied,
             error=None if applied else "ответ модели не разобран",
-            elapsed=elapsed,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            cost_usd=cost_usd,
+            elapsed=result.elapsed,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            cost_usd=result.cost_usd,
             covers=task.covers - covered_before if applied else 0,
             folded_tokens=folded_tokens,
             text=text,
-            finish_reason=choice.finish_reason,
+            finish_reason=result.finish_reason,
             memory_label=after.memory_label,
             memory_update=after.last_update if applied else "",
         )
@@ -1309,13 +1661,14 @@ class Agent:
             self._log_name, task.label, _num(folded_tokens),
             after.memory_label.lower(),
             _num(tokens.estimate_tokens(after.memory_text)),
-            after.last_update, elapsed,
-            prompt_tokens, completion_tokens, total_tokens, _cost_str(cost_usd),
+            after.last_update, result.elapsed,
+            result.prompt_tokens, result.completion_tokens, result.total_tokens,
+            _cost_str(result.cost_usd),
         )
         # Обрезанный ответ применён — отказ от него оставил бы задачу
         # назревшей, и она повторялась бы каждый ход за деньги и с тем же
         # итогом. Но молча это не проходит: штатно в потолок упираться нельзя.
-        if choice.finish_reason == "length":
+        if result.finish_reason == "length":
             logger.warning(
                 "[%s] служебный вызов — %s: ответ упёрся в max_tokens=%s и "
                 "оборван на полуслове — применён как есть; если это "
@@ -1325,9 +1678,192 @@ class Agent:
             )
         return call
 
+    def _call_service_model(
+        self, client: OpenAI, messages: list[dict], max_tokens: int | None
+    ) -> _ServiceResponse:
+        """Служебный вызов модели — второе (и последнее) место в проекте, где
+        вызывается `chat.completions.create` (спецификация дня 11, §5.3). Через
+        него идут обе служебные работы: вызов стратегии и разбор памяти.
+
+        Набор параметров у него намеренно другой, чем у основного вызова
+        (день 9): сообщения из задачи, `thinking` всегда выключен (скрытые
+        reasoning-токены тратят тот же бюджет `max_tokens`, что и видимый
+        ответ, и на маленьком лимите ответ пришёл бы пустым), `max_tokens` из
+        задачи, ни температуры, ни `stop`. Модель — из конфига агента:
+        отдельной модели под служебные работы нет (правило дня 9).
+
+        Исключение API пробрасывается вызывающему: что сбой значит для
+        памяти, знает работа вокруг вызова, а не вызов.
+        """
+        started = time.perf_counter()
+        response = client.chat.completions.create(
+            model=self._config.model,
+            messages=messages,
+            extra_body={"thinking": {"type": "disabled"}},
+            **({"max_tokens": max_tokens} if max_tokens else {}),
+        )
+        elapsed = time.perf_counter() - started
+        choice = response.choices[0]
+        usage = response.usage
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        return _ServiceResponse(
+            text=(choice.message.content or "").strip(),
+            finish_reason=choice.finish_reason,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=getattr(usage, "total_tokens", None),
+            cost_usd=estimate_cost_usd(
+                self._config.model, prompt_tokens, completion_tokens
+            ),
+            elapsed=elapsed,
+        )
+
+    def _run_memory_task(
+        self, client: OpenAI, question: str, long_term: dict
+    ) -> ServiceCall | None:
+        """Разбор памяти перед ответом (спецификация дня 11, §5.3):
+        `prepare()` → вызов → `apply()`.
+
+        Модель раскладывает сказанное игроком по ключам карты: рабочие ключи
+        сразу сливаются в рабочую память, долговременные становятся
+        кандидатами — в долговременную память без решения человека ничего не
+        попадает. `long_term` — снимок записей долговременной памяти этого
+        хода; во вход разбора уходят только значения долговременной части
+        карты.
+
+        Сбой хода не отменяет — правило дня 9 для служебного вызова целиком:
+        исключение API, пустой или неразобранный ответ оставляют рабочую
+        память, кандидатов и `covered` как были, разбор повторится на
+        следующем ходе с накопившимся хвостом. Обрезанный потолком ответ
+        применяется с предупреждением. Это настоящий вызов, но не ход, и не
+        `service_*`: разбор ничего не экономит.
+        """
+        if self._memory is None or not self._config.keep_history:
+            return None
+        values = memory.long_term_values(long_term, self._memory.slots)
+        task = self._memory.prepare(self._messages, question, values)
+        if task is None:
+            return None
+
+        before = self._memory.describe(self._messages)
+        folded = self._messages[before.covered:task.covers]
+        folded_tokens = sum(
+            tokens.estimate_tokens(message.get("content")) for message in folded
+        )
+
+        started = time.perf_counter()
+        try:
+            result = self._call_service_model(client, task.messages, task.max_tokens)
+        except Exception as exc:
+            logger.exception("[%s] разбор памяти упал", self._log_name)
+            call = ServiceCall(
+                kind="memory", label=task.label, ok=False, error=str(exc),
+                elapsed=time.perf_counter() - started,
+                prompt_tokens=None, completion_tokens=None, total_tokens=None,
+                cost_usd=None, covers=0, folded_tokens=folded_tokens, text="",
+                memory_label=MEMORY_CALL_LABEL,
+            )
+            self._record_memory(call)
+            logger.warning(
+                "[%s] %s: не удался (%s); ход не отменяется: рабочая память и "
+                "кандидаты не сдвинулись, разбор повторится на следующем ходе "
+                "с накопившимся хвостом",
+                self._log_name, task.label, call.error,
+            )
+            return call
+
+        text = result.text
+        if not text:
+            call = ServiceCall(
+                kind="memory", label=task.label, ok=False,
+                error="модель вернула пустой ответ",
+                elapsed=result.elapsed,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens, cost_usd=result.cost_usd,
+                covers=0, folded_tokens=folded_tokens, text="",
+                finish_reason=result.finish_reason,
+                memory_label=MEMORY_CALL_LABEL,
+            )
+            self._record_memory(call)
+            logger.warning(
+                "[%s] %s: модель вернула пустой ответ (finish_reason=%s) — "
+                "рабочая память и кандидаты не сдвинулись, разбор повторится "
+                "на следующем ходе",
+                self._log_name, task.label, result.finish_reason,
+            )
+            return call
+
+        applied = self._memory.apply(task, text, values)
+        after = self._memory.describe(self._messages)
+        call = ServiceCall(
+            kind="memory",
+            label=task.label,
+            ok=applied,
+            error=None if applied else "ответ модели не разобран",
+            elapsed=result.elapsed,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            cost_usd=result.cost_usd,
+            covers=task.covers - before.covered if applied else 0,
+            folded_tokens=folded_tokens,
+            text=text,
+            finish_reason=result.finish_reason,
+            memory_label=MEMORY_CALL_LABEL,
+            memory_update=after.last_update if applied else "",
+        )
+        # Токены потрачены в любом случае — считаем их до того, как решим,
+        # годится ли результат.
+        self._record_memory(call)
+        if not applied:
+            logger.warning(
+                "[%s] %s: ответ модели не разобран — рабочая память и "
+                "кандидаты не сдвинулись, начало ответа: %r; разбор повторится "
+                "на следующем ходе",
+                self._log_name, task.label, text[:200],
+            )
+            return call
+
+        # Немедленное сохранение: рабочая память и покрытие уже оплачены, и
+        # падение основного вызова не должно их терять.
+        self._persist()
+        # Ответ разбора — одна-три строки, и в логе он целиком: по нему видно,
+        # «нет изменений» это было или повтор того, что уже лежит в памяти.
+        logger.info(
+            "[%s] %s: %s; finish_reason=%s %.2fs, tokens=%s/%s/%s, cost=%s; "
+            "ответ: %r",
+            self._log_name, task.label, after.last_update, result.finish_reason,
+            result.elapsed, _num(result.prompt_tokens),
+            _num(result.completion_tokens), _num(result.total_tokens),
+            _cost_str(result.cost_usd), text,
+        )
+        waiting_before = {candidate.key: candidate for candidate in before.candidates}
+        for candidate in after.candidates:
+            if waiting_before.get(candidate.key) != candidate:
+                logger.info(
+                    "[%s] кандидат в долговременную память: %s — ждёт решения",
+                    self._log_name, _candidate_str(candidate),
+                )
+        if after.rejected:
+            # `info`, а не `warning`: это решение карты памяти, а не сбой.
+            logger.info(
+                "[%s] %s: ключи вне карты отклонены — %s; в память не попали",
+                self._log_name, task.label, ", ".join(after.rejected),
+            )
+        if result.finish_reason == "length":
+            logger.warning(
+                "[%s] %s: ответ упёрся в max_tokens=%s и оборван на полуслове — "
+                "применён как есть; если это повторяется, потолок мал "
+                "(спецификация дня 11, §3.2)",
+                self._log_name, task.label, task.max_tokens,
+            )
+        return call
+
     def _count_messages(self, messages: list[dict]) -> tokens.RequestTokens:
-        """Разложение готового списка сообщений на систему / память стратегии /
-        историю / вопрос.
+        """Разложение готового списка сообщений на систему / долговременную и
+        рабочую память / память стратегии / историю / вопрос.
 
         Единственное место, где список сообщений превращается в оценку: и
         `ask()`, и `context_usage()` ходят сюда, поэтому «сколько посчитали»
@@ -1339,14 +1875,28 @@ class Agent:
         память стратегии (сводка сегодня, блок фактов у дня 10). Правило
         безопасно: история агента нормализуется до `user`/`assistant` ещё с
         дня 6, и `system` в ней не бывает.
+
+        С дня 11 (§5.6) среди этих `system` отделяются блоки слоёв: то, что
+        начинается с `memory.LONG_TERM_HEADER`, — корзина `long_term`, с
+        `memory.WORKING_HEADER` — `working`, остальное — память стратегии.
+        Правило безопасно по той же причине: `system`-сообщения в запросе
+        ставит только код проекта, и заголовки — его константы.
         """
         middle = messages[1:-1]
+        system = [
+            m.get("content") or "" for m in middle if m.get("role") == "system"
+        ]
+        layers = (memory.LONG_TERM_HEADER, memory.WORKING_HEADER)
         return tokens.count_request(
             system_prompt=messages[0]["content"],
             history=[m for m in middle if m.get("role") != "system"],
             question=messages[-1]["content"],
-            memory="\n\n".join(
-                m.get("content") or "" for m in middle if m.get("role") == "system"
+            memory="\n\n".join(text for text in system if not text.startswith(layers)),
+            long_term="\n\n".join(
+                text for text in system if text.startswith(memory.LONG_TERM_HEADER)
+            ),
+            working="\n\n".join(
+                text for text in system if text.startswith(memory.WORKING_HEADER)
             ),
         )
 
@@ -1370,12 +1920,15 @@ class Agent:
         когда занято больше `WARN_RATIO`: приближение к лимиту должно быть
         видно в терминале, а не только в панели."""
         request = budget.request
+        # Слагаемые — в порядке блоков запроса (день 11, §3.5): долговременная
+        # и рабочая память стоят между системным промптом и памятью стратегии.
         logger.info(
-            "[%s] бюджет: система %s + память %s + история %s + вопрос %s + "
-            "служебные %s ≈ %s из %s доступных (%s); окно %s, резерв под "
-            "ответ %s",
+            "[%s] бюджет: система %s + долговременная %s + рабочая %s + память "
+            "стратегии %s + история %s + вопрос %s + служебные %s ≈ %s из %s "
+            "доступных (%s); окно %s, резерв под ответ %s",
             self._log_name,
-            _num(request.system), _num(request.memory), _num(request.history),
+            _num(request.system), _num(request.long_term), _num(request.working),
+            _num(request.memory), _num(request.history),
             _num(request.question), _num(request.overhead), _num(budget.used),
             _num(budget.available), _ratio_str(budget.ratio),
             _num(budget.limit), _num(budget.answer_reserve),
@@ -1453,8 +2006,13 @@ class Agent:
             if (dump := strategy.dump())
         }
         data: dict = {"strategy": self._strategy_name, "memory": memory}
+        # Рабочая память (день 11, §5.7) — отдельным ключом рядом с памятью
+        # стратегий и тем же правилом: только непустая. Кандидатов и слоёв в
+        # запросе здесь нет никогда — они не состояние сессии.
+        if self._memory is not None and (working := self._memory.dump()):
+            data["working"] = working
         if self._checkpoints:
-            data["checkpoints"] = [asdict(cp) for cp in self._checkpoints]
+            data["checkpoints"] = [_checkpoint_dump(cp) for cp in self._checkpoints]
         if self._branch is not None:
             data["branch"] = asdict(self._branch)
         return data
@@ -1504,6 +2062,9 @@ class Agent:
         saved = data.get("strategy")
         if isinstance(saved, str) and saved:
             self._strategy_name = self._known_strategy(saved)
+        # Рабочая память (день 11) — тем же кодом и из файла сессии, и из
+        # `seed` ветки.
+        self._load_working(data.get("working"))
         # Checkpoint'ы и происхождение ветки (день 10) — тем же приёмом, что
         # память стратегий: мусор переживается с предупреждением, историю
         # читать это не мешает. `self._messages` здесь уже проставлены — и при
@@ -1511,6 +2072,31 @@ class Agent:
         # это в обоих случаях).
         self._checkpoints = self._parse_checkpoints(data.get("checkpoints"))
         self._branch = self._parse_branch(data.get("branch"))
+
+    def _load_working(self, data: object) -> None:
+        """Рабочая память из `context.working` (день 11, §5.1). Ключа нет —
+        пусто без предупреждений: это файл дня 10. Не словарь — пусто с
+        предупреждением. Мусор внутри словаря модель памяти переживает молча
+        (логов у `memory.py` нет), и что прочитано не всё, агент узнаёт сам
+        приёмом дня 9: сравнивает `dump()` с прочитанным.
+
+        У агента без модели памяти рабочая память из файла не читается — это
+        поведение дня 10, и первая запись перепишет блок `context` без неё."""
+        if self._memory is None or data is None:
+            return
+        if not isinstance(data, dict):
+            self._startup_warnings.append(
+                f"рабочая память в файле имеет тип {type(data).__name__} "
+                f"вместо словаря — рабочая память пустая"
+            )
+            return
+        self._memory.load(data)
+        if self._memory.dump() != data:
+            self._startup_warnings.append(
+                "рабочая память в файле прочитана не целиком (битые поля или "
+                "ключи вне рабочей части карты) — работаем с тем, что удалось "
+                "разобрать"
+            )
 
     def _parse_checkpoints(self, data: object) -> list[Checkpoint]:
         """Checkpoint'ы из файла сессии. Файл дня 9 (ключа нет) даёт пустой
@@ -1565,9 +2151,23 @@ class Agent:
                 f"checkpoint «{checkpoint_id}» в файле битый — пропущен"
             )
             return None
+        # Снимок рабочей памяти (день 11, §5.7): ключа нет — пустой снимок без
+        # предупреждений (checkpoint дня 10); не словарь — checkpoint всё
+        # равно читается, но с пустым снимком и предупреждением: история и
+        # память стратегий в нём целы.
+        working = item.get("working")
+        if working is None:
+            working = {}
+        elif not isinstance(working, dict):
+            self._startup_warnings.append(
+                f"checkpoint «{checkpoint_id}»: снимок рабочей памяти имеет тип "
+                f"{type(working).__name__} вместо словаря — checkpoint прочитан "
+                f"с пустым снимком"
+            )
+            working = {}
         return Checkpoint(
             id=checkpoint_id, messages=messages, strategy=strategy,
-            memory=memory, created_at=created_at,
+            memory=memory, created_at=created_at, working=working,
         )
 
     def _parse_branch(self, data: object) -> BranchOrigin | None:
@@ -1615,11 +2215,14 @@ class Agent:
         ]
         return max(numbers, default=0) + 1
 
-    def _unchanged_checkpoint(self, memory: dict) -> Checkpoint | None:
+    def _unchanged_checkpoint(
+        self, memory: dict, working: dict | None = None
+    ) -> Checkpoint | None:
         """Последний checkpoint, если он совпадает с тем, что получился бы
-        сейчас, — та же длина истории, та же стратегия, тот же снимок памяти.
-        Только последний: более ранний совпадающий checkpoint не должен
-        мешать завести новый в другой точке истории."""
+        сейчас, — та же длина истории, та же стратегия, тот же снимок памяти
+        стратегий и (день 11) тот же снимок рабочей памяти. Только последний:
+        более ранний совпадающий checkpoint не должен мешать завести новый в
+        другой точке истории."""
         if not self._checkpoints:
             return None
         last = self._checkpoints[-1]
@@ -1627,9 +2230,35 @@ class Agent:
             last.messages == len(self._messages)
             and last.strategy == self._strategy_name
             and last.memory == memory
+            and last.working == (working or {})
         ):
             return last
         return None
+
+    def _layers_note(self) -> str:
+        """Кусок строки «агент создан» про слои памяти (день 11, §5.9): сколько
+        записей в рабочей памяти, сколько долговременных и какие слои уходят в
+        запрос — по логу видно, приехала ли память."""
+        if self._memory is None:
+            return ", модели памяти нет"
+        state = self._memory.describe(self._messages)
+        return (
+            f", рабочая память: {state.working_items} зап. (учтено "
+            f"{state.covered} сообщ.), долговременная: "
+            f"{self._long_term_count_str()}, слои в запросе: "
+            f"{_layers_str(self._request_layers)}"
+        )
+
+    def _long_term_count_str(self) -> str:
+        """«5 зап. в src/data/memory/long_term.json» — сколько записей
+        долговременной памяти использует карта; «не подключена» — хранилища
+        нет. Записи вне карты не считаются: в запрос они не уходят."""
+        if self._long_term is None or self._memory is None:
+            return "не подключена"
+        count = len(
+            memory.long_term_values(self._long_term_entries(), self._memory.slots)
+        )
+        return f"{count} зап. в {self._long_term.path}"
 
     def _known_strategy(self, name: str) -> str:
         """Имя стратегии из файла или от вызывающей стороны, приведённое к
@@ -1653,10 +2282,13 @@ class Agent:
         elapsed: float,
         request: "tokens.RequestTokens | None" = None,
         service: ServiceCall | None = None,
+        memory_call: ServiceCall | None = None,
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
         случай, когда оценку хочется видеть. У ошибки без ключа считать нечего.
+        Разбор памяти (день 11), применённый до упавшего вызова, уже оплачен и
+        сохранён — он едет в ответ, чтобы панель показала и его.
         """
         reply = AgentReply(
             ok=False,
@@ -1673,6 +2305,7 @@ class Agent:
             agent_name=self._config.name,
             request_tokens=request,
             service_call=service,
+            memory_call=memory_call,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
@@ -1684,6 +2317,7 @@ class Agent:
         history_before: int,
         view: ContextView,
         service: ServiceCall | None,
+        memory_call: ServiceCall | None = None,
     ) -> None:
         """Строка журнала ходов — только на успешный вызов и после `_record()`:
         накопительные числа берутся из уже обновлённых счётчиков агента.
@@ -1711,6 +2345,13 @@ class Agent:
                 service_cost_usd=service.cost_usd if service else None,
                 elapsed=reply.elapsed,
                 service_elapsed=service.elapsed if service else 0.0,
+                # Разбор памяти этого хода и корзины слоёв в оценке запроса
+                # (день 11, §5.8).
+                memory_tokens=(memory_call.total_tokens or 0) if memory_call else 0,
+                memory_cost_usd=memory_call.cost_usd if memory_call else None,
+                memory_elapsed=memory_call.elapsed if memory_call else 0.0,
+                long_term_tokens=view.usage.request.long_term,
+                working_tokens=view.usage.request.working,
             )
         )
         # Экономия копится по ходам и может быть отрицательной: на коротком
@@ -1727,6 +2368,25 @@ class Agent:
         ответ игроку. В калибровку служебный вызов тоже не идёт — собственной
         оценки этого запроса мы не считали, сравнивать факт не с чем.
         """
+        self._record_extra_call(call)
+        self._totals["service_calls"] += 1
+        self._totals["service_tokens"] += call.total_tokens or 0
+        self._totals["service_cost_usd"] += call.cost_usd or 0.0
+
+    def _record_memory(self, call: ServiceCall) -> None:
+        """Учёт разбора памяти (день 11, §5.8): в общих счётчиках агента и
+        процесса — как любой вызов, и отдельно в своих `memory_*`. Не в
+        `service_*`: те — цена памяти стратегий рядом с их экономией, а разбор
+        ничего не экономит, он добавляет. В калибровку не идёт по той же
+        причине, что служебный вызов стратегии."""
+        self._record_extra_call(call)
+        self._totals["memory_calls"] += 1
+        self._totals["memory_tokens"] += call.total_tokens or 0
+        self._totals["memory_cost_usd"] += call.cost_usd or 0.0
+
+    def _record_extra_call(self, call: ServiceCall) -> None:
+        """Общая часть учёта служебного вызова и разбора памяти: вызов, ошибка,
+        токены и деньги — в счётчики агента и процесса."""
         prompt_tokens = call.prompt_tokens or 0
         completion_tokens = call.completion_tokens or 0
         total_tokens = call.total_tokens or 0
@@ -1739,9 +2399,6 @@ class Agent:
         self._totals["completion_tokens"] += completion_tokens
         self._totals["total_tokens"] += total_tokens
         self._totals["cost_usd"] += cost_usd
-        self._totals["service_calls"] += 1
-        self._totals["service_tokens"] += total_tokens
-        self._totals["service_cost_usd"] += cost_usd
 
         _bump_process_stats(
             calls=1,
@@ -1802,6 +2459,41 @@ def _now_iso() -> str:
     """Время для checkpoint'а и происхождения ветки, ISO до секунд — тем же
     форматом, что `storage.py` пишет `created_at`/`updated_at`."""
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _checkpoint_dump(checkpoint: Checkpoint) -> dict:
+    """Checkpoint для файла сессии. Пустой снимок рабочей памяти (день 11) не
+    пишется — тем же правилом, что пустая память стратегий: checkpoint агента
+    без рабочей памяти выглядит на диске ровно как checkpoint дня 10."""
+    data = asdict(checkpoint)
+    if not data.get("working"):
+        data.pop("working", None)
+    return data
+
+
+def _layers_str(layers: Sequence[str]) -> str:
+    """Слои в запросе словами для лога: «долговременная, рабочая» или «нет»."""
+    return ", ".join(layers) if layers else "нет"
+
+
+def _quoted(value: str | None) -> str:
+    return "нет" if value is None else f"«{value}»"
+
+
+def _candidate_str(candidate: "memory.Candidate") -> str:
+    """Кандидат для лога (день 11, §5.9): «коллекция = «только база» (было:
+    «база и Undertow»)» или «знания о правилах — удалить (было: «…»)»."""
+    proposal = (
+        f"{candidate.key} = «{candidate.value}»"
+        if candidate.value is not None
+        else f"{candidate.key} — удалить"
+    )
+    previous = (
+        f"было: «{candidate.previous}»"
+        if candidate.previous is not None
+        else "раньше ключа не было"
+    )
+    return f"{proposal} ({previous})"
 
 
 def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:

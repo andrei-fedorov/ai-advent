@@ -1,5 +1,6 @@
 # TooManyRules — хранилище истории диалогов (день 7, неделя 2; день 9 —
-# формат версии 2, память стратегии рядом с историей).
+# формат версии 2, память стратегии рядом с историей; день 11 — долговременная
+# память в отдельном файле).
 #
 # Реализация протокола `HistoryStore`, объявленного в `agent.py` на дне 6:
 # одна сессия — один JSON-файл в `src/data/sessions/`. День 6 объявил
@@ -14,8 +15,19 @@
 #
 # Из `agent.py` тоже ничего не импортируется: протокол структурный, наследовать
 # его не требуется. Направление зависимостей: app.py → storage.py.
+#
+# День 11 добавляет второе хранилище — `JsonLongTermStore`, долговременную
+# память агента (спецификация дня 11, §6). Хранение следует за временем
+# жизни (§2.2): рабочая память живёт ровно столько, сколько сессия, и едет в
+# тот же непрозрачный блок `context` файла сессии — формат файла сессии не
+# меняется, версия остаётся второй. Долговременная память с сессиями не
+# связана, и её файл лежит вне каталога сессий — рядом с ним, в `memory/`:
+# удалённая сессия не должна уносить профиль пользователя, а ветка — жить со
+# своей копией. Карты памяти и слоёв хранилище не знает: ключи для него —
+# непрозрачные строки.
 
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -47,6 +59,18 @@ DATA_DIR = Path(os.getenv("TOOMANYRULES_DATA_DIR") or _DEFAULT_DATA_DIR)
 # Имя файла сессии: s001.json, s002.json, … — номер с ведущими нулями, чтобы
 # файлы в каталоге шли в порядке создания, а сессия читалась в логе глазом.
 _SESSION_ID_RE = re.compile(r"^s(\d+)$")
+
+# Каталог долговременной памяти (день 11, §2.2) — сосед каталога сессий, а не
+# его подкаталог: в каталог сессий он не попадает, и `sessions()` про него не
+# знает. Правило одно на оба случая: по умолчанию это `src/data/memory/`
+# рядом с `src/data/sessions/`, а экземпляр, поднятый с
+# `TOOMANYRULES_DATA_DIR=<каталог>/sessions`, получает свою долговременную
+# память в `<каталог>/memory/` и не пишет в память автора.
+LONG_TERM_DIR = DATA_DIR.parent / "memory"
+
+# Версия формата файла долговременной памяти. Своя, а не общая с файлом
+# сессии: файлы разные и растут независимо.
+LONG_TERM_FORMAT_VERSION = 1
 
 
 class StorageError(Exception):
@@ -376,6 +400,210 @@ class JsonHistoryStore:
     def _preset_for(self, session_id: str) -> str | None:
         with self._lock:
             return self._known.get(session_id)
+
+
+class JsonLongTermStore:
+    """Долговременная память в одном JSON-файле, общем для всех сессий и
+    агентов процесса. Хранилище не знает ни карты памяти, ни слоёв: ключи
+    для него — непрозрачные строки.
+
+    Экземпляр в приложении один на процесс и передаётся всем агентам тем же
+    объектом, как `JsonHistoryStore`. Файл читается один раз при создании,
+    дальше записи живут в памяти процесса, а файл — источник при старте. Два
+    процесса с одним каталогом не синхронизируются (правило дня 7): второй
+    экземпляр поднимается с другим `TOOMANYRULES_DATA_DIR`, и у него своя
+    долговременная память.
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = (
+            Path(path) if path is not None else LONG_TERM_DIR / "long_term.json"
+        )
+        # Замок нужен, потому что хранилище общее: два агента, сохраняющие
+        # кандидатов одновременно, без него записали бы файл в обратном
+        # порядке и потеряли бы одно решение человека.
+        self._lock = threading.Lock()
+        self._entries: dict[str, dict] = {}
+        self._error: str | None = None
+        # Запись выключается ровно в одном случае — файл есть, но не
+        # прочитался: не затираем то, что сегодня не прочиталось (день 7).
+        self._writable = True
+        self._load()
+
+    @property
+    def path(self) -> str:
+        """Путь к файлу для логов и панели — от корня репозитория."""
+        return display_path(self._path)
+
+    @property
+    def error(self) -> str | None:
+        """Почему файл не прочитался или не записался; `None` — всё в порядке."""
+        return self._error
+
+    def entries(self) -> dict:
+        """Копия записей: «ключ → {"value", "session_id", "updated_at"}».
+
+        Глубокая копия, без замка: словарь записей подменяется целиком после
+        каждой записи и после этого не меняется, поэтому панель и агенты
+        читают его, не дожидаясь чужой записи, — и не должны получить
+        словарь, который меняется у них под руками.
+        """
+        return copy.deepcopy(self._entries)
+
+    def apply(self, changes: dict[str, str | None], session_id: str) -> dict:
+        """Слияние изменений и запись файла; возвращает новую копию записей.
+
+        `None` удаляет ключ (удаление отсутствующего — не ошибка), значение
+        слово в слово запись не трогает — ни значение, ни происхождение.
+        Сливается копия, файл пишется атомарно (временный файл рядом плюс
+        `os.replace`, как у сессий), и только после успешной записи
+        подменяется кэш. Сбой записи — `StorageError`, кэш остаётся прежним:
+        решение человека не должно считаться сохранённым, если его нет на
+        диске.
+
+        Пустой набор записей файл **не** удаляет: в отличие от сессии, пустая
+        долговременная память — законное состояние «человек всё отклонил и
+        всё удалил», и `updated_at` у файла это показывает.
+        """
+        with self._lock:
+            if not self._writable:
+                raise StorageError(
+                    f"запись долговременной памяти выключена: {self._error}"
+                )
+            entries = copy.deepcopy(self._entries)
+            now = _now()
+            changed: list[str] = []
+            for key, value in (changes or {}).items():
+                if not isinstance(key, str) or not key:
+                    continue
+                if value is None:
+                    if key in entries:
+                        del entries[key]
+                        changed.append(f"−{key}")
+                    continue
+                current = entries.get(key)
+                if current is not None and current.get("value") == value:
+                    continue
+                changed.append(f"{'~' if current is not None else '+'}{key}")
+                entries[key] = {
+                    "value": value,
+                    "session_id": session_id,
+                    "updated_at": now,
+                }
+            if not changed:
+                # Писать нечего: всё уже лежит в файле в этом виде.
+                return copy.deepcopy(entries)
+
+            payload = {
+                "version": LONG_TERM_FORMAT_VERSION,
+                "updated_at": now,
+                "entries": entries,
+            }
+            tmp_path = self._path.with_name(self._path.name + ".tmp")
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp_path, self._path)
+            except OSError as exc:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink(missing_ok=True)
+                self._error = f"не удалось записать {self.path}: {exc}"
+                logger.warning("долговременная память: %s", self._error)
+                raise StorageError(self._error) from exc
+
+            self._entries = entries
+            self._error = None
+            logger.info(
+                "долговременная память: записано %s (сессия %s), записей %d → %s",
+                ", ".join(changed), session_id, len(entries), self.path,
+            )
+            return copy.deepcopy(entries)
+
+    def read_file(self) -> dict | None:
+        """Сырое содержимое файла для дебаг-панели: `None`, если файла нет
+        или он не читается. Панель перечитывает файл на каждом событии
+        интерфейса, поэтому успешное чтение логируется на уровне `debug`."""
+        if not self._path.exists():
+            return None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "долговременная память: файл не показан в панели — %s: %s",
+                self.path, exc,
+            )
+            return None
+        logger.debug("прочитан файл долговременной памяти (%s)", self.path)
+        return data if isinstance(data, dict) else None
+
+    # --- Внутреннее ------------------------------------------------------
+
+    def _load(self) -> None:
+        """Чтение файла при создании хранилища. Нет файла — пустая память, это
+        нормально. Файл не читается, не JSON, не той формы — пустая память,
+        запись выключена, файл не трогается. Отдельные битые записи
+        пропускаются с предупреждением, остальные читаются."""
+        if not self._path.exists():
+            logger.info(
+                "долговременная память: файла нет, память пустая — %s появится "
+                "с первым сохранённым кандидатом",
+                self.path,
+            )
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._disable(f"файл {self.path} не прочитался: {exc}")
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+            self._disable(
+                f"файл {self.path} — не файл долговременной памяти: нет "
+                f"словаря entries"
+            )
+            return
+        version = data.get("version")
+        if version is not None and version != LONG_TERM_FORMAT_VERSION:
+            self._disable(
+                f"файл {self.path} — формат версии {version!r}, этот код "
+                f"читает версию {LONG_TERM_FORMAT_VERSION}"
+            )
+            return
+
+        entries: dict[str, dict] = {}
+        dropped: list[str] = []
+        for key, entry in data["entries"].items():
+            value = entry.get("value") if isinstance(entry, dict) else None
+            if not key or not isinstance(value, str) or not value.strip():
+                dropped.append(str(key))
+                continue
+            entries[key] = {
+                "value": value,
+                "session_id": _str_or_empty(entry.get("session_id")),
+                "updated_at": _str_or_empty(entry.get("updated_at")),
+            }
+        if dropped:
+            logger.warning(
+                "долговременная память: пропущено битых записей %d (%s), "
+                "прочитано %d — %s",
+                len(dropped), ", ".join(dropped), len(entries), self.path,
+            )
+        self._entries = entries
+        logger.info(
+            "долговременная память: загружено %d записей ← %s",
+            len(entries), self.path,
+        )
+
+    def _disable(self, reason: str) -> None:
+        self._writable = False
+        self._error = f"{reason}; память пустая, запись выключена, файл не тронут"
+        logger.warning("долговременная память: %s", self._error)
+
+
+def _str_or_empty(value: object) -> str:
+    return value if isinstance(value, str) else ""
 
 
 def _clean_messages(messages: object, session_id: str) -> list[dict]:

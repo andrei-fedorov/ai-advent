@@ -1,14 +1,27 @@
-# TooManyRules — приложение недели 2 (день 9: чат через агента + дебаг-панель;
-# день 10: четыре стратегии, checkpoint'ы и ветки диалога).
+# TooManyRules — приложение (день 9: чат через агента + дебаг-панель; день 10:
+# четыре стратегии, checkpoint'ы и ветки диалога; день 11, неделя 3: модель
+# памяти — три слоя, кандидаты в долговременную память и переключатель слоёв
+# в запросе).
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
 # `agent.Agent`, конфиги агентов проекта лежат в `presets.py`, история
-# диалогов — в `storage.py`, счёт токенов — в `tokens.py` (оттуда берутся
-# только чистые функции: генератор заполнителя и оценка его размера, всё
-# остальное панель получает от агента готовым), стратегии управления
-# контекстом — в `context.py`, и напрямую он отсюда тоже не импортируется:
-# набор стратегий агенту выдаёт `presets.make_strategies()`.
+# диалогов и долговременная память — в `storage.py`, счёт токенов — в
+# `tokens.py` (оттуда берутся только чистые функции: генератор заполнителя и
+# оценка его размера, всё остальное панель получает от агента готовым),
+# стратегии управления контекстом — в `context.py`, и напрямую он отсюда тоже
+# не импортируется: набор стратегий агенту выдаёт `presets.make_strategies()`.
+# Из `memory.py` интерфейс берёт только имена слоёв (пункты переключателя) и
+# чистую `long_term_text()` для подраздела долговременной памяти: модель памяти
+# агенту выдаёт `presets.make_memory()`.
+#
+# День 11 (спецификация дня 11, §7): интерфейс остаётся видом на состояние
+# агента — ни своей копии рабочей памяти, ни своего списка кандидатов, ни
+# своего кэша долговременной памяти. Всё приходит из агента и хранилища на
+# каждом событии. Панель не знает, какие ключи бывают: рабочая память и
+# кандидаты рисуются из `MemoryState`, долговременная — из записей хранилища.
+# Запись в долговременную память — только кнопкой «Сохранить в
+# долговременную»: по умолчанию ни один кандидат не отмечен.
 #
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
@@ -56,6 +69,7 @@ from agent import (
     estimate_cost_usd,
     process_stats,
 )
+from memory import LAYER_LONG_TERM, LAYER_WORKING, REQUEST_LAYERS, long_term_text
 from presets import (
     BRANCH_QUESTION,
     BRANCH_STEPS,
@@ -63,11 +77,16 @@ from presets import (
     CONTROL_QUESTIONS,
     DEFAULT_PRESET,
     DEFAULT_STRATEGY,
+    MEMORY_CONTROL_QUESTIONS,
+    MEMORY_MAP,
+    MEMORY_SCENARIO,
+    NEXT_SESSION_QUESTIONS,
     PRESETS,
     STRATEGIES,
+    make_memory,
     make_strategies,
 )
-from storage import JsonHistoryStore, StorageError, display_path
+from storage import JsonHistoryStore, JsonLongTermStore, StorageError, display_path
 from tokens import FILLER_MAX_TOKENS, estimate_tokens, filler_text
 
 # Логирование настраивает точка входа — тот же формат, что на неделе 1.
@@ -81,6 +100,12 @@ logger = logging.getLogger("toomanyrules.app")
 # их по файлам. Создаётся на модуле, а не в обработчиках, — иначе номера
 # сессий выдавали бы несколько независимых экземпляров.
 STORE = JsonHistoryStore()
+
+# Долговременная память (день 11, §7.1) — тоже одна на процесс и общая для
+# всех агентов, рядом со `STORE`: её файл общий для всех сессий. Путь к
+# файлу хранилище печатает в лог при создании — по нему видно, что экземпляр,
+# поднятый с `TOOMANYRULES_DATA_DIR`, не пишет в память автора.
+LONG_TERM = JsonLongTermStore()
 
 # Сколько агентов поднялось из файлов при старте процесса — заполняется
 # `_restore_agents()` ниже и показывается в строке статуса при открытии
@@ -185,6 +210,9 @@ def _metrics_md(last_call: dict | None) -> str:
         # показать её здесь — значит не показать нигде, кроме накопленных
         # счётчиков.
         service = _service_lines(last_call.get("service_call"))
+        # Разбор памяти (день 11) — тем же правилом: применённый до упавшего
+        # вызова разбор оплачен и сохранён, и показать его больше негде.
+        service += _memory_call_lines(last_call.get("memory_call"))
         if service:
             lines += ["", *service]
         return "\n".join(lines)
@@ -222,6 +250,7 @@ def _metrics_md(last_call: dict | None) -> str:
         f"- **Модель:** `{last_call['model']}`",
     ]
     lines += _service_lines(last_call.get("service_call"))
+    lines += _memory_call_lines(last_call.get("memory_call"))
     return "\n".join(lines)
 
 
@@ -262,6 +291,37 @@ def _service_lines(service: dict | None) -> list[str]:
     if service.get("finish_reason") == "length":
         # Обрезанный ответ применён, но выдавать его за нормальный нельзя:
         # штатно в потолок служебного вызова упираться не должно.
+        line += (
+            " — ⚠️ **ответ упёрся в потолок `max_tokens` и оборван на "
+            "полуслове**, применён как есть"
+        )
+    return [line]
+
+
+def _memory_call_lines(call: dict | None) -> list[str]:
+    """Разбор памяти этого хода (день 11, §7.4) — строкой следом за служебным
+    вызовом стратегии, по образцу `_service_lines()`. `None` — разбора не
+    было. Сбой и неразобранный ответ показываются здесь же и за ошибку
+    ответа не выдаются: ход состоялся."""
+    if not call:
+        return []
+    if not call["ok"]:
+        line = f"- **🧠 Разбор памяти не удался — {call['label']}:** {call['error']}"
+        if call["text"]:
+            line += f" (начало ответа: «{call['text'][:120]}»)"
+        line += (
+            f" — рабочая память и кандидаты не сдвинулись, ход состоялся; "
+            f"разбор повторится на следующем ходе. Потрачено "
+            f"{_fmt_int(call['total_tokens'] or 0)} токенов."
+        )
+        return [line]
+    line = (
+        f"- **🧠 Разбор памяти — {call['label']}:** {call['memory_update']}; "
+        f"ответ ≈{_fmt_int(estimate_tokens(call['text']))} токенов, вызов "
+        f"{_fmt_int(call['total_tokens'])} токенов, "
+        f"{_fmt_cost(call['cost_usd'])}, {call['elapsed']:.2f} s"
+    )
+    if call.get("finish_reason") == "length":
         line += (
             " — ⚠️ **ответ упёрся в потолок `max_tokens` и оборван на "
             "полуслове**, применён как есть"
@@ -352,8 +412,12 @@ def _context_md(
         + f", резерв под ответ {_fmt_int(usage['answer_reserve'])}",
         # Память стратегии (день 9: сводка; день 10: факты) — слагаемое
         # наравне с остальными: без неё сумма в строке не сходилась бы с
-        # итогом ровно на размер этой памяти.
-        f"- **В запросе:** система {_fmt_int(request['system'])} + память "
+        # итогом ровно на размер этой памяти. Слои памяти дня 11 — тем же
+        # правилом, в порядке блоков запроса: между системой и памятью
+        # стратегии.
+        f"- **В запросе:** система {_fmt_int(request['system'])} + "
+        f"долговременная {_fmt_int(request['long_term'])} + рабочая "
+        f"{_fmt_int(request['working'])} + память стратегии "
         f"{_fmt_int(request['memory'])} + история "
         f"{_fmt_int(request['history'])} ({len(request['per_message'])} сообщ.) + "
         f"вопрос {_fmt_int(request['question'])} + служебные "
@@ -435,7 +499,13 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
         "### Контекст: что уходит в модель",
         "",
         f"- **Стратегия:** «{view['strategy']}» — {state['description']}",
+        # Слои памяти (день 11) — слагаемыми между системой и памятью
+        # стратегии: без них сумма не сошлась бы с итогом. Стратегия о них
+        # не знает, и в экономию ниже они не входят — база «вся история»
+        # собрана с теми же слоями.
         f"- **Состав запроса:** система {_fmt_int(request['system'])} + "
+        f"долговременная {_fmt_int(request['long_term'])} + рабочая "
+        f"{_fmt_int(request['working'])} + "
         f"{memory_name} {_fmt_int(request['memory'])} + "
         f"{view['sent_messages']} сообщ. истории {_fmt_int(request['history'])} + "
         f"вопрос {_fmt_int(request['question'])} + служебные "
@@ -596,6 +666,13 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             # в колонке есть.
             "время ответа, s": f"{turn['elapsed']:.2f}",
             "время служебного, s": f"{turn['service_elapsed']:.2f}",
+            # Колонки дня 11 — в конце (§7.4): корзины слоёв в запросе хода и
+            # разбор памяти этого хода. Разбор — отдельной колонкой, а не в
+            # «служебных»: те — цена памяти стратегий рядом с их экономией.
+            "долговременная": turn["long_term_tokens"],
+            "рабочая": turn["working_tokens"],
+            "разбор памяти": turn["memory_tokens"],
+            "время разбора, s": f"{turn['memory_elapsed']:.2f}",
         }
         for turn in turns
     ]
@@ -604,7 +681,9 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
         columns=["ход", "стек до хода", "оценка", "prompt", "completion",
                  "total", "оценка/факт", "стоимость", "накопительно",
                  "стратегия", "отправлено сообщ.", "вся история", "служебные",
-                 "время ответа, s", "время служебного, s"],
+                 "время ответа, s", "время служебного, s",
+                 "долговременная", "рабочая", "разбор памяти",
+                 "время разбора, s"],
     )
 
 
@@ -616,7 +695,8 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
     return (
         f"### Накоплено агентом {agent_title}\n\n"
         f"- **Вызовов:** {totals['calls']} (из них с ошибкой: "
-        f"{totals['errors']}, служебных: {totals['service_calls']})\n"
+        f"{totals['errors']}, служебных: {totals['service_calls']}, "
+        f"разборов памяти: {totals['memory_calls']})\n"
         f"- **🔢 Токены:** prompt={totals['prompt_tokens']} / "
         f"completion={totals['completion_tokens']} / "
         f"total={totals['total_tokens']}\n"
@@ -626,8 +706,28 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"≈{_fmt_int(abs(lifetime_saved))} токенов "
         f"({_fmt_cost(estimate_cost_usd(model, abs(lifetime_saved), 0))} "
         f"по входу)\n"
+        # Строка дня 11 (§7.4): разбор памяти ничего не экономит, он
+        # добавляет, — и стоит отдельно от служебных вызовов стратегий.
+        f"- **🧠 Разбор памяти:** {totals['memory_calls']} "
+        f"{_calls_word(totals['memory_calls'])}, "
+        f"{_fmt_int(totals['memory_tokens'])} токенов, "
+        f"{_fmt_cost(totals['memory_cost_usd'])} — это цена слоёв памяти; в "
+        f"экономию стратегии не входит\n"
         f"- **💲 Стоимость:** {_fmt_cost(totals['cost_usd'])}"
     )
+
+
+def _calls_word(count: int) -> str:
+    """«1 вызов» / «2 вызова» / «5 вызовов»."""
+    if 11 <= count % 100 <= 14:
+        return "вызовов"
+    match count % 10:
+        case 1:
+            return "вызов"
+        case 2 | 3 | 4:
+            return "вызова"
+        case _:
+            return "вызовов"
 
 
 def _process_md(process: dict) -> str:
@@ -801,6 +901,185 @@ def _branches_md(agent: Agent) -> str:
     return "\n".join(lines)
 
 
+# --- Слои памяти (день 11) ------------------------------------------------
+# Блок «Слои памяти», ряд кандидатов и статусы про долговременную память.
+# Панель не знает, какие ключи бывают: рабочая память и кандидаты приходят из
+# `MemoryState` в `debug_state()["memory"]`, долговременная — из
+# `debug_state()["long_term"]`, её текст — из `memory.long_term_text()`.
+
+def _records_word(count: int) -> str:
+    """«1 запись» / «2 записи» / «5 записей»."""
+    if 11 <= count % 100 <= 14:
+        return "записей"
+    match count % 10:
+        case 1:
+            return "запись"
+        case 2 | 3 | 4:
+            return "записи"
+        case _:
+            return "записей"
+
+
+def _long_term_records() -> str:
+    """«5 записей» — сколько записей в долговременной памяти процесса."""
+    count = len(LONG_TERM.entries())
+    return f"{count} {_records_word(count)}"
+
+
+def _long_term_status() -> str:
+    """Фраза про долговременную память для статуса при открытии страницы
+    (§7.1): сколько записей и откуда, или что её пока нет."""
+    if LONG_TERM.error:
+        return f"Долговременная память: ⚠️ {LONG_TERM.error}."
+    if LONG_TERM.read_file() is None:
+        return (
+            f"Долговременной памяти пока нет — `{LONG_TERM.path}` появится с "
+            f"первым сохранённым кандидатом."
+        )
+    return f"Долговременная память: {_long_term_records()} из `{LONG_TERM.path}`."
+
+
+def _candidate_label(candidate: dict) -> str:
+    """Кандидат словами — и пунктом группы «Кандидаты в долговременную
+    память», и строкой блока «Слои памяти»: «коллекция: только база (было:
+    база и Undertow)»."""
+    value = candidate["value"] if candidate["value"] is not None else "удалить"
+    previous = (
+        f"было: {candidate['previous']}"
+        if candidate["previous"] is not None
+        else "раньше не было"
+    )
+    return f"{candidate['key']}: {value} ({previous})"
+
+
+def _layer_mark(layer: str, layers: list[str]) -> str:
+    return "✅ в запросе" if layer in layers else "⛔ в запрос не уходит"
+
+
+def _layers_md(state: dict, view: dict) -> str:
+    """Блок «Слои памяти» (спецификация дня 11, §7.3): что агент знает — по
+    слою, в порядке таблицы §2.1, — где это лежит и уходит ли в запрос.
+    Стоит над «Контекстом»: сначала что агент знает, потом что из этого
+    отправляется."""
+    memory_state = state["memory"]
+    layers = state["request_layers"]
+    long_term = state["long_term"]
+    session_id = state["session_id"]
+    lines = ["### Слои памяти", ""]
+    if memory_state is None:
+        lines.append(
+            "У этого агента нет модели памяти: слоёв нет, он ведёт себя как на "
+            "дне 10."
+        )
+        return "\n".join(lines)
+
+    strategy_state = view["state"]
+    lines += [
+        "#### 💬 Краткосрочная — разговор этой сессии",
+        f"- **Сессия** `{session_id}`: в стеке {view['history_messages']} "
+        f"сообщ., в запрос уходит {view['sent_messages']} — стратегия "
+        f"«{view['strategy']}»",
+        "- **Память стратегии:** "
+        + (
+            f"{strategy_state['memory_label'].lower()} "
+            f"≈{_fmt_int(estimate_tokens(strategy_state['memory_text']))} "
+            f"токенов — подробности в блоке «Контекст» ниже"
+            if strategy_state["memory_text"]
+            else "нет — подробности в блоке «Контекст» ниже"
+        ),
+        f"- **Где лежит:** `{display_path(STORE.path_for(session_id))}` → "
+        f"`messages` (память стратегий — `context.memory`); пишет агент каждым "
+        f"ходом, «Сбросить диалог» очищает",
+        "",
+        f"#### 🗂 Рабочая — данные текущей задачи · "
+        f"{_layer_mark(LAYER_WORKING, layers)}",
+    ]
+    if memory_state["working_text"]:
+        lines += [f"- {line}" for line in memory_state["working_text"].splitlines()]
+    else:
+        lines.append(
+            "- _пусто_ — разбор памяти заполнит её перед ответом, когда игрок "
+            "скажет что-то о текущей партии"
+        )
+    lines += [
+        f"- **Учтено разбором:** {memory_state['covered']} сообщ. из "
+        f"{view['history_messages']} · разборов применилось: "
+        f"{memory_state['updated_turns']}",
+        f"- **Последнее изменение:** "
+        f"{memory_state['last_update'] or 'в этом процессе разборов ещё не было'}",
+        f"- **Где лежит:** файл сессии `{session_id}`, `context.working`; пишет "
+        f"разбор памяти сразу, без подтверждения; сброс очищает, ветка получает "
+        f"копию из checkpoint'а",
+        "",
+        f"#### 🧠 Долговременная — пользователь вообще · "
+        f"{_layer_mark(LAYER_LONG_TERM, layers)}",
+    ]
+    if long_term is None:
+        lines.append("- **не подключена:** сохранять кандидатов некуда")
+    else:
+        text = long_term_text(long_term["entries"], MEMORY_MAP)
+        if text:
+            # Пустые строки вокруг обязательны: внутри текста разделы идут
+            # абзацами со своими списками.
+            lines += ["", text, ""]
+        else:
+            lines.append(
+                "- _пусто_ — сюда попадает только то, что человек сохранил "
+                "кнопкой «Сохранить в долговременную»"
+            )
+        lines.append(
+            f"- **Где лежит:** `{long_term['path']}` — одна на процесс, общая "
+            f"для всех сессий и агентов; сброс, удаление агента, новая сессия "
+            f"и ветка её не трогают"
+        )
+        if LONG_TERM.error:
+            lines.append(f"- ⚠️ **Хранилище:** {LONG_TERM.error}")
+    lines += ["", "#### ⏳ Ждут решения человека"]
+    if memory_state["candidates"]:
+        lines += [f"- {_candidate_label(c)}" for c in memory_state["candidates"]]
+    else:
+        lines.append("- кандидатов нет")
+    if memory_state["rejected"]:
+        lines.append(
+            f"- **Вне карты на последнем разборе:** "
+            f"{', '.join(memory_state['rejected'])} — отклонены картой памяти, "
+            f"в память не попали"
+        )
+    lines += [
+        "",
+        "_Краткосрочная — разговор, рабочая — партия, долговременная — игрок. "
+        "Слой в запрос выбирает переключатель «Слои памяти в запросе», запись "
+        "в долговременную — человек, куда идёт ключ — карта памяти._",
+    ]
+    return "\n".join(lines)
+
+
+def _candidates_update(state: dict) -> dict:
+    """Группа «Кандидаты в долговременную память»: пункты — кандидаты
+    активного агента, значение — ключ. По умолчанию не отмечено ничего:
+    выбор делает человек (§2.3)."""
+    candidates = (state["memory"] or {}).get("candidates") or []
+    if not candidates:
+        return gr.update(
+            choices=[],
+            value=[],
+            label="Кандидаты в долговременную память",
+            info=(
+                "Ждущих решения записей нет: разбор памяти предложит кандидата, "
+                "когда игрок скажет что-то о себе, а не о партии."
+            ),
+        )
+    return gr.update(
+        choices=[(_candidate_label(c), c["key"]) for c in candidates],
+        value=[],
+        label=f"Кандидаты в долговременную память — ждут решения: {len(candidates)}",
+        info=(
+            "Отметьте, что сохранить или отклонить. В долговременную память "
+            "попадает только то, что вы сохранили кнопкой."
+        ),
+    )
+
+
 # --- «Агенты процесса»: расход по журналам всех агентов реестра -----------
 
 def _turn_strategies_label(agent: Agent) -> str:
@@ -828,6 +1107,10 @@ def _agents_table() -> pd.DataFrame:
         "агент", "сессия", "ветка от", "стратегии ходов", "ходов",
         "prompt", "completion", "служебные токены", "стоимость",
         "среднее время хода, s",
+        # Колонки дня 11 — в конце (§7.4): текущее положение переключателя
+        # слоёв и токены разбора памяти. Стоимость и время хода включают
+        # разбор.
+        "слои в запросе", "токены разбора памяти",
     ]
     rows = []
     for a in agents():
@@ -835,12 +1118,14 @@ def _agents_table() -> pd.DataFrame:
         if not turns or all(t.cost_usd is None for t in turns):
             cost_str = "н/д"
         else:
-            total_cost = sum(t.cost_usd or 0.0 for t in turns) + sum(
-                t.service_cost_usd or 0.0 for t in turns
+            total_cost = sum(
+                (t.cost_usd or 0.0) + (t.service_cost_usd or 0.0)
+                + (t.memory_cost_usd or 0.0)
+                for t in turns
             )
             cost_str = _fmt_cost(total_cost)
         avg_time = (
-            f"{sum(t.elapsed + t.service_elapsed for t in turns) / len(turns):.2f}"
+            f"{sum(t.elapsed + t.service_elapsed + t.memory_elapsed for t in turns) / len(turns):.2f}"
             if turns else "н/д"
         )
         rows.append({
@@ -856,14 +1141,16 @@ def _agents_table() -> pd.DataFrame:
             "служебные токены": sum(t.service_tokens for t in turns),
             "стоимость": cost_str,
             "среднее время хода, s": avg_time,
+            "слои в запросе": ", ".join(a.request_layers) or "нет",
+            "токены разбора памяти": sum(t.memory_tokens for t in turns),
         })
     return pd.DataFrame(rows, columns=columns)
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 22 значений
-    (18 — до дня 10), позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок —
-    часть контракта обработчиков ниже.
+    """Полный вид на состояние агента — фиксированный кортеж из 26 значений
+    (18 — до дня 10, 22 — до дня 11), позиционно раскладывающийся в
+    `VIEW_OUTPUTS`. Порядок — часть контракта обработчиков ниже.
 
     Значения всех выпадающих списков — тоже часть вида: иначе после
     переключения агента панель показывала бы одного, а списки — другого.
@@ -885,8 +1172,11 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
     # которого весь бюджет и пересчитывается вместе с ним.
     view = asdict(agent.context_view(question)) if question else state["context_view"]
     # Файл перечитывается на каждом событии интерфейса — поллинга и
-    # автообновления, как и на дне 6, здесь нет.
+    # автообновления, как и на дне 6, здесь нет. С дня 11 так же
+    # перечитывается файл долговременной памяти: «в памяти» и «на диске» в
+    # кадре рядом.
     session_file = STORE.read_file(state["session_id"])
+    long_term_file = LONG_TERM.read_file()
     # Checkpoint'ы посчитаны заранее: список «Checkpoint» открывает значением
     # последний (§7.2), и вычислять это внутри самого кортежа было бы нечитаемо.
     checkpoint_choices = _checkpoint_choices(agent)
@@ -951,6 +1241,23 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         _branches_md(agent),
         # 22. таблица «Агенты процесса»
         gr.update(value=_agents_table()),
+        # Значения дня 11 — в конце кортежа и в конце VIEW_OUTPUTS (§7.6).
+        # 23. переключатель «Слои памяти в запросе» подтягивается к агенту
+        gr.update(value=list(state["request_layers"])),
+        # 24. группа кандидатов: пункты — кандидаты агента, ничего не отмечено
+        _candidates_update(state),
+        # 25. блок «Слои памяти»
+        _layers_md(state, view),
+        # 26. сырое содержимое файла долговременной памяти — рядом с файлом
+        #     сессии: два файла рядом и есть «хранятся отдельно»
+        gr.update(
+            value=long_term_file,
+            label=(
+                f"Файл долговременной памяти на диске · {LONG_TERM.path}"
+                if long_term_file is not None
+                else f"Файл долговременной памяти · {LONG_TERM.path} — файла нет"
+            ),
+        ),
     )
 
 
@@ -980,6 +1287,10 @@ def _new_agent(preset_name: str) -> Agent:
         # День 9 показывает «было → стало», и начинать надо с «было»:
         # новый агент всегда стартует на «Всей истории».
         strategy=DEFAULT_STRATEGY,
+        # Модель памяти своя у каждого агента (рабочая память — это
+        # сессия), долговременная память — одна на процесс (день 11, §7.1).
+        memory=make_memory(),
+        long_term=LONG_TERM,
     )
 
 
@@ -1041,11 +1352,16 @@ def _restore_agents() -> int:
         # реестр процесса, и оттуда его берут `on_load` и переключатель.
         # Стратегия здесь не передаётся: у восстановленного агента умолчания
         # нет — он берёт ту, что записана в его файле сессии.
+        # Рабочая память приезжает из того же файла сессии (`context.working`),
+        # кандидатов у восстановленного агента нет — они были вопросом
+        # прошлого процесса (день 11, §2.4).
         Agent(
             PRESETS[preset_name],
             session_id=info.session_id,
             store=STORE,
             strategies=make_strategies(),
+            memory=make_memory(),
+            long_term=LONG_TERM,
         )
         restored += 1
     logger.info(
@@ -1068,7 +1384,7 @@ def on_load(preset_name: str):
     """
     registry = agents()
     if not registry:
-        return _spawn(preset_name, "Страница открыта.")
+        return _spawn(preset_name, f"Страница открыта. {_long_term_status()}")
 
     target = registry[-1]
     if RESTORED_AT_START:
@@ -1091,7 +1407,9 @@ def on_load(preset_name: str):
             f"Страница открыта. Активен {_agent_title(target)} · "
             f"`{target.session_id}`: в стеке {len(target.history)} сообщ."
         )
-    return (target, gr.update(), *_view(target, status))
+    # День 11 (§7.1): при открытии страницы видно и долговременную память —
+    # сколько записей и откуда, или что её пока нет.
+    return (target, gr.update(), *_view(target, f"{status} {_long_term_status()}"))
 
 
 def on_preset_change(preset_name: str):
@@ -1127,10 +1445,17 @@ def on_delete_agent(agent: Agent | None, preset_name: str):
         # Агента из процесса уже убрали; о том, что файл остался на диске
         # (и агент вернётся при следующем запуске), честнее сказать вслух.
         logger.warning("сессия %s: файл не удалён — %s", agent.session_id, exc)
+    # Удаление уносит краткосрочную и рабочую память этой сессии — они в её
+    # файле; долговременная память общая и остаётся (день 11, §5.7).
+    kept = (
+        f"Его разговор и рабочая память удалены вместе с файлом сессии, "
+        f"долговременная память осталась ({_long_term_records()})."
+    )
     remaining = agents()
     if not remaining:
         return _spawn(
-            preset_name, f"Агент {title} удалён, в реестре не осталось никого."
+            preset_name,
+            f"Агент {title} удалён, в реестре не осталось никого. {kept}",
         )
 
     target = remaining[-1]
@@ -1139,7 +1464,7 @@ def on_delete_agent(agent: Agent | None, preset_name: str):
         gr.update(),
         *_view(
             target,
-            f"Агент {title} удалён из процесса. Активен "
+            f"Агент {title} удалён из процесса. {kept} Активен "
             f"{_agent_title(target)}: в стеке {len(target.history)} сообщ. "
             f"Агентов в реестре: {len(remaining)}.",
         ),
@@ -1268,6 +1593,22 @@ def on_send(agent: Agent | None, message: str, preset_name: str):
                 f"состоялся, память стратегии не сдвинулась, в модель ушло "
                 f"всё неучтённое; вызов повторится на следующем ходе."
             )
+        # Разбор памяти (день 11, §7.4) — одной короткой фразой после
+        # служебного вызова стратегии, словами самого разбора.
+        memory_call = reply.memory_call
+        if memory_call is not None and memory_call.ok:
+            status += f" 🧠 Память — {memory_call.memory_update}."
+            if memory_call.finish_reason == "length":
+                status += (
+                    " ⚠️ Ответ разбора памяти упёрся в потолок и оборван на "
+                    "полуслове — применён как есть."
+                )
+        elif memory_call is not None:
+            status += (
+                f" ⚠️ Разбор памяти не удался ({memory_call.error}) — ход "
+                f"состоялся, рабочая память и кандидаты не сдвинулись; разбор "
+                f"повторится на следующем ходе."
+            )
         # Поле ввода чистим только при успехе; при ошибке вопрос остаётся
         # в поле, чтобы его можно было отправить повторно.
         message_update = ""
@@ -1283,7 +1624,25 @@ def on_send(agent: Agent | None, message: str, preset_name: str):
                 f"{service.label}: {service.memory_update} — применённая "
                 f"память уйдёт со следующим вопросом."
             )
+        memory_call = reply.memory_call
+        if memory_call is not None and memory_call.ok:
+            status += (
+                f" 🧠 Разбор памяти перед вызовом при этом применился — "
+                f"{memory_call.memory_update} — рабочая память уйдёт со "
+                f"следующим вопросом."
+            )
         message_update = gr.update()
+
+    # Если есть кандидаты — это главное в статусе (§7.4): человеку есть что
+    # решить, и без его решения в долговременную память ничего не попадёт.
+    waiting = agent.memory_state.candidates if agent.memory_state else []
+    if waiting:
+        status = (
+            f"🧠 **Ждут вашего решения: "
+            f"{', '.join(candidate.key for candidate in waiting)}** — отметьте "
+            f"в ряду «Кандидаты в долговременную память» под чатом и сохраните "
+            f"или отклоните. {status}"
+        )
 
     return (agent, message_update, *_view(agent, status))
 
@@ -1373,7 +1732,9 @@ def on_reset(agent: Agent | None, preset_name: str):
         *_view(
             agent,
             f"Диалог агента {_agent_title(agent)} сброшен: стек сообщений пуст, "
-            f"{note}, счётчики агента сохранены.",
+            f"{note}, счётчики агента сохранены. Рабочая память и кандидаты "
+            f"ушли вместе с диалогом, **долговременная память не тронута** "
+            f"({_long_term_records()}).",
         ),
     )
 
@@ -1403,8 +1764,9 @@ def on_save_checkpoint(agent: Agent | None, preset_name: str):
         status = (
             f"Checkpoint {checkpoint.id} сохранён: {checkpoint.messages} "
             f"сообщ., стратегия «{checkpoint.strategy}», снимок памяти "
-            f"стратегий. Ветку от него создаёт «Ветка от checkpoint'а»; "
-            f"диалог можно продолжать — checkpoint останется тем, каким был."
+            f"стратегий и рабочей памяти. Ветку от него создаёт «Ветка от "
+            f"checkpoint'а»; диалог можно продолжать — checkpoint останется "
+            f"тем, каким был."
         )
     return (agent, gr.update(), *_view(agent, status))
 
@@ -1432,7 +1794,10 @@ def on_fork(agent: Agent | None, checkpoint_choice: str | None, preset_name: str
         )
 
     session_id = STORE.create_session(agent.config.name)
-    branch = agent.fork(checkpoint_id, session_id, make_strategies())
+    # Ветке — свежая модель памяти: рабочую память она получит копией из
+    # снимка checkpoint'а, долговременную — от родителя тем же хранилищем
+    # (день 11, §7.1).
+    branch = agent.fork(checkpoint_id, session_id, make_strategies(), make_memory())
     if branch is None:
         return (
             agent,
@@ -1442,6 +1807,7 @@ def on_fork(agent: Agent | None, checkpoint_choice: str | None, preset_name: str
                 f"Ветка от checkpoint'а «{checkpoint_id}» не создана — см. лог.",
             ),
         )
+    working = branch.memory_state.working_items if branch.memory_state else 0
     return (
         branch,
         gr.update(),
@@ -1450,7 +1816,9 @@ def on_fork(agent: Agent | None, checkpoint_choice: str | None, preset_name: str
             f"Создана ветка {branch.session_id} от {agent.session_id} · "
             f"{checkpoint_id}: общие {branch.branch.messages} сообщ. "
             f"скопированы, стратегия «{branch.strategy.name}», файл уже на "
-            f"диске. Исходный диалог не тронут — он в списке «Ветка диалога».",
+            f"диске. Рабочая память — копия из снимка ({working} "
+            f"{_records_word(working)}), долговременная — та же, кандидатов "
+            f"нет. Исходный диалог не тронут — он в списке «Ветка диалога».",
         ),
     )
 
@@ -1477,6 +1845,103 @@ def on_switch_branch(agent_number: int, preset_name: str):
             f"{len(target.history)} сообщ., веток от него — {branches}."
         )
     return (target, gr.update(), *_view(target, status))
+
+
+# --- Слои памяти: обработчики (день 11) -----------------------------------
+
+def on_layers_change(agent: Agent | None, layers: list[str] | None, preset_name: str):
+    """«Слои памяти в запросе» — какие слои уходят в модель (§7.2).
+
+    Нового агента не создаёт и ничего не пишет: меняется запрос, а не
+    память (§2.5). Разбор памяти продолжает работать при любом положении —
+    выключенный слой копится, и включённый обратно он сразу полон.
+    """
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    agent.set_request_layers(layers or [])
+    current = agent.request_layers
+    parts = [f"Слои в запросе: {', '.join(current) if current else 'нет'}."]
+    state = agent.memory_state
+    for layer in REQUEST_LAYERS:
+        if layer in current:
+            continue
+        if layer == LAYER_LONG_TERM:
+            parts.append(
+                f"Долговременная память ({_long_term_records()}) в модель не "
+                f"уходит, но разбор продолжает предлагать в неё кандидатов."
+            )
+        elif layer == LAYER_WORKING:
+            items = state.working_items if state else 0
+            parts.append(
+                f"Рабочая память ({items} {_records_word(items)}) в модель не "
+                f"уходит, но разбор продолжает её записывать."
+            )
+    parts.append("Стек и память не тронуты; краткосрочную память урезает стратегия.")
+    return (agent, gr.update(), *_view(agent, " ".join(parts)))
+
+
+def on_accept_candidates(agent: Agent | None, keys: list[str] | None, preset_name: str):
+    """«Сохранить в долговременную» — решение человека по отмеченным
+    кандидатам (§7.2). Запись в файл — сразу; сбой записи оставляет
+    кандидатов ждать решения."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    keys = list(keys or [])
+    if not keys:
+        return (
+            agent,
+            gr.update(),
+            *_view(agent, "Отметьте кандидатов, которых сохранить в долговременную память."),
+        )
+    decision = agent.accept_candidates(keys)
+    if decision.error:
+        status = (
+            f"⚠️ Кандидаты не сохранены: {decision.error}. Они остались ждать "
+            f"решения — сохранить можно ещё раз."
+        )
+    elif not decision.keys:
+        status = (
+            "Отмеченных кандидатов среди ждущих решения уже нет — список "
+            "обновлён, отметьте заново."
+        )
+    else:
+        status = (
+            f"В долговременную память сохранено: {', '.join(decision.keys)} — с "
+            f"этого хода это уходит в запрос каждого агента и каждой новой "
+            f"сессии, у которых слой включён. Файл: `{LONG_TERM.path}`."
+        )
+    return (agent, gr.update(), *_view(agent, status))
+
+
+def on_reject_candidates(agent: Agent | None, keys: list[str] | None, preset_name: str):
+    """«Отклонить» — отмеченные кандидаты убираются, в память ничего не
+    пишется (§7.2)."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    keys = list(keys or [])
+    if not keys:
+        return (
+            agent,
+            gr.update(),
+            *_view(agent, "Отметьте кандидатов, которых отклонить."),
+        )
+    decision = agent.reject_candidates(keys)
+    if decision.error:
+        status = f"⚠️ Отклонить не удалось: {decision.error}."
+    elif not decision.keys:
+        status = (
+            "Отмеченных кандидатов среди ждущих решения уже нет — список "
+            "обновлён, отметьте заново."
+        )
+    else:
+        status = (
+            f"Отклонено: {', '.join(decision.keys)} — в долговременную память "
+            f"не попало; сказанное осталось в истории разговора."
+        )
+    return (agent, gr.update(), *_view(agent, status))
 
 
 # --- Старт процесса ------------------------------------------------------
@@ -1514,25 +1979,49 @@ _SCENARIO_LABELS: list[str] = [
     "КВ · сводный сетап",
 ]
 
+# --- Сценарий проверки слоёв памяти: тексты для gr.Examples (день 11, §7.5) -
+# Порядок прогона (§9.2): С1-С6, К1-К3, Н1 и Н3 — Н2 отдельным пунктом не
+# нужен, это К2 дословно (`NEXT_SESSION_QUESTIONS[1] is
+# MEMORY_CONTROL_QUESTIONS[1]`). Тексты живут в `presets.py`, здесь только
+# подписи и порядок показа.
+_MEMORY_SCENARIO_TEXTS: list[str] = [
+    *MEMORY_SCENARIO,
+    *MEMORY_CONTROL_QUESTIONS,
+    NEXT_SESSION_QUESTIONS[0],
+    NEXT_SESSION_QUESTIONS[2],
+]
+_MEMORY_SCENARIO_LABELS: list[str] = [
+    "С1 · цель, состав, игровая группа",
+    "С2 · коллекция и время",
+    "С3 · формат и домашнее правило",
+    "С4 · герои",
+    "С5 · поправка коллекции",
+    "С6 · тиран и знание о правилах",
+    "К1 · контроль: время и состав",
+    "К2 / Н2 · контроль: домашнее правило",
+    "К3 · контроль: поправка коллекции",
+    "Н1 · новая партия: Drellen и Undertow",
+    "Н3 · рабочая не протекла",
+]
+
 
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 10: четыре способа отправить историю в модель и один способ её "
-        "разветвить. Стратегия слева переключается на живом диалоге: стек "
-        "сообщений и файл сессии всегда полные, меняется только то, что из "
-        "них уходит в запрос, — «Вся история» и «Сводка + последние N» "
-        "(день 9) стоят рядом со **«Скользящим окном»** (последние N сообщ., "
-        "остальное отброшено без замены — плата деталями, а не токенами) и "
-        "**«Фактами + последними N»** (блок «ключ — значение», который "
-        "обновляет служебный вызов перед каждым ответом — плата вызовом на "
-        "каждом ходе). Одна и та же история отправляется разными способами, "
-        "и ответы можно сравнить. Ниже чата — «Сохранить checkpoint» и "
-        "«Ветка от checkpoint'а»: они заводят от текущей точки диалога "
-        "независимое продолжение — отдельную сессию со своим файлом, своей "
-        "стратегией и своими счётчиками; переключатель «Ветка диалога» стоит "
-        "рядом со стратегией контекста. Сравнение всех стратегий на одном "
-        "сценарии — в `docs/TooManyRules — День 10 сравнение стратегий.md`."
+        "День 11: у агента три слоя памяти, и живут они разное время. "
+        "**Краткосрочная** — разговор этой сессии: стек сообщений и стратегия "
+        "контекста дней 9-10. **Рабочая** — данные текущей партии (цель, "
+        "состав, герои, тиран, ограничения): перед каждым ответом её "
+        "заполняет разбор памяти, лежит она в файле сессии и уходит вместе "
+        "со сбросом. **Долговременная** — игрок вообще (коллекция, игровая "
+        "группа, формат ответов, домашние правила, знания о правилах): лежит "
+        "в отдельном файле, общем для всех сессий, и пишется **только с "
+        "вашего согласия** — разбор предлагает кандидатов, а сохраняете их вы "
+        "кнопкой под чатом. Какой ключ в какой слой — решает карта памяти в "
+        "`presets.py`, а не модель. Переключатель «Слои памяти в запросе» "
+        "слева меняет запрос, а не память. Стратегии, checkpoint'ы и ветки "
+        "дня 10 работают как раньше. Проверка слоёв на сценарии — в "
+        "`docs/TooManyRules — День 11 проверка слоёв памяти.md`."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -1594,6 +2083,21 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "своим файлом, своей стратегией и своими счётчиками."
                 ),
             )
+            # «Слои памяти в запросе» (день 11, §7.2) — сразу под веткой
+            # диалога: ещё один переключатель того, что уходит в модель, и
+            # снова не того, что агент помнит. Пункты — имена слоёв из
+            # `memory.py`, значение подтягивается к агенту в `_view()`.
+            layers_group = gr.CheckboxGroup(
+                choices=list(REQUEST_LAYERS),
+                value=list(REQUEST_LAYERS),
+                label="Слои памяти в запросе",
+                info=(
+                    "Выключенный слой не уходит в модель, но продолжает "
+                    "записываться: разбор памяти идёт при любом положении, и "
+                    "включённый обратно слой сразу полон. Краткосрочную "
+                    "память (разговор) урезает стратегия контекста."
+                ),
+            )
 
             # Формат значения — список сообщений {"role", "content"}, то есть
             # ровно `agent.history`. Аргумент `type="messages"` из спецификации
@@ -1633,6 +2137,22 @@ with gr.Blocks(title="TooManyRules") as demo:
                     # к нему не относится.
                 )
                 fork_btn = gr.Button("Ветка от checkpoint'а", scale=1)
+            # Ряд кандидатов (день 11, §7.2) — под рядом checkpoint'ов. Своего
+            # обработчика у группы нет — это вход кнопок, как список
+            # «Checkpoint». По умолчанию не отмечено ничего: в долговременную
+            # память попадает только то, что человек отметил и сохранил.
+            with gr.Row():
+                candidates_group = gr.CheckboxGroup(
+                    choices=[],
+                    value=[],
+                    label="Кандидаты в долговременную память",
+                    scale=3,
+                )
+                with gr.Column(scale=1, min_width=160):
+                    accept_btn = gr.Button(
+                        "Сохранить в долговременную", variant="primary"
+                    )
+                    reject_btn = gr.Button("Отклонить")
             status_md = gr.Markdown("")
 
             gr.Examples(
@@ -1666,6 +2186,21 @@ with gr.Blocks(title="TooManyRules") as demo:
                 ),
             )
 
+            # Сценарий проверки слоёв памяти (день 11, §7.5, §9.1): С1-С6 и
+            # К1-К3 — первая партия, Н1 и Н3 — новая сессия (Н2 — это К2).
+            # Клик кладёт текст в поле ввода, отправляет человек.
+            gr.Examples(
+                examples=[[text] for text in _MEMORY_SCENARIO_TEXTS],
+                inputs=[question_input],
+                example_labels=_MEMORY_SCENARIO_LABELS,
+                examples_per_page=len(_MEMORY_SCENARIO_TEXTS),
+                label=(
+                    "Сценарий проверки слоёв памяти (первая партия С1-С6 и "
+                    "К1-К3, новая сессия Н1-Н3; Н2 — это К2 — см. "
+                    "docs/TooManyRules — День 11 проверка слоёв памяти.md)"
+                ),
+            )
+
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=2):
             gr.Markdown("## Дебаг-панель")
@@ -1676,6 +2211,10 @@ with gr.Blocks(title="TooManyRules") as demo:
                 height=220,
             )
             metrics_md = gr.Markdown(_metrics_md(None))
+            # «Слои памяти» (день 11, §7.3) — сразу под «Последним вызовом» и
+            # над «Контекстом»: сначала что агент знает, потом что из этого
+            # отправляется.
+            layers_md = gr.Markdown("")
             # Сначала «что отправляем» (день 9), потом «сколько это от окна»
             # (день 8): блок контекста стоит над бюджетом, а сводка — сразу
             # под ним, потому что объясняет числа над собой.
@@ -1787,9 +2326,17 @@ with gr.Blocks(title="TooManyRules") as demo:
                 label="Файл сессии на диске",
                 max_height=420,
             )
+            # Файл долговременной памяти (день 11, §7.4) — рядом с файлом
+            # сессии: рабочая память лежит в том, что выше (`context.working`),
+            # долговременная — в этом. Два файла рядом и есть «хранятся
+            # отдельно».
+            long_term_file_json = gr.JSON(
+                label="Файл долговременной памяти на диске",
+                max_height=320,
+            )
 
     # Порядок выходов совпадает с порядком значений в `_view()`. Значения
-    # дня 10 — в конце списка, как и в кортеже `_view()` (§7.6).
+    # дня 10 и дня 11 — в конце списка, как и в кортеже `_view()` (§7.6).
     VIEW_OUTPUTS = [
         chatbot,
         status_md,
@@ -1813,6 +2360,10 @@ with gr.Blocks(title="TooManyRules") as demo:
         checkpoint_dropdown,
         branches_md,
         agents_table,
+        layers_group,
+        candidates_group,
+        layers_md,
+        long_term_file_json,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
 
@@ -1885,6 +2436,31 @@ with gr.Blocks(title="TooManyRules") as demo:
     fork_btn.click(
         on_fork,
         inputs=[agent_state, checkpoint_dropdown, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # «Слои памяти в запросе» — только на действие человека: правило
+    # выпадающих списков дня 6 в силе, `change` срабатывал бы и на обновление
+    # значения из `_view()` и переключал бы слои сам по себе. У
+    # `gr.CheckboxGroup` в Gradio 6.26 это `input`, а не `select`, как у
+    # списков: проверено 16.09.2026 по сети и по логу — на клик по пункту
+    # приходит ровно один запрос с уже обновлённым значением и одна строка
+    # «слои в запросе» в логе, а на обновление значения из `_view()` (другие
+    # кнопки) `input` не приходит вовсе. Двойного срабатывания, как у
+    # `Dropdown.input` на дне 6, у группы флажков нет.
+    layers_group.input(
+        on_layers_change,
+        inputs=[agent_state, layers_group, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # Группа кандидатов — вход этих двух кнопок, своего обработчика у неё нет.
+    accept_btn.click(
+        on_accept_candidates,
+        inputs=[agent_state, candidates_group, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    reject_btn.click(
+        on_reject_candidates,
+        inputs=[agent_state, candidates_group, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
     # Единственный обработчик, который сам знает содержимое поля ввода и
