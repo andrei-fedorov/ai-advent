@@ -1,5 +1,5 @@
 # TooManyRules — счёт токенов (день 8, неделя 2; день 9 — корзина памяти
-# стратегии; день 11 — корзины слоёв памяти).
+# стратегии; день 11 — корзины слоёв памяти; день 12 — корзина профиля).
 #
 # Модуль знает только про текст и числа: ни Gradio, ни Too Many Bones, ни
 # вызовов API здесь нет и быть не может. Из проекта не импортируется ничего —
@@ -189,6 +189,10 @@ class RequestTokens:
     # не меняется — это контракт дней 9-10.
     long_term: int = 0             # блок долговременной памяти
     working: int = 0               # блок рабочей памяти
+    # Корзина дня 12 — снова в конце и с умолчанием: блок профиля пользователя
+    # уходит в запрос ведущим `system`-сообщением сразу после системного
+    # промпта и перед слоями памяти (спецификация дня 12, §5.6).
+    profile: int = 0
 
 
 def count_request(
@@ -198,9 +202,10 @@ def count_request(
     memory: str = "",
     long_term: str = "",
     working: str = "",
+    profile: str = "",
 ) -> RequestTokens:
-    """Оценка запроса по частям: системный промпт + долговременная и рабочая
-    память + память стратегии + вся история + новый вопрос.
+    """Оценка запроса по частям: системный промпт + профиль + долговременная
+    и рабочая память + память стратегии + вся история + новый вопрос.
 
     Считается ровно то, что уходит в API: агент зовёт эту функцию по
     результату `_build_messages()`, а не по стеку отдельно (спецификация
@@ -209,7 +214,8 @@ def count_request(
     `question=""` — законный случай: так панель считает бюджет стека без
     нового вопроса, то есть нижнюю границу следующего запроса. Пустой вопрос
     не считается сообщением и служебных токенов не добавляет; с `memory`
-    (день 9), `long_term` и `working` (день 11) то же правило.
+    (день 9), `long_term`/`working` (день 11) и `profile` (день 12) то же
+    правило.
     """
     per_message = [estimate_tokens(_content(message)) for message in history or []]
     system = estimate_tokens(system_prompt)
@@ -218,10 +224,11 @@ def count_request(
     memory_tokens = estimate_tokens(memory)
     long_term_tokens = estimate_tokens(long_term)
     working_tokens = estimate_tokens(working)
+    profile_tokens = estimate_tokens(profile)
 
     messages = (
         1 + len(per_message) + (1 if question else 0) + (1 if memory else 0)
-        + (1 if long_term else 0) + (1 if working else 0)
+        + (1 if long_term else 0) + (1 if working else 0) + (1 if profile else 0)
     )
     overhead = messages * TOKENS_PER_MESSAGE + TOKENS_PER_REQUEST
     return RequestTokens(
@@ -231,12 +238,13 @@ def count_request(
         overhead=overhead,
         total=(
             system + history_tokens + question_tokens + memory_tokens
-            + long_term_tokens + working_tokens + overhead
+            + long_term_tokens + working_tokens + profile_tokens + overhead
         ),
         per_message=per_message,
         memory=memory_tokens,
         long_term=long_term_tokens,
         working=working_tokens,
+        profile=profile_tokens,
     )
 
 

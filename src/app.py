@@ -1,19 +1,22 @@
 # TooManyRules — приложение (день 9: чат через агента + дебаг-панель; день 10:
 # четыре стратегии, checkpoint'ы и ветки диалога; день 11, неделя 3: модель
 # памяти — три слоя, кандидаты в долговременную память и переключатель слоёв
-# в запросе).
+# в запросе; день 12: профиль пользователя, роутер режима и переключатель
+# «Профиль в запросе»).
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
 # `agent.Agent`, конфиги агентов проекта лежат в `presets.py`, история
-# диалогов и долговременная память — в `storage.py`, счёт токенов — в
-# `tokens.py` (оттуда берутся только чистые функции: генератор заполнителя и
+# диалогов, долговременная память и профиль — в `storage.py`, счёт токенов —
+# в `tokens.py` (оттуда берутся только чистые функции: генератор заполнителя и
 # оценка его размера, всё остальное панель получает от агента готовым),
 # стратегии управления контекстом — в `context.py`, и напрямую он отсюда тоже
 # не импортируется: набор стратегий агенту выдаёт `presets.make_strategies()`.
 # Из `memory.py` интерфейс берёт только имена слоёв (пункты переключателя) и
 # чистую `long_term_text()` для подраздела долговременной памяти: модель памяти
-# агенту выдаёт `presets.make_memory()`.
+# агенту выдаёт `presets.make_memory()`. Из `user_profile.py` — разбор,
+# проверку и текст профиля для редактора и панели: роутер агенту выдаёт
+# `presets.make_router()`.
 #
 # День 11 (спецификация дня 11, §7): интерфейс остаётся видом на состояние
 # агента — ни своей копии рабочей памяти, ни своего списка кандидатов, ни
@@ -22,6 +25,13 @@
 # кандидаты рисуются из `MemoryState`, долговременная — из записей хранилища.
 # Запись в долговременную память — только кнопкой «Сохранить в
 # долговременную»: по умолчанию ни один кандидат не отмечен.
+#
+# День 12 (спецификация дня 12, §7) сохраняет это правило почти везде, с
+# одним осознанным исключением: **редактор профиля — форма, а не вид.** Его
+# поля не входят в `_view()`/`VIEW_OUTPUTS` — иначе отправка вопроса или
+# смена стратегии затирали бы несохранённую правку. У редактора свои выходы
+# (`PROFILE_EDITOR_OUTPUTS`) и свои обработчики, а профиль в запросе, режим и
+# переключатель по-прежнему приходят из агента и хранилища на каждом событии.
 #
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
@@ -76,18 +86,40 @@ from presets import (
     COMPARISON_SCENARIO,
     CONTROL_QUESTIONS,
     DEFAULT_PRESET,
+    DEFAULT_PROFILE,
     DEFAULT_STRATEGY,
     MEMORY_CONTROL_QUESTIONS,
     MEMORY_MAP,
     MEMORY_SCENARIO,
     NEXT_SESSION_QUESTIONS,
     PRESETS,
+    PROFILE_QUESTION,
+    PROFILE_VARIANTS,
+    ROUTING_SCENARIO,
     STRATEGIES,
     make_memory,
+    make_router,
     make_strategies,
 )
-from storage import JsonHistoryStore, JsonLongTermStore, StorageError, display_path
+from storage import (
+    JsonHistoryStore,
+    JsonLongTermStore,
+    JsonProfileStore,
+    StorageError,
+    display_path,
+)
 from tokens import FILLER_MAX_TOKENS, estimate_tokens, filler_text
+from user_profile import (
+    CHOICE_AUTO,
+    CHOICE_OFF,
+    dump_profile,
+    mode_by_name,
+    parse_profile,
+    profile_block,
+    profile_changes,
+    profile_text,
+    validate_profile,
+)
 
 # Логирование настраивает точка входа — тот же формат, что на неделе 1.
 logging.basicConfig(
@@ -106,6 +138,16 @@ STORE = JsonHistoryStore()
 # файлу хранилище печатает в лог при создании — по нему видно, что экземпляр,
 # поднятый с `TOOMANYRULES_DATA_DIR`, не пишет в память автора.
 LONG_TERM = JsonLongTermStore()
+
+# Профиль пользователя (день 12, §7.1) — тем же приёмом: один на процесс,
+# общий для всех агентов, рядом со `STORE` и `LONG_TERM`. Профиль по
+# умолчанию хранилище получает параметром — `storage.py` по-прежнему не
+# импортирует ничего из проекта.
+PROFILE = JsonProfileStore(default=dump_profile(DEFAULT_PROFILE))
+# Замечания разбора профиля по умолчанию/сохранённого файла — один раз за
+# процесс, а не на каждый ход (§5.1: агент их не логирует).
+for _profile_note in parse_profile(PROFILE.current())[1]:
+    logger.warning("профиль при старте: %s", _profile_note)
 
 # Сколько агентов поднялось из файлов при старте процесса — заполняется
 # `_restore_agents()` ниже и показывается в строке статуса при открытии
@@ -213,6 +255,8 @@ def _metrics_md(last_call: dict | None) -> str:
         # Разбор памяти (день 11) — тем же правилом: применённый до упавшего
         # вызова разбор оплачен и сохранён, и показать его больше негде.
         service += _memory_call_lines(last_call.get("memory_call"))
+        # Роутер профиля (день 12) — тем же правилом.
+        service += _route_call_lines(last_call)
         if service:
             lines += ["", *service]
         return "\n".join(lines)
@@ -251,6 +295,7 @@ def _metrics_md(last_call: dict | None) -> str:
     ]
     lines += _service_lines(last_call.get("service_call"))
     lines += _memory_call_lines(last_call.get("memory_call"))
+    lines += _route_call_lines(last_call)
     return "\n".join(lines)
 
 
@@ -317,6 +362,46 @@ def _memory_call_lines(call: dict | None) -> list[str]:
         return [line]
     line = (
         f"- **🧠 Разбор памяти — {call['label']}:** {call['memory_update']}; "
+        f"ответ ≈{_fmt_int(estimate_tokens(call['text']))} токенов, вызов "
+        f"{_fmt_int(call['total_tokens'])} токенов, "
+        f"{_fmt_cost(call['cost_usd'])}, {call['elapsed']:.2f} s"
+    )
+    if call.get("finish_reason") == "length":
+        line += (
+            " — ⚠️ **ответ упёрся в потолок `max_tokens` и оборван на "
+            "полуслове**, применён как есть"
+        )
+    return [line]
+
+
+def _route_call_lines(last_call: dict) -> list[str]:
+    """Роутер профиля этого хода (день 12, §7.5) — строкой следом за
+    разбором памяти, по образцу `_service_lines()`/`_memory_call_lines()`.
+
+    Режим хода виден и без вызова роутера — выбран вручную, единственный
+    режим профиля или профиль выключен, — тогда строка про сам режим, без
+    вызова: `route_call` не знает панель, какая часть `ModeChoice` пришла из
+    вызова, а какая нет, — это решают `profile_mode`/`profile_note`.
+    """
+    call = last_call.get("route_call")
+    mode = last_call.get("profile_mode") or ""
+    note = last_call.get("profile_note") or ""
+    if call is None:
+        if not note:
+            return []
+        label = f"«{mode}»" if mode else "нет"
+        return [f"- **🧭 Режим {label}** — {note}."]
+    if not call["ok"]:
+        line = f"- **🧭 Роутер профиля не удался — {call['label']}:** {call['error']}"
+        if call["text"]:
+            line += f" (начало ответа: «{call['text'][:120]}»)"
+        line += (
+            f" — режим этого хода: «{mode}» ({note}), ход состоялся. "
+            f"Потрачено {_fmt_int(call['total_tokens'] or 0)} токенов."
+        )
+        return [line]
+    line = (
+        f"- **🧭 Роутер профиля — {call['label']}:** режим «{mode}» — {note}; "
         f"ответ ≈{_fmt_int(estimate_tokens(call['text']))} токенов, вызов "
         f"{_fmt_int(call['total_tokens'])} токенов, "
         f"{_fmt_cost(call['cost_usd'])}, {call['elapsed']:.2f} s"
@@ -412,17 +497,27 @@ def _context_md(
         + f", резерв под ответ {_fmt_int(usage['answer_reserve'])}",
         # Память стратегии (день 9: сводка; день 10: факты) — слагаемое
         # наравне с остальными: без неё сумма в строке не сходилась бы с
-        # итогом ровно на размер этой памяти. Слои памяти дня 11 — тем же
-        # правилом, в порядке блоков запроса: между системой и памятью
+        # итогом ровно на размер этой памяти. Профиль (день 12) и слои
+        # памяти дня 11 — тем же правилом, в порядке блоков запроса: профиль
+        # сразу за системой, дальше долговременная и рабочая, потом память
         # стратегии.
-        f"- **В запросе:** система {_fmt_int(request['system'])} + "
-        f"долговременная {_fmt_int(request['long_term'])} + рабочая "
+        f"- **В запросе:** система {_fmt_int(request['system'])} + профиль "
+        f"{_fmt_int(request['profile'])} + долговременная "
+        f"{_fmt_int(request['long_term'])} + рабочая "
         f"{_fmt_int(request['working'])} + память стратегии "
         f"{_fmt_int(request['memory'])} + история "
         f"{_fmt_int(request['history'])} ({len(request['per_message'])} сообщ.) + "
         f"вопрос {_fmt_int(request['question'])} + служебные "
         f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(request['total'])}**",
-        # Отдельная корзина, а не история: что это за память и куда встаёт.
+        # Отдельные корзины, а не история: что это за память/профиль и куда
+        # встаёт.
+        f"- **Профиль в запросе:** "
+        + (
+            f"≈{_fmt_int(request['profile'])} токенов — блок сразу за "
+            f"системным промптом, перед слоями памяти"
+            if request["profile"]
+            else "ничего: профиль выключен или его блок пуст"
+        ),
         f"- **Память стратегии в запросе:** "
         + (
             f"≈{_fmt_int(request['memory'])} токенов — она уходит ведущим "
@@ -499,12 +594,14 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
         "### Контекст: что уходит в модель",
         "",
         f"- **Стратегия:** «{view['strategy']}» — {state['description']}",
-        # Слои памяти (день 11) — слагаемыми между системой и памятью
-        # стратегии: без них сумма не сошлась бы с итогом. Стратегия о них
-        # не знает, и в экономию ниже они не входят — база «вся история»
-        # собрана с теми же слоями.
+        # Профиль (день 12) и слои памяти (день 11) — слагаемыми между
+        # системой и памятью стратегии: без них сумма не сошлась бы с
+        # итогом. Ни стратегия, ни профиль друг о друге не знают, и в
+        # экономию ниже они не входят — база «вся история» собрана с тем же
+        # профилем и теми же слоями.
         f"- **Состав запроса:** система {_fmt_int(request['system'])} + "
-        f"долговременная {_fmt_int(request['long_term'])} + рабочая "
+        f"профиль {_fmt_int(request['profile'])} + долговременная "
+        f"{_fmt_int(request['long_term'])} + рабочая "
         f"{_fmt_int(request['working'])} + "
         f"{memory_name} {_fmt_int(request['memory'])} + "
         f"{view['sent_messages']} сообщ. истории {_fmt_int(request['history'])} + "
@@ -673,6 +770,17 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             "рабочая": turn["working_tokens"],
             "разбор памяти": turn["memory_tokens"],
             "время разбора, s": f"{turn['memory_elapsed']:.2f}",
+            # Колонки дня 12 — в конце (§7.5): режим, ушедший в запрос этого
+            # хода (и откуда), корзина профиля и цена роутера — своя
+            # колонка, а не часть «служебных» или «разбора памяти».
+            "режим": (
+                f"{turn['profile_mode']} ({turn['profile_note']})"
+                if turn["profile_mode"]
+                else (turn["profile_note"] or "—")
+            ),
+            "профиль": turn["profile_tokens"],
+            "роутер": turn["route_tokens"],
+            "время роутера, s": f"{turn['route_elapsed']:.2f}",
         }
         for turn in turns
     ]
@@ -683,7 +791,8 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
                  "стратегия", "отправлено сообщ.", "вся история", "служебные",
                  "время ответа, s", "время служебного, s",
                  "долговременная", "рабочая", "разбор памяти",
-                 "время разбора, s"],
+                 "время разбора, s", "режим", "профиль", "роутер",
+                 "время роутера, s"],
     )
 
 
@@ -696,7 +805,8 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"### Накоплено агентом {agent_title}\n\n"
         f"- **Вызовов:** {totals['calls']} (из них с ошибкой: "
         f"{totals['errors']}, служебных: {totals['service_calls']}, "
-        f"разборов памяти: {totals['memory_calls']})\n"
+        f"разборов памяти: {totals['memory_calls']}, роутера профиля: "
+        f"{totals['route_calls']})\n"
         f"- **🔢 Токены:** prompt={totals['prompt_tokens']} / "
         f"completion={totals['completion_tokens']} / "
         f"total={totals['total_tokens']}\n"
@@ -713,6 +823,13 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"{_fmt_int(totals['memory_tokens'])} токенов, "
         f"{_fmt_cost(totals['memory_cost_usd'])} — это цена слоёв памяти; в "
         f"экономию стратегии не входит\n"
+        # Строка дня 12 (§7.5): роутер профиля — своя цена, не входит ни в
+        # служебные вызовы стратегий, ни в разбор памяти.
+        f"- **🧭 Роутер профиля:** {totals['route_calls']} "
+        f"{_calls_word(totals['route_calls'])}, "
+        f"{_fmt_int(totals['route_tokens'])} токенов, "
+        f"{_fmt_cost(totals['route_cost_usd'])} — цена автоматического "
+        f"выбора режима; в экономию стратегии не входит\n"
         f"- **💲 Стоимость:** {_fmt_cost(totals['cost_usd'])}"
     )
 
@@ -939,6 +1056,19 @@ def _long_term_status() -> str:
     return f"Долговременная память: {_long_term_records()} из `{LONG_TERM.path}`."
 
 
+def _profile_status() -> str:
+    """Фраза про профиль для статуса при открытии страницы (§7.1): сохранён
+    ли он, или действует профиль по умолчанию."""
+    if PROFILE.error:
+        return f"Профиль: ⚠️ {PROFILE.error}."
+    if not PROFILE.saved:
+        return (
+            f"Профиль не сохранён — действует профиль по умолчанию из "
+            f"`presets.py`, `{PROFILE.path}` появится с первым сохранением."
+        )
+    return f"Профиль сохранён: `{PROFILE.path}`."
+
+
 def _candidate_label(candidate: dict) -> str:
     """Кандидат словами — и пунктом группы «Кандидаты в долговременную
     память», и строкой блока «Слои памяти»: «коллекция: только база (было:
@@ -950,6 +1080,72 @@ def _candidate_label(candidate: dict) -> str:
         else "раньше не было"
     )
     return f"{candidate['key']}: {value} ({previous})"
+
+
+def _mode_block_tokens(profile, mode_name: str | None) -> int:
+    """Размер блока профиля «общая часть + этот режим» в токенах — по
+    `estimate_tokens()` над `user_profile.profile_block()` (§7.4)."""
+    block = profile_block(profile, mode_name)
+    return estimate_tokens(block["content"]) if block else 0
+
+
+def _profile_md(state: dict) -> str:
+    """Блок «Профиль» (день 12, §7.4) — сразу над «Слоями памяти», в порядке
+    блоков запроса: профиль встаёт в запрос раньше слоёв памяти. Панель не
+    знает, какие режимы бывают, — всё приходит из
+    `debug_state()["profile"]` и `user_profile.profile_text()`."""
+    profile_state = state["profile"]
+    lines = ["### Профиль", ""]
+    if not PROFILE.saved:
+        lines.append(
+            f"- **Где лежит:** файла нет — действует профиль по умолчанию "
+            f"из `presets.py`, `{PROFILE.path}` появится с первым сохранением."
+        )
+    else:
+        lines.append(
+            f"- **Где лежит:** `{PROFILE.path}` — один на процесс, общий "
+            f"для всех агентов и сессий."
+        )
+    if PROFILE.error:
+        lines.append(f"- ⚠️ **Хранилище:** {PROFILE.error}")
+
+    if profile_state is None:
+        lines.append("- У этого агента нет профиля — он ведёт себя как на дне 11.")
+        return "\n".join(lines)
+
+    lines.append(f"- **В запросе у этого агента:** {profile_state['choice']}")
+    last = profile_state["last"]
+    if last is None:
+        lines.append("- **Режим прошлого хода:** ходов ещё не было")
+    else:
+        last_bit = f"«{last['mode']}» — {last['note']}" if last["mode"] else last["note"]
+        lines.append(f"- **Режим прошлого хода:** {last_bit}")
+
+    profile_obj, _ = parse_profile(profile_state["data"])
+    preview = profile_state["preview"]
+    if preview["sent"] and preview["mode"]:
+        next_tokens = _mode_block_tokens(profile_obj, preview["mode"])
+        lines.append(
+            f"- **Следующий запрос:** «{preview['mode']}» — {preview['note']}; "
+            f"блок ≈{_fmt_int(next_tokens)} токенов"
+        )
+    else:
+        lines.append(f"- **Следующий запрос:** {preview['note']} — блок в запрос не уйдёт")
+
+    lines += ["", profile_text(profile_obj, active=preview["mode"] if preview["sent"] else None)]
+    if profile_obj.modes:
+        lines += ["", "Размер блока «общая часть + режим»:"]
+        lines += [
+            f"- «{mode.name}»: ≈{_fmt_int(_mode_block_tokens(profile_obj, mode.name))} токенов"
+            for mode in profile_obj.modes
+        ]
+    lines += [
+        "",
+        "_Профиль пишет только пользователь, в редакторе слева — модель его "
+        "не меняет; память — то, что агент узнал из разговоров, профиль — "
+        "то, что вы задали сами._",
+    ]
+    return "\n".join(lines)
 
 
 def _layer_mark(layer: str, layers: list[str]) -> str:
@@ -1111,6 +1307,10 @@ def _agents_table() -> pd.DataFrame:
         # слоёв и токены разбора памяти. Стоимость и время хода включают
         # разбор.
         "слои в запросе", "токены разбора памяти",
+        # Колонки дня 12 — в конце (§7.5): положение переключателя «Профиль
+        # в запросе» и токены роутера. Стоимость и среднее время хода
+        # включают и роутер.
+        "профиль в запросе", "токены роутера",
     ]
     rows = []
     for a in agents():
@@ -1120,12 +1320,12 @@ def _agents_table() -> pd.DataFrame:
         else:
             total_cost = sum(
                 (t.cost_usd or 0.0) + (t.service_cost_usd or 0.0)
-                + (t.memory_cost_usd or 0.0)
+                + (t.memory_cost_usd or 0.0) + (t.route_cost_usd or 0.0)
                 for t in turns
             )
             cost_str = _fmt_cost(total_cost)
         avg_time = (
-            f"{sum(t.elapsed + t.service_elapsed + t.memory_elapsed for t in turns) / len(turns):.2f}"
+            f"{sum(t.elapsed + t.service_elapsed + t.memory_elapsed + t.route_elapsed for t in turns) / len(turns):.2f}"
             if turns else "н/д"
         )
         rows.append({
@@ -1143,14 +1343,28 @@ def _agents_table() -> pd.DataFrame:
             "среднее время хода, s": avg_time,
             "слои в запросе": ", ".join(a.request_layers) or "нет",
             "токены разбора памяти": sum(t.memory_tokens for t in turns),
+            "профиль в запросе": a.profile_choice or "—",
+            "токены роутера": sum(t.route_tokens for t in turns),
         })
     return pd.DataFrame(rows, columns=columns)
 
 
+def _profile_choice_options(choices: list[str]) -> list[tuple[str, str]]:
+    """Подписи переключателя «Профиль в запросе» (§7.2): `авто` и
+    `выключен` — с пояснением прямо в подписи, названия режимов — в
+    кавычках. Значение списка — то, что понимает `set_profile_choice()`."""
+    labels = {
+        CHOICE_AUTO: "авто — режим выбирает роутер",
+        CHOICE_OFF: "выключен — профиль не уходит в модель",
+    }
+    return [(labels.get(choice, f"«{choice}»"), choice) for choice in choices]
+
+
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 26 значений
-    (18 — до дня 10, 22 — до дня 11), позиционно раскладывающийся в
-    `VIEW_OUTPUTS`. Порядок — часть контракта обработчиков ниже.
+    """Полный вид на состояние агента — фиксированный кортеж из 29 значений
+    (18 — до дня 10, 22 — до дня 11, 26 — до дня 12), позиционно
+    раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
+    обработчиков ниже.
 
     Значения всех выпадающих списков — тоже часть вида: иначе после
     переключения агента панель показывала бы одного, а списки — другого.
@@ -1258,6 +1472,30 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
                 else f"Файл долговременной памяти · {LONG_TERM.path} — файла нет"
             ),
         ),
+        # Значения дня 12 — в конце кортежа и в конце VIEW_OUTPUTS (§7.7).
+        # 27. переключатель «Профиль в запросе» — пункты и значение подтянуты
+        #     к агенту; нет профиля у агента — список пуст и неактивен
+        gr.update(
+            choices=(
+                _profile_choice_options(state["profile"]["choices"])
+                if state["profile"] is not None
+                else []
+            ),
+            value=state["profile"]["choice"] if state["profile"] is not None else None,
+            interactive=state["profile"] is not None,
+        ),
+        # 28. блок «Профиль»
+        _profile_md(state),
+        # 29. сырое содержимое файла профиля — рядом с файлами сессии и
+        #     долговременной памяти: три файла рядом и есть «три разные вещи»
+        gr.update(
+            value=PROFILE.read_file(),
+            label=(
+                f"Файл профиля на диске · {PROFILE.path}"
+                if PROFILE.read_file() is not None
+                else f"Файл профиля · {PROFILE.path} — файла нет"
+            ),
+        ),
     )
 
 
@@ -1291,6 +1529,10 @@ def _new_agent(preset_name: str) -> Agent:
         # сессия), долговременная память — одна на процесс (день 11, §7.1).
         memory=make_memory(),
         long_term=LONG_TERM,
+        # Профиль один на процесс, роутер свой у каждого агента — тем же
+        # приёмом (день 12, §7.1).
+        profile=PROFILE,
+        router=make_router(),
     )
 
 
@@ -1362,6 +1604,10 @@ def _restore_agents() -> int:
             strategies=make_strategies(),
             memory=make_memory(),
             long_term=LONG_TERM,
+            # Профиль общий, роутер свой у восстановленного агента —
+            # `авто`, режима прошлого хода нет (день 12, §5.7).
+            profile=PROFILE,
+            router=make_router(),
         )
         restored += 1
     logger.info(
@@ -1384,7 +1630,10 @@ def on_load(preset_name: str):
     """
     registry = agents()
     if not registry:
-        return _spawn(preset_name, f"Страница открыта. {_long_term_status()}")
+        return _spawn(
+            preset_name,
+            f"Страница открыта. {_long_term_status()} {_profile_status()}",
+        )
 
     target = registry[-1]
     if RESTORED_AT_START:
@@ -1408,8 +1657,13 @@ def on_load(preset_name: str):
             f"`{target.session_id}`: в стеке {len(target.history)} сообщ."
         )
     # День 11 (§7.1): при открытии страницы видно и долговременную память —
-    # сколько записей и откуда, или что её пока нет.
-    return (target, gr.update(), *_view(target, f"{status} {_long_term_status()}"))
+    # сколько записей и откуда, или что её пока нет. День 12 (§7.1) —
+    # добавляет то же самое про профиль.
+    return (
+        target,
+        gr.update(),
+        *_view(target, f"{status} {_long_term_status()} {_profile_status()}"),
+    )
 
 
 def on_preset_change(preset_name: str):
@@ -1796,8 +2050,11 @@ def on_fork(agent: Agent | None, checkpoint_choice: str | None, preset_name: str
     session_id = STORE.create_session(agent.config.name)
     # Ветке — свежая модель памяти: рабочую память она получит копией из
     # снимка checkpoint'а, долговременную — от родителя тем же хранилищем
-    # (день 11, §7.1).
-    branch = agent.fork(checkpoint_id, session_id, make_strategies(), make_memory())
+    # (день 11, §7.1). Роутер — тоже свежий («авто», без режима прошлого
+    # хода), хранилище профиля ветка берёт у родителя (день 12, §5.7).
+    branch = agent.fork(
+        checkpoint_id, session_id, make_strategies(), make_memory(), make_router()
+    )
     if branch is None:
         return (
             agent,
@@ -1881,6 +2138,35 @@ def on_layers_change(agent: Agent | None, layers: list[str] | None, preset_name:
     return (agent, gr.update(), *_view(agent, " ".join(parts)))
 
 
+def on_profile_choice(agent: Agent | None, choice: str, preset_name: str):
+    """«Профиль в запросе» — что уходит в модель на этот ход (§7.2, §2.3):
+    `авто` (роутер выбирает режим), название режима (всегда этот режим) или
+    `выключен` (профиль в запрос не уходит).
+
+    Нового агента не создаёт и ничего не пишет: меняется запрос, а не
+    профиль. Событие — `select`, тем же правилом, что у остальных
+    выпадающих списков (день 6): `_view()` синхронизирует значение списка на
+    каждом событии, и `change` переключал бы профиль сам по себе.
+    """
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    previous = agent.profile_choice
+    agent.set_profile_choice(choice)
+    current = agent.profile_choice
+    if current == CHOICE_AUTO:
+        note = "режим выбирает роутер — это +1 вызов модели на ход"
+    elif current == CHOICE_OFF:
+        note = "профиль не уходит в модель; сам профиль не тронут"
+    else:
+        note = f"в запрос всегда уходит режим «{current}», роутер не вызывается"
+    status = (
+        f"Профиль в запросе: {previous} → {current}. {note[:1].upper()}{note[1:]}. "
+        f"Стек, память и профиль не тронуты."
+    )
+    return (agent, gr.update(), *_view(agent, status))
+
+
 def on_accept_candidates(agent: Agent | None, keys: list[str] | None, preset_name: str):
     """«Сохранить в долговременную» — решение человека по отмеченным
     кандидатам (§7.2). Запись в файл — сразу; сбой записи оставляет
@@ -1944,6 +2230,113 @@ def on_reject_candidates(agent: Agent | None, keys: list[str] | None, preset_nam
     return (agent, gr.update(), *_view(agent, status))
 
 
+# --- Редактор профиля: обработчики (день 12, §7.3) ------------------------
+# Единственное исключение из «интерфейс — вид на состояние агента»: это
+# форма ввода, а её поля не входят в `_view()`/`VIEW_OUTPUTS` — иначе любое
+# событие (отправка вопроса, смена стратегии) затирало бы несохранённую
+# правку. У формы свои выходы (`PROFILE_EDITOR_OUTPUTS`, определены при
+# сборке интерфейса) и свои обработчики; профиль они читают из `PROFILE`, а
+# не из агента — профиль общий для всех агентов процесса.
+
+def on_profile_editor_load():
+    """Загрузка формы редактора — отдельный `demo.load`, не событие
+    `_view()`: общая часть и первый режим из сохранённого профиля (или
+    профиля по умолчанию, если файла ещё нет)."""
+    profile, _ = parse_profile(PROFILE.current())
+    mode = profile.modes[0] if profile.modes else None
+    mode_names = [m.name for m in profile.modes]
+    return (
+        profile.address,
+        profile.language,
+        profile.level,
+        profile.constraints,
+        gr.update(choices=mode_names, value=mode.name if mode else None),
+        mode.when if mode else "",
+        mode.style if mode else "",
+        mode.format if mode else "",
+        mode.constraints if mode else "",
+        "\n".join(mode.steps) if mode else "",
+    )
+
+
+def on_pick_profile_mode(mode_name: str):
+    """Список «Режим для правки» — событие `select` (§7.3): поля режима из
+    **сохранённого** профиля, а не из текущего состояния формы —
+    несохранённая правка предыдущего режима при переключении теряется (об
+    этом говорит `info` списка)."""
+    profile, _ = parse_profile(PROFILE.current())
+    mode = mode_by_name(profile, mode_name)
+    if mode is None:
+        return "", "", "", "", ""
+    return mode.when, mode.style, mode.format, mode.constraints, "\n".join(mode.steps)
+
+
+def on_save_profile(
+    agent: Agent | None,
+    preset_name: str,
+    address: str,
+    language: str,
+    level: str,
+    constraints: str,
+    mode_name: str,
+    when: str,
+    style: str,
+    format_: str,
+    mode_constraints: str,
+    steps: str,
+):
+    """«Сохранить профиль» (§7.3): профиль собирается из `PROFILE.current()`
+    — общая часть заменяется полями формы, режим `mode_name` — полями формы,
+    остальные режимы берутся как есть. Дальше `parse_profile()` →
+    `validate_profile()` → `profile_changes()` против текущего →
+    `PROFILE.save()`. Возвращает `COMMON_OUTPUTS`, как и остальные
+    обработчики: агент не создаётся и не меняется, но панель («Профиль»,
+    файл профиля) должна перерисоваться."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    old_profile, _ = parse_profile(PROFILE.current())
+    data = dump_profile(old_profile)
+    data["address"] = address or ""
+    data["language"] = language or ""
+    data["level"] = level or ""
+    data["constraints"] = constraints or ""
+    target = mode_by_name(old_profile, mode_name)
+    if target is not None:
+        for mode_data in data["modes"]:
+            if mode_data["name"] == target.name:
+                mode_data["when"] = when or ""
+                mode_data["style"] = style or ""
+                mode_data["format"] = format_ or ""
+                mode_data["constraints"] = mode_constraints or ""
+                mode_data["steps"] = steps or ""
+                break
+
+    new_profile, _ = parse_profile(data)
+    errors = validate_profile(new_profile)
+    if errors:
+        status = f"Профиль не сохранён: {'; '.join(errors)}. Действует прежний профиль."
+        return (agent, gr.update(), *_view(agent, status))
+
+    changes = profile_changes(old_profile, new_profile)
+    if not changes:
+        status = "Профиль не изменился — записывать нечего."
+        return (agent, gr.update(), *_view(agent, status))
+
+    try:
+        PROFILE.save(dump_profile(new_profile), changed=", ".join(changes))
+    except StorageError as exc:
+        status = f"Профиль не сохранён: {exc}. Действует прежний профиль."
+        return (agent, gr.update(), *_view(agent, status))
+
+    status = (
+        f"Профиль сохранён: {', '.join(changes)} → {PROFILE.path}. Действует "
+        f"со следующего хода у всех агентов, у которых профиль в запросе не "
+        f"выключен."
+    )
+    return (agent, gr.update(), *_view(agent, status))
+
+
 # --- Старт процесса ------------------------------------------------------
 # Восстановление агентов происходит здесь, при импорте модуля, — один раз на
 # процесс и до `demo.launch()`. Кнопки «восстановить» в интерфейсе нет и не
@@ -1993,7 +2386,7 @@ _MEMORY_SCENARIO_TEXTS: list[str] = [
 _MEMORY_SCENARIO_LABELS: list[str] = [
     "С1 · цель, состав, игровая группа",
     "С2 · коллекция и время",
-    "С3 · формат и домашнее правило",
+    "С3 · домашнее правило (формат — теперь профиль, не память)",
     "С4 · герои",
     "С5 · поправка коллекции",
     "С6 · тиран и знание о правилах",
@@ -2004,24 +2397,45 @@ _MEMORY_SCENARIO_LABELS: list[str] = [
     "Н3 · рабочая не протекла",
 ]
 
+# --- Сценарий проверки персонализации: тексты для gr.Examples (день 12,
+# §7.6, §9.1) — В1 (сравнение профилей и режимов), затем Р1-Р8 (сообщения
+# для роутера, порядок прогона П4/П6). Тексты живут в `presets.py`, здесь
+# только подписи и порядок показа под чатом.
+_PROFILE_SCENARIO_TEXTS: list[str] = [
+    PROFILE_QUESTION,
+    *ROUTING_SCENARIO,
+]
+_PROFILE_SCENARIO_LABELS: list[str] = [
+    "В1 · бой: кто ходит первым",
+    "Р1 · явная ситуация партии",
+    "Р2 · продолжение без маркеров",
+    "Р3 · явное объяснение новичку",
+    "Р4 · продолжение объяснения",
+    "Р5 · явный разбор",
+    "Р6 · продолжение разбора",
+    "Р7 · явная смена задачи",
+    "Р8 · граница (после смены профиля на Б)",
+]
+
 
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 11: у агента три слоя памяти, и живут они разное время. "
-        "**Краткосрочная** — разговор этой сессии: стек сообщений и стратегия "
-        "контекста дней 9-10. **Рабочая** — данные текущей партии (цель, "
-        "состав, герои, тиран, ограничения): перед каждым ответом её "
-        "заполняет разбор памяти, лежит она в файле сессии и уходит вместе "
-        "со сбросом. **Долговременная** — игрок вообще (коллекция, игровая "
-        "группа, формат ответов, домашние правила, знания о правилах): лежит "
-        "в отдельном файле, общем для всех сессий, и пишется **только с "
-        "вашего согласия** — разбор предлагает кандидатов, а сохраняете их вы "
-        "кнопкой под чатом. Какой ключ в какой слой — решает карта памяти в "
-        "`presets.py`, а не модель. Переключатель «Слои памяти в запросе» "
-        "слева меняет запрос, а не память. Стратегии, checkpoint'ы и ветки "
-        "дня 10 работают как раньше. Проверка слоёв на сценарии — в "
-        "`docs/TooManyRules — День 11 проверка слоёв памяти.md`."
+        "День 12: агент отвечает по-разному в зависимости от того, кто "
+        "спрашивает и зачем. **Профиль** — настройки, которые вы задаёте "
+        "сами в редакторе слева: как к вам обращаться, на каком языке, "
+        "какой у вас уровень, и режимы под задачу («За столом», «Учу "
+        "новичка», «Разбор после партии»). Профиль уходит в каждый запрос "
+        "**блоком сразу за системным промптом**, а режим на конкретный ход "
+        "выбирает либо роутер (переключатель «авто»), либо вы сами. Это не "
+        "память и не пресет: память (ниже) — то, что агент **узнал** из "
+        "разговоров, профиль — то, что вы **задали сами**; пресет выбирает "
+        "разработчик, профиль — пользователь. У агента по-прежнему три слоя "
+        "памяти разного времени жизни (день 11): **краткосрочная** — "
+        "разговор этой сессии, **рабочая** — данные текущей партии, "
+        "**долговременная** — игрок вообще, с записью только по вашему "
+        "согласию. Стратегии, checkpoint'ы и ветки дня 10 работают как "
+        "раньше. Сценарий проверки персонализации — под чатом."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -2098,6 +2512,22 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "память (разговор) урезает стратегия контекста."
                 ),
             )
+            # «Профиль в запросе» (день 12, §7.2) — сразу под слоями памяти:
+            # ещё один переключатель того, что уходит в модель. Пункты —
+            # `debug_state()["profile"]["choices"]`, значение подтягивается к
+            # агенту в `_view()`.
+            profile_dropdown = gr.Dropdown(
+                choices=[],
+                label="Профиль в запросе",
+                filterable=False,
+                info=(
+                    "Профиль задаёте вы — в блоке «Профиль» справа и в "
+                    "редакторе ниже. «авто» — режим выбирает роутер (+1 "
+                    "вызов модели на ход); режим — в запрос всегда уходит "
+                    "он, роутер не вызывается; «выключен» меняет запрос, а "
+                    "не профиль — он никуда не девается."
+                ),
+            )
 
             # Формат значения — список сообщений {"role", "content"}, то есть
             # ровно `agent.history`. Аргумент `type="messages"` из спецификации
@@ -2155,6 +2585,57 @@ with gr.Blocks(title="TooManyRules") as demo:
                     reject_btn = gr.Button("Отклонить")
             status_md = gr.Markdown("")
 
+            # Редактор профиля (день 12, §7.3) — форма, а не вид: её поля не
+            # входят в `_view()`/`VIEW_OUTPUTS`, иначе отправка вопроса или
+            # смена стратегии затирали бы несохранённую правку. Закрыт по
+            # умолчанию, под строкой статуса и над блоками примеров.
+            with gr.Accordion(
+                "Профиль пользователя — настройки, которые задаёте вы",
+                open=False,
+            ):
+                gr.Markdown(
+                    "Общая часть верна для любой задачи; режимы — под "
+                    "конкретную задачу, между ними выбирает роутер или "
+                    "переключатель «Профиль в запросе» слева. Модель профиль "
+                    "не пишет и не предлагает правок."
+                )
+                profile_address_input = gr.Textbox(label="Как к вам обращаться")
+                profile_language_input = gr.Textbox(label="Язык ответов и названий")
+                profile_level_input = gr.Textbox(label="Ваш уровень в игре")
+                profile_common_constraints_input = gr.Textbox(
+                    label="Ограничения во всех ответах"
+                )
+                profile_mode_dropdown = gr.Dropdown(
+                    choices=[],
+                    label="Режим для правки",
+                    filterable=False,
+                    info="Несохранённая правка режима при переключении теряется.",
+                )
+                profile_when_input = gr.Textbox(
+                    label="Когда этот режим нужен — по этому описанию выбирает роутер"
+                )
+                profile_style_input = gr.Textbox(label="Стиль")
+                profile_format_input = gr.Textbox(label="Формат")
+                profile_mode_constraints_input = gr.Textbox(label="Ограничения режима")
+                profile_steps_input = gr.Textbox(
+                    label="Порядок ответа — по шагу на строку", lines=4,
+                )
+                save_profile_btn = gr.Button("Сохранить профиль", variant="primary")
+                gr.Examples(
+                    examples=[
+                        [v["address"], v["language"], v["level"], v["constraints"]]
+                        for v in PROFILE_VARIANTS
+                    ],
+                    inputs=[
+                        profile_address_input,
+                        profile_language_input,
+                        profile_level_input,
+                        profile_common_constraints_input,
+                    ],
+                    example_labels=[v["label"] for v in PROFILE_VARIANTS],
+                    label="Профили для проверки (заполняет общую часть; сохраняет человек)",
+                )
+
             gr.Examples(
                 examples=[
                     ["Из каких фаз состоит ход игрока?"],
@@ -2201,6 +2682,17 @@ with gr.Blocks(title="TooManyRules") as demo:
                 ),
             )
 
+            # Сценарий проверки персонализации (день 12, §7.6, §9): В1 — один
+            # вопрос для сравнения профилей и режимов, Р1-Р8 — сообщения для
+            # роутера. Порядок прогона — §9.2 спецификации дня 12.
+            gr.Examples(
+                examples=[[text] for text in _PROFILE_SCENARIO_TEXTS],
+                inputs=[question_input],
+                example_labels=_PROFILE_SCENARIO_LABELS,
+                examples_per_page=len(_PROFILE_SCENARIO_TEXTS),
+                label="Сценарий проверки профиля (В1, Р1-Р8 — см. §9 спецификации дня 12)",
+            )
+
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=2):
             gr.Markdown("## Дебаг-панель")
@@ -2211,8 +2703,12 @@ with gr.Blocks(title="TooManyRules") as demo:
                 height=220,
             )
             metrics_md = gr.Markdown(_metrics_md(None))
-            # «Слои памяти» (день 11, §7.3) — сразу под «Последним вызовом» и
-            # над «Контекстом»: сначала что агент знает, потом что из этого
+            # «Профиль» (день 12, §7.4) — сразу под «Последним вызовом» и над
+            # «Слоями памяти»: в порядке блоков запроса профиль встаёт раньше
+            # слоёв памяти.
+            profile_md = gr.Markdown("")
+            # «Слои памяти» (день 11, §7.3) — сразу под «Профилем» и над
+            # «Контекстом»: сначала что агент знает, потом что из этого
             # отправляется.
             layers_md = gr.Markdown("")
             # Сначала «что отправляем» (день 9), потом «сколько это от окна»
@@ -2334,9 +2830,17 @@ with gr.Blocks(title="TooManyRules") as demo:
                 label="Файл долговременной памяти на диске",
                 max_height=320,
             )
+            # Файл профиля (день 12, §7.4) — рядом с файлами сессии и
+            # долговременной памяти: три файла рядом и есть «профиль, пресет
+            # и память — три разные вещи».
+            profile_file_json = gr.JSON(
+                label="Файл профиля на диске",
+                max_height=320,
+            )
 
     # Порядок выходов совпадает с порядком значений в `_view()`. Значения
-    # дня 10 и дня 11 — в конце списка, как и в кортеже `_view()` (§7.6).
+    # дня 10, дня 11 и дня 12 — в конце списка, как и в кортеже `_view()`
+    # (§7.7).
     VIEW_OUTPUTS = [
         chatbot,
         status_md,
@@ -2364,8 +2868,26 @@ with gr.Blocks(title="TooManyRules") as demo:
         candidates_group,
         layers_md,
         long_term_file_json,
+        profile_dropdown,
+        profile_md,
+        profile_file_json,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
+    # Выходы формы редактора профиля (день 12, §7.3) — отдельно от
+    # `VIEW_OUTPUTS`: это не вид на состояние агента, а поля ввода, которые
+    # `_view()` не должен трогать.
+    PROFILE_EDITOR_OUTPUTS = [
+        profile_address_input,
+        profile_language_input,
+        profile_level_input,
+        profile_common_constraints_input,
+        profile_mode_dropdown,
+        profile_when_input,
+        profile_style_input,
+        profile_format_input,
+        profile_mode_constraints_input,
+        profile_steps_input,
+    ]
 
     demo.load(
         on_load,
@@ -2469,6 +2991,53 @@ with gr.Blocks(title="TooManyRules") as demo:
     fill_btn.click(
         on_fill_context,
         inputs=[agent_state, filler_size, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # «Профиль в запросе» — тем же правилом, что остальные выпадающие списки
+    # (день 6): `select`, а не `change`/`input` — `_view()` синхронизирует
+    # его значение на каждом событии.
+    profile_dropdown.select(
+        on_profile_choice,
+        inputs=[agent_state, profile_dropdown, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+
+    # Редактор профиля (день 12, §7.3) — форма со своими выходами и своими
+    # обработчиками, отдельными от `_view()`/`COMMON_OUTPUTS`.
+    demo.load(
+        on_profile_editor_load,
+        inputs=[],
+        outputs=PROFILE_EDITOR_OUTPUTS,
+    )
+    # «Режим для правки» — тоже `select`: список показывает поля
+    # сохранённого режима, а не то, что человек ещё не сохранил.
+    profile_mode_dropdown.select(
+        on_pick_profile_mode,
+        inputs=[profile_mode_dropdown],
+        outputs=[
+            profile_when_input,
+            profile_style_input,
+            profile_format_input,
+            profile_mode_constraints_input,
+            profile_steps_input,
+        ],
+    )
+    save_profile_btn.click(
+        on_save_profile,
+        inputs=[
+            agent_state,
+            preset_dropdown,
+            profile_address_input,
+            profile_language_input,
+            profile_level_input,
+            profile_common_constraints_input,
+            profile_mode_dropdown,
+            profile_when_input,
+            profile_style_input,
+            profile_format_input,
+            profile_mode_constraints_input,
+            profile_steps_input,
+        ],
         outputs=COMMON_OUTPUTS,
     )
 

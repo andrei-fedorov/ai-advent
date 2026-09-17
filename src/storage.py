@@ -1,6 +1,6 @@
 # TooManyRules — хранилище истории диалогов (день 7, неделя 2; день 9 —
 # формат версии 2, память стратегии рядом с историей; день 11 — долговременная
-# память в отдельном файле).
+# память в отдельном файле; день 12 — профиль пользователя в отдельном файле).
 #
 # Реализация протокола `HistoryStore`, объявленного в `agent.py` на дне 6:
 # одна сессия — один JSON-файл в `src/data/sessions/`. День 6 объявил
@@ -22,9 +22,19 @@
 # тот же непрозрачный блок `context` файла сессии — формат файла сессии не
 # меняется, версия остаётся второй. Долговременная память с сессиями не
 # связана, и её файл лежит вне каталога сессий — рядом с ним, в `memory/`:
-# удалённая сессия не должна уносить профиль пользователя, а ветка — жить со
+# удалённая сессия не должна уносить долговременную память, а ветка — жить со
 # своей копией. Карты памяти и слоёв хранилище не знает: ключи для него —
 # непрозрачные строки.
+#
+# День 12 добавляет третье хранилище — `JsonProfileStore`, профиль
+# пользователя (спецификация дня 12, §6). Тем же приёмом, что долговременная
+# память: один файл, общий для всех сессий и агентов процесса, читается один
+# раз при создании, дальше живёт в памяти процесса. Каталог — сосед каталогов
+# сессий и долговременной памяти (`profile/`, не подкаталог `sessions/`), а не
+# его часть. Профиль по умолчанию хранилище получает параметром конструктора
+# (его собирает `app.py` из `presets.DEFAULT_PROFILE`) — `storage.py`
+# по-прежнему не импортирует ничего из проекта. Поля профиля и режимы для
+# хранилища непрозрачны — это работа `user_profile.py`.
 
 import contextlib
 import copy
@@ -71,6 +81,14 @@ LONG_TERM_DIR = DATA_DIR.parent / "memory"
 # Версия формата файла долговременной памяти. Своя, а не общая с файлом
 # сессии: файлы разные и растут независимо.
 LONG_TERM_FORMAT_VERSION = 1
+
+# Каталог профиля пользователя (день 12, §6.1) — сосед каталогов сессий и
+# долговременной памяти, тем же правилом: экземпляр с другим
+# `TOOMANYRULES_DATA_DIR` получает свой профиль и не пишет в профиль автора.
+PROFILE_DIR = DATA_DIR.parent / "profile"
+
+# Версия формата файла профиля. Своя, как у долговременной памяти.
+PROFILE_FORMAT_VERSION = 1
 
 
 class StorageError(Exception):
@@ -600,6 +618,153 @@ class JsonLongTermStore:
         self._writable = False
         self._error = f"{reason}; память пустая, запись выключена, файл не тронут"
         logger.warning("долговременная память: %s", self._error)
+
+
+class JsonProfileStore:
+    """Профиль пользователя в одном JSON-файле, общем для всех сессий и
+    агентов процесса (день 12, §6.1). Хранилище не знает ни полей профиля,
+    ни режимов: профиль для него — непрозрачный словарь.
+
+    Экземпляр в приложении один на процесс, как `JsonLongTermStore`. Файл
+    читается один раз при создании, дальше профиль живёт в памяти процесса.
+    Нет файла — действует профиль по умолчанию, переданный конструктору:
+    правка профиля по умолчанию в коде до сохранённого файла уже не
+    доезжает — это данные пользователя, а не промпт разработчика (§2.1).
+    """
+
+    def __init__(self, default: dict, path: Path | None = None) -> None:
+        self._path = Path(path) if path is not None else PROFILE_DIR / "profile.json"
+        # Замок нужен по той же причине, что у долговременной памяти: две
+        # вкладки, сохраняющие профиль одновременно, без него записали бы
+        # файл в обратном порядке.
+        self._lock = threading.Lock()
+        self._default = copy.deepcopy(default) if isinstance(default, dict) else {}
+        self._current: dict = copy.deepcopy(self._default)
+        self._error: str | None = None
+        self._saved = False
+        # Запись выключается ровно в одном случае — файл есть, но не
+        # прочитался: не затираем то, что сегодня не прочиталось (день 7).
+        self._writable = True
+        self._load()
+
+    @property
+    def path(self) -> str:
+        """Путь к файлу для логов и панели — от корня репозитория."""
+        return display_path(self._path)
+
+    @property
+    def error(self) -> str | None:
+        """Почему файл не прочитался или не записался; `None` — всё в порядке."""
+        return self._error
+
+    @property
+    def saved(self) -> bool:
+        """Есть ли сохранённый файл; `False` — действует профиль по умолчанию."""
+        return self._saved
+
+    def current(self) -> dict:
+        """Копия текущего профиля словарём: из файла или профиль по
+        умолчанию. Без замка, как `JsonLongTermStore.entries()`: словарь
+        подменяется целиком после записи."""
+        return copy.deepcopy(self._current)
+
+    def save(self, data: dict, changed: str = "") -> dict:
+        """Записывает профиль целиком, атомарно и под замком хранилища —
+        оно общее для агентов. `changed` — слова для строки лога (что
+        изменилось, из `user_profile.profile_changes()`). Сбой записи или
+        выключенная запись — `StorageError`, кэш остаётся прежним."""
+        with self._lock:
+            if not self._writable:
+                raise StorageError(
+                    f"запись профиля выключена: {self._error}"
+                )
+            profile = copy.deepcopy(data) if isinstance(data, dict) else {}
+            payload = {
+                "version": PROFILE_FORMAT_VERSION,
+                "updated_at": _now(),
+                "profile": profile,
+            }
+            tmp_path = self._path.with_name(self._path.name + ".tmp")
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp_path, self._path)
+            except OSError as exc:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink(missing_ok=True)
+                self._error = f"не удалось записать {self.path}: {exc}"
+                logger.warning("профиль: %s", self._error)
+                raise StorageError(self._error) from exc
+
+            self._current = profile
+            self._saved = True
+            self._error = None
+            logger.info(
+                "профиль: сохранено%s → %s",
+                f" — {changed}" if changed else "",
+                self.path,
+            )
+            return copy.deepcopy(self._current)
+
+    def read_file(self) -> dict | None:
+        """Сырое содержимое файла для дебаг-панели: `None`, если файла нет
+        или он не читается. Панель перечитывает файл на каждом событии
+        интерфейса, поэтому успешное чтение логируется на уровне `debug`."""
+        if not self._path.exists():
+            return None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "профиль: файл не показан в панели — %s: %s", self.path, exc,
+            )
+            return None
+        logger.debug("прочитан файл профиля (%s)", self.path)
+        return data if isinstance(data, dict) else None
+
+    # --- Внутреннее ------------------------------------------------------
+
+    def _load(self) -> None:
+        """Чтение файла при создании хранилища. Нет файла — действует профиль
+        по умолчанию, это нормально. Файл не читается, не JSON, не той
+        формы — действует профиль по умолчанию, запись выключена, файл не
+        трогается. Мусор внутри словаря профиля здесь не разбирается — это
+        работа `user_profile.parse_profile()`."""
+        if not self._path.exists():
+            logger.info(
+                "профиль: файла нет, действует профиль по умолчанию — %s "
+                "появится с первым сохранением",
+                self.path,
+            )
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._disable(f"файл {self.path} не прочитался: {exc}")
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("profile"), dict):
+            self._disable(
+                f"файл {self.path} — не файл профиля: нет словаря profile"
+            )
+            return
+        version = data.get("version")
+        if version is not None and version != PROFILE_FORMAT_VERSION:
+            self._disable(
+                f"файл {self.path} — формат версии {version!r}, этот код "
+                f"читает версию {PROFILE_FORMAT_VERSION}"
+            )
+            return
+        self._current = data["profile"]
+        self._saved = True
+        logger.info("профиль: загружен ← %s", self.path)
+
+    def _disable(self, reason: str) -> None:
+        self._writable = False
+        self._error = f"{reason}; действует профиль по умолчанию, запись выключена, файл не тронут"
+        logger.warning("профиль: %s", self._error)
 
 
 def _str_or_empty(value: object) -> str:

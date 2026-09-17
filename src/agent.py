@@ -1,6 +1,7 @@
 # TooManyRules — сущность агента (день 6, неделя 2; день 8 — работа с токенами,
 # день 9 — управление контекстом, день 10 — общий служебный вызов, checkpoint'ы
-# и ветки диалога; день 11 — модель памяти: рабочая и долговременная память).
+# и ветки диалога; день 11 — модель памяти: рабочая и долговременная память;
+# день 12 — профиль пользователя и роутер режима).
 #
 # Единственное место в проекте, где происходят вызовы LLM API. Модуль
 # намеренно ничего не знает ни про Gradio, ни про Too Many Bones: внутри
@@ -9,21 +10,21 @@
 # (`AgentReply`) и своё состояние для дебага (`debug_state`).
 #
 # Направление зависимостей одностороннее: app.py → presets.py → agent.py →
-# tokens.py, context.py, memory.py → context.py. Из проекта здесь
-# импортируются листья графа, которые сами не импортируют ничего, —
-# `tokens.py` (день 8) и `context.py` (день 9), — и `memory.py` (день 11),
-# который зависит только от листа `context.py`; замороженный `app_week1.py`
-# не импортируется по-прежнему — см. `docs/TooManyRules — Неделя 2
-# архитектура.md`, §3, и спецификации дня 8, §4, дня 9, §4, дня 10, §5, и
-# дня 11, §5.
+# tokens.py, context.py, memory.py → context.py, user_profile.py → context.py.
+# Из проекта здесь импортируются листья графа, которые сами не импортируют
+# ничего, — `tokens.py` (день 8) и `context.py` (день 9), — и `memory.py`
+# (день 11) с `user_profile.py` (день 12), которые оба зависят только от
+# листа `context.py`; замороженный `app_week1.py` не импортируется
+# по-прежнему — см. `docs/TooManyRules — Неделя 2 архитектура.md`, §3, и
+# спецификации дня 8, §4, дня 9, §4, дня 10, §5, дня 11, §5, и дня 12, §5.
 #
 # С дня 9 вызовов LLM API здесь два места: основной вызов (ответ игроку) и
 # служебный. До дня 10 служебный был «свёрткой», с дня 10 обслуживает любую
-# стратегию с памятью (сводку и факты) одним путём, а с дня 11 — две работы:
-# служебный вызов стратегии и разбор памяти. Поэтому сам вызов вынесен в
-# `_call_service_model()`, а работы вокруг него — `_run_context_task()` и
-# `_run_memory_task()`. Правило «вызовы LLM API — только в `agent.py`, в двух
-# местах» остаётся буквальным.
+# стратегию с памятью (сводку и факты) одним путём, с дня 11 — ещё и разбор
+# памяти, а с дня 12 — ещё и роутер профиля: три работы. Поэтому сам вызов
+# вынесен в `_call_service_model()`, а работы вокруг него —
+# `_run_context_task()`, `_run_memory_task()` и `_run_route_task()`. Правило
+# «вызовы LLM API — только в `agent.py`, в двух местах» остаётся буквальным.
 #
 # День 10 также добавляет операцию над самой историей — checkpoint и ветку:
 # агент фиксирует точку диалога вместе со снимком памяти стратегий и порождает
@@ -39,6 +40,15 @@
 # агент ведёт себя ровно как на дне 10. Что куда пишется, решает карта памяти,
 # а в долговременную память — только человек: разбор предлагает кандидатов,
 # сохраняет их `accept_candidates()`.
+#
+# День 12 добавляет профиль пользователя — не слой памяти и не пресет
+# (спецификация дня 12, §2.1), а явные настройки, которые пользователь пишет
+# сам. Хранилище профиля (`ProfileStore`) одно на процесс, как долговременная
+# память; выбор режима на этот ход (`user_profile.ModeRouter`) — свой у
+# каждого агента, как модель памяти. Обе зависимости снова необязательные:
+# без них агент ведёт себя ровно как на дне 11. Роутер — третья служебная
+# работа вокруг `_call_service_model()`; блок профиля встаёт в запрос сразу
+# за системным промптом, перед слоями памяти.
 
 import copy
 import functools
@@ -57,6 +67,7 @@ from openai import OpenAI
 import context
 import memory
 import tokens
+import user_profile
 
 # Ключ читается только здесь, поэтому и .env подхватывается здесь же —
 # интерфейс про API-ключи ничего не знает.
@@ -115,6 +126,11 @@ CONTEXT_OVERFLOW_MARKERS = (
 # Как разбор памяти (день 11) подписан в `ServiceCall.memory_label`: панель
 # показывает служебные вызовы по этим словам, не зная, кто их сделал.
 MEMORY_CALL_LABEL = "Слои памяти"
+
+# То же для роутера профиля (день 12) — своя подпись, своя цена: роутер не
+# входит ни в `service_*` (цена памяти стратегий), ни в `memory_*` (цена
+# разбора памяти).
+ROUTE_CALL_LABEL = "Роутер профиля"
 
 # Слои в запросе по умолчанию — все переключаемые. Отдельное имя, а не
 # `memory.REQUEST_LAYERS` на месте: в конструкторе и в `fork()` имя `memory`
@@ -257,6 +273,15 @@ class AgentReply:
     # остаётся за стратегией — у хода бывает оба служебных вызова сразу.
     # `None` — разбора не было (у агента нет модели памяти или истории).
     memory_call: ServiceCall | None = None
+    # Поля дня 12 — в конце. `route_call` — вызов роутера профиля этого хода;
+    # `None`, если роутер не вызывался (переключатель не на `авто`, режимов
+    # меньше двух, вопрос пустой или роутера у агента нет — `preview()`/
+    # запасной режим тогда всё равно есть, просто без вызова). `profile_mode`
+    # и `profile_note` — что ушло в запрос этого хода и почему, из
+    # `ModeChoice`; `""` — режима не было (профиля нет или он выключен).
+    route_call: ServiceCall | None = None
+    profile_mode: str = ""
+    profile_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -297,6 +322,16 @@ class TurnStats:
     memory_elapsed: float = 0.0
     long_term_tokens: int = 0
     working_tokens: int = 0
+    # Поля дня 12 — снова в конце: корзина профиля в оценке запроса хода,
+    # режим, ушедший в запрос, и откуда он (из `ModeChoice`), и цена роутера —
+    # своя колонка, а не часть `service_*`/`memory_*` (спецификация дня 12,
+    # §5.8).
+    profile_tokens: int = 0
+    profile_mode: str = ""
+    profile_note: str = ""
+    route_tokens: int = 0
+    route_cost_usd: float | None = None
+    route_elapsed: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -420,6 +455,19 @@ class LongTermStore(Protocol):
     def apply(self, changes: dict[str, str | None], session_id: str) -> dict: ...  # None — удалить; бросает при сбое записи
     @property
     def path(self) -> str: ...                                  # для логов и панели
+
+
+class ProfileStore(Protocol):
+    """Профиль пользователя (реализация — `storage.JsonProfileStore`,
+    спецификация дня 12, §6). Один на процесс и общий для всех агентов.
+
+    Объявлен здесь, как `HistoryStore` и `LongTermStore`: обмен идёт
+    словарями, и реализация протокол не импортирует.
+    """
+
+    def current(self) -> dict: ...      # профиль словарём: из файла или по умолчанию, копия
+    @property
+    def path(self) -> str: ...          # для логов и панели
 
 
 # --- Счётчики процесса и реестр агентов ----------------------------------
@@ -621,6 +669,16 @@ class Agent:
         # передаётся всем агентам тем же объектом.
         memory: "memory.AgentMemory | None" = None,
         long_term: LongTermStore | None = None,
+        # Зависимости дня 12 (§5.1) — снова в конце и необязательные:
+        # `profile=None` — профиля нет, агент ведёт себя ровно как на дне 11.
+        # Хранилище профиля одно на процесс и передаётся всем агентам тем же
+        # объектом, как `long_term`. `router` свой у каждого агента
+        # (`presets.make_router()`): положение переключателя и режим
+        # прошлого хода относятся к конкретному агенту. `profile` есть, а
+        # `router=None` (REPL) — профиль уходит в запрос, роутер не
+        # вызывается (§5.1).
+        profile: ProfileStore | None = None,
+        router: "user_profile.ModeRouter | None" = None,
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -630,6 +688,11 @@ class Agent:
         # `_load_context()`, что память стратегий.
         self._memory = memory
         self._long_term = long_term
+        # Профиль и роутер (день 12) — тем же порядком, до чтения хранилища:
+        # ничего из них хранилище не читает, но это те же «необязательные
+        # зависимости в конце», что и у памяти.
+        self._profile = profile
+        self._router = router
         # Какие слои уходят в запрос — состояние агента, но не диалога
         # (§2.5): на диск не едет, в checkpoint не входит, у нового,
         # восстановленного агента и у ветки включены оба.
@@ -675,6 +738,12 @@ class Agent:
             "memory_calls": 0,
             "memory_tokens": 0,
             "memory_cost_usd": 0.0,
+            # Счётчики дня 12: роутер профиля. Считается в общих счётчиках
+            # выше, как любой вызов, но не в `service_*` и не в `memory_*` —
+            # у каждой служебной работы своя цена (спецификация дня 12, §5.8).
+            "route_calls": 0,
+            "route_tokens": 0,
+            "route_cost_usd": 0.0,
         }
         # Журнал ходов (день 8). Ведёт себя как счётчики агента, а не как стек
         # сообщений: `reset()` его не чистит, на диск он не едет, и после
@@ -769,19 +838,19 @@ class Agent:
             logger.info(
                 "[%s] агент создан как ветка от %s · %s: общий префикс %d "
                 "сообщ., стратегия «%s», память стратегий из снимка "
-                "checkpoint'а%s; живых агентов: %d",
+                "checkpoint'а%s%s; живых агентов: %d",
                 self._log_name, self._branch.parent, self._branch.checkpoint,
                 self._branch.messages, self._strategy_name, self._layers_note(),
-                process_stats()["agents_alive"],
+                self._profile_note(), process_stats()["agents_alive"],
             )
         else:
             logger.info(
                 "[%s] агент создан: model=%s thinking=%s стратегия=«%s» "
-                "восстановлено из хранилища=%d сообщ.%s%s, живых агентов: %d",
+                "восстановлено из хранилища=%d сообщ.%s%s%s, живых агентов: %d",
                 self._log_name, config.model, _thinking_label(config.thinking),
                 self._strategy_name, self._restored_messages,
                 _memory_note(self.strategy.describe(self._messages)),
-                self._layers_note(),
+                self._layers_note(), self._profile_note(),
                 process_stats()["agents_alive"],
             )
         # Сбой загрузки логируется здесь, а не на месте: до регистрации в
@@ -889,6 +958,19 @@ class Agent:
         return self._request_layers
 
     @property
+    def profile_choice(self) -> str | None:
+        """Положение переключателя «Профиль в запросе» (день 12, §5.5);
+        `None` — профиля у агента нет. Есть профиль, но нет роутера (REPL) —
+        поведение фиксировано на «авто» (§5.1)."""
+        if self._profile is None:
+            return None
+        return (
+            self._router.choice
+            if self._router is not None
+            else user_profile.CHOICE_AUTO
+        )
+
+    @property
     def turns(self) -> list[TurnStats]:
         """Копия журнала ходов — как `history`, наружу список не уезжает.
 
@@ -940,9 +1022,11 @@ class Agent:
 
         С дня 9 фаз подготовки было две: сначала стратегии дают возможность
         попросить служебный вызов (свёртку), и только потом собирается и
-        уходит основной запрос. С дня 11 их три (спецификация дня 11, §5.2):
-        служебный вызов стратегии, разбор памяти, сборка запроса со слоями.
-        Служебные вызовы ходом не являются и через `ask()` не идут.
+        уходит основной запрос. С дня 11 их три (спецификация дня 11, §5.2), а
+        с дня 12 — четыре (спецификация дня 12, §5.2): служебный вызов
+        стратегии, разбор памяти, выбор режима роутером, сборка запроса с
+        профилем и слоями. Служебные вызовы ходом не являются и через
+        `ask()` не идут.
 
         Исключений не бросает: ошибка API или отсутствующий ключ возвращаются
         как `AgentReply(ok=False, error=...)` — в том числе при сбое
@@ -980,11 +1064,20 @@ class Agent:
         long_term = self._long_term_entries()
         memory_call = self._run_memory_task(client, user_message, long_term)
 
+        # Выбор режима профиля (день 12, §5.2) — после разбора памяти и до
+        # сборки: порядок служебных вызовов на результат не влияет (читают
+        # одну историю, пишут разное), но фиксирован — чтобы логи ходов
+        # читались одинаково. Профиль читается один раз за ход, тем же
+        # приёмом, что долговременная память: снимок уходит и во вход
+        # роутера, и в блок основного запроса.
+        profile = self._profile_snapshot()
+        mode_choice, route_call = self._run_route_task(client, user_message, profile)
+
         # Счёт до запроса (день 8): считаем ровно тот список сообщений, который
         # сейчас уйдёт в API, — и логируем бюджет до вызова, а не после.
         # Сборка и расчёт идут одним вызовом, чтобы «что отправляем» и «что
         # показываем в панели» не считались двумя путями.
-        messages, view = self._context_view(user_message, long_term)
+        messages, view = self._context_view(user_message, long_term, profile, mode_choice)
         request = view.usage.request
         budget = view.usage
         self._log_context(view)
@@ -1016,6 +1109,9 @@ class Agent:
                 request=request,
                 service=service,
                 memory_call=memory_call,
+                route_call=route_call,
+                profile_mode=mode_choice.mode or "",
+                profile_note=mode_choice.note,
             )
         elapsed = time.perf_counter() - started
 
@@ -1053,6 +1149,9 @@ class Agent:
             prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
             service_call=service,
             memory_call=memory_call,
+            route_call=route_call,
+            profile_mode=mode_choice.mode or "",
+            profile_note=mode_choice.note,
         )
 
         if self._config.keep_history:
@@ -1061,7 +1160,7 @@ class Agent:
             self._persist()
 
         self._record(reply)
-        self._record_turn(reply, history_before, view, service, memory_call)
+        self._record_turn(reply, history_before, view, service, memory_call, route_call)
         logger.info(
             "[%s] model=%s thinking=%s finish_reason=%s time=%.2fs "
             "tokens(prompt/completion/total)=%s/%s/%s "
@@ -1097,12 +1196,18 @@ class Agent:
         пришли из диалога. **Долговременную память сброс не трогает**: это и
         есть разница времени жизни слоёв (спецификация дня 11, §5.7). Слои в
         запросе сброс тоже не меняет — это инструмент проверки, а не диалог.
+
+        С дня 12 сброс дополнительно зовёт `router.reset()`: режим прошлого
+        хода ушёл вместе с диалогом. Положение переключателя «Профиль в
+        запросе» и сам профиль сброс не трогает — они не диалог (§5.7).
         """
         self._messages = []
         for strategy in self._strategies.values():
             strategy.reset()
         if self._memory is not None:
             self._memory.reset()
+        if self._router is not None:
+            self._router.reset()
         self._checkpoints = []
         self._branch = None
         self._persist()
@@ -1184,6 +1289,7 @@ class Agent:
         session_id: str,
         strategies: dict[str, context.ContextStrategy] | None = None,
         memory: "memory.AgentMemory | None" = None,
+        router: "user_profile.ModeRouter | None" = None,
     ) -> "Agent | None":
         """Создаёт ветку от одного из checkpoint'ов этой сессии: новый агент
         с новой сессией, в историю которого скопирован префикс до
@@ -1199,6 +1305,11 @@ class Agent:
         долговременной памяти, что у родителя, — тем же объектом.
         Кандидаты не копируются: они вопрос к человеку в этой сессии, а не
         память.
+
+        С дня 12 (§5.7) ветка получает свежий `ModeRouter` (`авто`, режима
+        прошлого хода нет) и то же хранилище профиля, что у родителя, тем же
+        объектом: профиль пользователя не привязан к диалогу. В checkpoint
+        профиль и переключатель не входят.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -1244,6 +1355,8 @@ class Agent:
             seed=seed,
             memory=memory,
             long_term=self._long_term,
+            profile=self._profile,
+            router=router,
         )
 
     @_locked
@@ -1268,6 +1381,30 @@ class Agent:
             self._log_name, _layers_str(previous), _layers_str(wanted),
         )
         return True
+
+    @_locked
+    def set_profile_choice(self, choice: str) -> bool:
+        """«Профиль в запросе» (день 12, §5.5): `авто`, название режима или
+        `выключен`. Возвращает, изменилось ли что-нибудь.
+
+        `False` — у агента нет профиля или роутера, значение неизвестно
+        (не из `choices(profile)` на свежем снимке) или не изменилось. Под
+        замком агента: переключатель не должен смениться посреди хода,
+        который уже выбрал режим. Стек, файл сессии, память и профиль не
+        трогаются, на диск ничего не пишется.
+        """
+        if self._profile is None or self._router is None:
+            return False
+        profile = self._profile_snapshot()
+        previous = self._router.choice
+        changed = self._router.set_choice(choice, profile)
+        if changed:
+            logger.info(
+                "[%s] профиль в запросе: %s → %s; стек, память и профиль не "
+                "тронуты",
+                self._log_name, previous, self._router.choice,
+            )
+        return changed
 
     @_locked
     def accept_candidates(self, keys: Sequence[str]) -> CandidateDecision:
@@ -1369,7 +1506,11 @@ class Agent:
         # разъехались между двумя чтениями. Это копия словаря из памяти
         # процесса, файл при этом не читается.
         long_term = self._long_term_entries()
-        view = self._context_view("", long_term)[1]
+        # Снимок профиля на рендер (день 12) — тем же приёмом: и в бюджет
+        # (через `_context_view`), и в ключ `profile` ниже.
+        profile = self._profile_snapshot()
+        preview = self._preview_mode_choice(profile)
+        view = self._context_view("", long_term, profile, preview)[1]
         return {
             "number": self._number,
             "config": asdict(self._config),
@@ -1424,12 +1565,48 @@ class Agent:
                 if self._long_term is not None
                 else None
             ),
+            # Ключи дня 12 — в конце. `None` — профиля у агента нет. `choices`
+            # и `preview` — тем же снимком, по которому посчитан бюджет выше;
+            # `last` — что реально ушло в запрос прошлого хода (`None` —
+            # ходов ещё не было).
+            "profile": (
+                {
+                    "path": self._profile.path,
+                    "choice": (
+                        self._router.choice
+                        if self._router is not None
+                        else user_profile.CHOICE_AUTO
+                    ),
+                    "choices": (
+                        self._router.choices(profile)
+                        if self._router is not None
+                        else [
+                            user_profile.CHOICE_AUTO,
+                            *(mode.name for mode in profile.modes),
+                            user_profile.CHOICE_OFF,
+                        ]
+                    ),
+                    "preview": asdict(preview),
+                    "last": (
+                        asdict(self._router.last)
+                        if self._router is not None and self._router.last is not None
+                        else None
+                    ),
+                    "data": user_profile.dump_profile(profile),
+                }
+                if self._profile is not None
+                else None
+            ),
         }
 
     # --- Внутреннее ------------------------------------------------------
 
     def _build_messages(
-        self, user_message: str, long_term: dict | None = None
+        self,
+        user_message: str,
+        long_term: dict | None = None,
+        profile: "user_profile.UserProfile | None" = None,
+        mode_choice: "user_profile.ModeChoice | None" = None,
     ) -> list[dict]:
         """Единственное место, где собирается список сообщений для запроса.
 
@@ -1445,13 +1622,24 @@ class Agent:
         стратегия, `_with_layers()` вставляет блоки долговременной и рабочей
         памяти. Стратегии о слоях не знают. `long_term` — снимок записей
         долговременной памяти этого хода; `None` — взять свежий.
+
+        День 12 дописывает блок профиля (§5.4): `_with_profile()` вставляет
+        его после `_with_layers()`, но целится в то же место — сразу после
+        системного промпта, поэтому в итоге он оказывается перед слоями
+        (порядок блоков — §2.4). `profile`/`mode_choice` — снимок и решение
+        этого хода; `None` — взять свежие (панель).
         """
         if long_term is None:
             long_term = self._long_term_entries()
+        if profile is None:
+            profile = self._profile_snapshot()
+        if mode_choice is None:
+            mode_choice = self._preview_mode_choice(profile)
         messages = self.strategy.build(
             self._config.system_prompt, self._messages, user_message
         )
-        return self._with_layers(messages, long_term)
+        messages = self._with_layers(messages, long_term)
+        return self._with_profile(messages, profile, mode_choice)
 
     def _with_layers(self, messages: list[dict], long_term: dict) -> list[dict]:
         """Блоки слоёв памяти в готовом списке сообщений — единственное место,
@@ -1478,6 +1666,28 @@ class Agent:
             return messages
         return messages[:1] + blocks + messages[1:]
 
+    def _with_profile(
+        self,
+        messages: list[dict],
+        profile: "user_profile.UserProfile | None",
+        mode_choice: "user_profile.ModeChoice | None",
+    ) -> list[dict]:
+        """Блок профиля в готовом списке сообщений — единственное место, где
+        он туда попадает (спецификация дня 12, §5.4). Уходит только если
+        `ModeChoice.sent` и блок не пуст; вставляется сразу после системного
+        промпта — стратегии и модель памяти о профиле не знают."""
+        if (
+            profile is None
+            or mode_choice is None
+            or not mode_choice.sent
+            or not messages
+        ):
+            return messages
+        block = user_profile.profile_block(profile, mode_choice.mode)
+        if block is None:
+            return messages
+        return messages[:1] + [block] + messages[1:]
+
     def _long_term_entries(self) -> dict:
         """Снимок записей долговременной памяти — копия словаря из памяти
         процесса (файл хранилище читает один раз, при создании); `{}` —
@@ -1486,8 +1696,40 @@ class Agent:
             return {}
         return self._long_term.entries()
 
+    def _profile_snapshot(self) -> "user_profile.UserProfile | None":
+        """Профиль этого хода — разобранный снимок хранилища профиля (день
+        12, §5.1): чистая функция на словаре в пару килобайт, без кэша.
+        `None` — у агента нет профиля, он ведёт себя как на дне 11.
+        Замечания разбора здесь не логируются — их один раз при старте
+        логирует `app.py`."""
+        if self._profile is None:
+            return None
+        parsed, _ = user_profile.parse_profile(self._profile.current())
+        return parsed
+
+    def _preview_mode_choice(
+        self, profile: "user_profile.UserProfile | None"
+    ) -> "user_profile.ModeChoice":
+        """Что уйдёт в запрос без вызова роутера (день 12, §5.1, §4.4): у
+        панели и у сборки без нового хода нет причины звать модель. Профиля
+        нет — режима нет; профиль есть, а роутера нет (REPL) — `авто`
+        ведёт себя как «первый режим профиля»."""
+        if profile is None:
+            return user_profile.ModeChoice(False, None, "у агента нет профиля")
+        if self._router is None:
+            if profile.modes:
+                return user_profile.ModeChoice(
+                    True, profile.modes[0].name, "роутера у агента нет"
+                )
+            return user_profile.ModeChoice(True, None, "в профиле нет режимов")
+        return self._router.preview(profile)
+
     def _context_view(
-        self, question: str = "", long_term: dict | None = None
+        self,
+        question: str = "",
+        long_term: dict | None = None,
+        profile: "user_profile.UserProfile | None" = None,
+        mode_choice: "user_profile.ModeChoice | None" = None,
     ) -> tuple[list[dict], ContextView]:
         """Сборка запроса и всё, что про неё нужно знать панели и логам, —
         одним проходом.
@@ -1499,11 +1741,18 @@ class Agent:
         Чистый метод: `describe()`, `prepare()` и `build()` ничего не меняют и
         в сеть не ходят, поэтому его безопасно звать на каждый рендер панели.
         `long_term` — снимок долговременной памяти (день 11): `ask()` передаёт
-        снимок этого хода, панель — `None`, и тогда берётся свежий.
+        снимок этого хода, панель — `None`, и тогда берётся свежий. `profile`
+        и `mode_choice` (день 12) — тем же приёмом: `ask()` передаёт снимок и
+        решение этого хода, панель — `None`, и тогда берётся превью без
+        вызова роутера.
         """
         if long_term is None:
             long_term = self._long_term_entries()
-        messages = self._build_messages(question, long_term)
+        if profile is None:
+            profile = self._profile_snapshot()
+        if mode_choice is None:
+            mode_choice = self._preview_mode_choice(profile)
+        messages = self._build_messages(question, long_term, profile, mode_choice)
         usage = tokens.context_usage(
             self._count_messages(messages),
             model=self._config.model,
@@ -1512,14 +1761,18 @@ class Agent:
         )
         # База для сравнения: во сколько обошёлся бы тот же ход без всякого
         # управления контекстом. Считается тем же счётчиком по той же сборке,
-        # только стратегией «Вся история». С дня 11 — с теми же слоями памяти:
-        # экономия говорит только о стратегии, а не о том, что слои добавили.
+        # только стратегией «Вся история». С дня 11 — с теми же слоями памяти,
+        # с дня 12 — с тем же профилем: экономия говорит только о стратегии,
+        # а не о том, что слои или профиль добавили.
         full = self._count_messages(
-            self._with_layers(
-                _FULL_HISTORY.build(
-                    self._config.system_prompt, self._messages, question
+            self._with_profile(
+                self._with_layers(
+                    _FULL_HISTORY.build(
+                        self._config.system_prompt, self._messages, question
+                    ),
+                    long_term,
                 ),
-                long_term,
+                profile, mode_choice,
             )
         )
         state = self.strategy.describe(self._messages)
@@ -1861,6 +2114,113 @@ class Agent:
             )
         return call
 
+    def _run_route_task(
+        self,
+        client: OpenAI,
+        question: str,
+        profile: "user_profile.UserProfile | None",
+    ) -> tuple["user_profile.ModeChoice", ServiceCall | None]:
+        """Выбор режима профиля на этот ход (спецификация дня 12, §5.2,
+        §5.3): `prepare()` → `_call_service_model()` → `settle()`.
+
+        Нет профиля у агента — режима нет, роутер не вызывается. Есть
+        профиль, но нет роутера (REPL, §5.1) — `авто` ведёт себя как
+        «первый режим профиля», без служебного вызова. Сбой хода не
+        отменяет (правило дня 9 для служебного вызова): исключение API,
+        пустой или неразобранный ответ дают запасной режим — режим прошлого
+        хода, если он ещё есть в профиле, иначе первый; сам вызов всё равно
+        оплачен и посчитан.
+        """
+        if profile is None or self._router is None:
+            return self._preview_mode_choice(profile), None
+
+        self._warn_stale_profile_choice(profile)
+        task = self._router.prepare(profile, self._messages, question)
+        if task is None:
+            choice, _ = self._router.settle(profile, None, None)
+            return choice, None
+
+        started = time.perf_counter()
+        try:
+            result = self._call_service_model(client, task.messages, task.max_tokens)
+        except Exception as exc:
+            logger.exception("[%s] роутер профиля упал", self._log_name)
+            choice, _ = self._router.settle(profile, task, None)
+            call = ServiceCall(
+                kind="route", label=task.label, ok=False, error=str(exc),
+                elapsed=time.perf_counter() - started,
+                prompt_tokens=None, completion_tokens=None, total_tokens=None,
+                cost_usd=None, covers=0, folded_tokens=0, text="",
+                memory_label=ROUTE_CALL_LABEL,
+                memory_update=_route_update(choice),
+            )
+            self._record_route(call)
+            logger.warning(
+                "[%s] роутер профиля — %s: не удался (%s); ход не "
+                "отменяется — режим этого хода: %s",
+                self._log_name, task.label, call.error, _route_update(choice),
+            )
+            return choice, call
+
+        text = result.text
+        choice, ok = self._router.settle(profile, task, text or None)
+        call = ServiceCall(
+            kind="route",
+            label=task.label,
+            ok=ok,
+            error=None if ok else "ответ роутера не разобран",
+            elapsed=result.elapsed,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            cost_usd=result.cost_usd,
+            covers=0,
+            folded_tokens=0,
+            text=text,
+            finish_reason=result.finish_reason,
+            memory_label=ROUTE_CALL_LABEL,
+            memory_update=_route_update(choice),
+        )
+        self._record_route(call)
+        if not ok:
+            logger.warning(
+                "[%s] роутер профиля — %s: ответ не разобран (начало: %r) — "
+                "режим этого хода: %s",
+                self._log_name, task.label, text[:200], _route_update(choice),
+            )
+        else:
+            logger.info(
+                "[%s] роутер профиля: %s → %s; finish_reason=%s %.2fs, "
+                "tokens=%s/%s/%s, cost=%s; ответ: %r",
+                self._log_name, task.label, _route_update(choice),
+                result.finish_reason, result.elapsed,
+                _num(result.prompt_tokens), _num(result.completion_tokens),
+                _num(result.total_tokens), _cost_str(result.cost_usd), text,
+            )
+        if result.finish_reason == "length":
+            logger.warning(
+                "[%s] роутер профиля — %s: ответ упёрся в max_tokens=%s и "
+                "оборван на полуслове; если это повторяется, потолок мал "
+                "(спецификация дня 12, §3.3)",
+                self._log_name, task.label, task.max_tokens,
+            )
+        return choice, call
+
+    def _warn_stale_profile_choice(self, profile: "user_profile.UserProfile") -> None:
+        """Устаревшее название режима в переключателе «Профиль в запросе»
+        (день 12, §5.9): режима с таким именем в профиле больше нет.
+        Логируется на `info` — это решение человека или правки профиля, а не
+        сбой; ведёт себя как `CHOICE_AUTO` (§4.4)."""
+        choice = self._router.choice
+        if choice in (user_profile.CHOICE_AUTO, user_profile.CHOICE_OFF):
+            return
+        if user_profile.mode_by_name(profile, choice) is None:
+            logger.info(
+                "[%s] переключатель «Профиль в запросе» указывает на «%s», "
+                "которого больше нет в профиле — работаем как «%s»",
+                self._log_name, choice, user_profile.CHOICE_AUTO,
+            )
+
     def _count_messages(self, messages: list[dict]) -> tokens.RequestTokens:
         """Разложение готового списка сообщений на систему / долговременную и
         рабочую память / память стратегии / историю / вопрос.
@@ -1881,22 +2241,33 @@ class Agent:
         `memory.WORKING_HEADER` — `working`, остальное — память стратегии.
         Правило безопасно по той же причине: `system`-сообщения в запросе
         ставит только код проекта, и заголовки — его константы.
+
+        С дня 12 (§5.6) так же отделяется блок профиля: то, что начинается с
+        `user_profile.PROFILE_HEADER`, — корзина `profile`; корзина `memory`
+        (память стратегии) — то, что не начинается ни с одного из трёх
+        заголовков.
         """
         middle = messages[1:-1]
         system = [
             m.get("content") or "" for m in middle if m.get("role") == "system"
         ]
-        layers = (memory.LONG_TERM_HEADER, memory.WORKING_HEADER)
+        named = (
+            memory.LONG_TERM_HEADER, memory.WORKING_HEADER,
+            user_profile.PROFILE_HEADER,
+        )
         return tokens.count_request(
             system_prompt=messages[0]["content"],
             history=[m for m in middle if m.get("role") != "system"],
             question=messages[-1]["content"],
-            memory="\n\n".join(text for text in system if not text.startswith(layers)),
+            memory="\n\n".join(text for text in system if not text.startswith(named)),
             long_term="\n\n".join(
                 text for text in system if text.startswith(memory.LONG_TERM_HEADER)
             ),
             working="\n\n".join(
                 text for text in system if text.startswith(memory.WORKING_HEADER)
+            ),
+            profile="\n\n".join(
+                text for text in system if text.startswith(user_profile.PROFILE_HEADER)
             ),
         )
 
@@ -1920,15 +2291,17 @@ class Agent:
         когда занято больше `WARN_RATIO`: приближение к лимиту должно быть
         видно в терминале, а не только в панели."""
         request = budget.request
-        # Слагаемые — в порядке блоков запроса (день 11, §3.5): долговременная
-        # и рабочая память стоят между системным промптом и памятью стратегии.
+        # Слагаемые — в порядке блоков запроса (день 12, §2.4): профиль,
+        # долговременная и рабочая память стоят между системным промптом и
+        # памятью стратегии.
         logger.info(
-            "[%s] бюджет: система %s + долговременная %s + рабочая %s + память "
-            "стратегии %s + история %s + вопрос %s + служебные %s ≈ %s из %s "
-            "доступных (%s); окно %s, резерв под ответ %s",
+            "[%s] бюджет: система %s + профиль %s + долговременная %s + "
+            "рабочая %s + память стратегии %s + история %s + вопрос %s + "
+            "служебные %s ≈ %s из %s доступных (%s); окно %s, резерв под "
+            "ответ %s",
             self._log_name,
-            _num(request.system), _num(request.long_term), _num(request.working),
-            _num(request.memory), _num(request.history),
+            _num(request.system), _num(request.profile), _num(request.long_term),
+            _num(request.working), _num(request.memory), _num(request.history),
             _num(request.question), _num(request.overhead), _num(budget.used),
             _num(budget.available), _ratio_str(budget.ratio),
             _num(budget.limit), _num(budget.answer_reserve),
@@ -2249,6 +2622,20 @@ class Agent:
             f"{_layers_str(self._request_layers)}"
         )
 
+    def _profile_note(self) -> str:
+        """Кусок строки «агент создан» про профиль (день 12, §5.9): путь,
+        число режимов и положение переключателя «Профиль в запросе»."""
+        if self._profile is None:
+            return ", профиля нет"
+        profile = self._profile_snapshot()
+        choice = (
+            self._router.choice if self._router is not None else user_profile.CHOICE_AUTO
+        )
+        return (
+            f", профиль: {self._profile.path} ({len(profile.modes)} "
+            f"{_modes_word(len(profile.modes))}), в запросе: {choice}"
+        )
+
     def _long_term_count_str(self) -> str:
         """«5 зап. в src/data/memory/long_term.json» — сколько записей
         долговременной памяти использует карта; «не подключена» — хранилища
@@ -2283,12 +2670,16 @@ class Agent:
         request: "tokens.RequestTokens | None" = None,
         service: ServiceCall | None = None,
         memory_call: ServiceCall | None = None,
+        route_call: ServiceCall | None = None,
+        profile_mode: str = "",
+        profile_note: str = "",
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
         случай, когда оценку хочется видеть. У ошибки без ключа считать нечего.
-        Разбор памяти (день 11), применённый до упавшего вызова, уже оплачен и
-        сохранён — он едет в ответ, чтобы панель показала и его.
+        Разбор памяти (день 11) и роутер профиля (день 12), применённые до
+        упавшего вызова, уже оплачены и сохранены — они едут в ответ, чтобы
+        панель показала и их.
         """
         reply = AgentReply(
             ok=False,
@@ -2306,6 +2697,9 @@ class Agent:
             request_tokens=request,
             service_call=service,
             memory_call=memory_call,
+            route_call=route_call,
+            profile_mode=profile_mode,
+            profile_note=profile_note,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
@@ -2318,6 +2712,7 @@ class Agent:
         view: ContextView,
         service: ServiceCall | None,
         memory_call: ServiceCall | None = None,
+        route_call: ServiceCall | None = None,
     ) -> None:
         """Строка журнала ходов — только на успешный вызов и после `_record()`:
         накопительные числа берутся из уже обновлённых счётчиков агента.
@@ -2352,6 +2747,14 @@ class Agent:
                 memory_elapsed=memory_call.elapsed if memory_call else 0.0,
                 long_term_tokens=view.usage.request.long_term,
                 working_tokens=view.usage.request.working,
+                # Корзина профиля, режим этого хода и цена роутера (день 12,
+                # §5.8).
+                profile_tokens=view.usage.request.profile,
+                profile_mode=reply.profile_mode,
+                profile_note=reply.profile_note,
+                route_tokens=(route_call.total_tokens or 0) if route_call else 0,
+                route_cost_usd=route_call.cost_usd if route_call else None,
+                route_elapsed=route_call.elapsed if route_call else 0.0,
             )
         )
         # Экономия копится по ходам и может быть отрицательной: на коротком
@@ -2383,6 +2786,17 @@ class Agent:
         self._totals["memory_calls"] += 1
         self._totals["memory_tokens"] += call.total_tokens or 0
         self._totals["memory_cost_usd"] += call.cost_usd or 0.0
+
+    def _record_route(self, call: ServiceCall) -> None:
+        """Учёт роутера профиля (день 12, §5.8): в общих счётчиках агента и
+        процесса — как любой вызов, и отдельно в своих `route_*`. Не в
+        `service_*` и не в `memory_*` — у каждой служебной работы своя цена.
+        В калибровку не идёт по той же причине, что остальные служебные
+        вызовы."""
+        self._record_extra_call(call)
+        self._totals["route_calls"] += 1
+        self._totals["route_tokens"] += call.total_tokens or 0
+        self._totals["route_cost_usd"] += call.cost_usd or 0.0
 
     def _record_extra_call(self, call: ServiceCall) -> None:
         """Общая часть учёта служебного вызова и разбора памяти: вызов, ошибка,
@@ -2476,6 +2890,19 @@ def _layers_str(layers: Sequence[str]) -> str:
     return ", ".join(layers) if layers else "нет"
 
 
+def _modes_word(count: int) -> str:
+    """«1 режим» / «2 режима» / «5 режимов»."""
+    if 11 <= count % 100 <= 14:
+        return "режимов"
+    match count % 10:
+        case 1:
+            return "режим"
+        case 2 | 3 | 4:
+            return "режима"
+        case _:
+            return "режимов"
+
+
 def _quoted(value: str | None) -> str:
     return "нет" if value is None else f"«{value}»"
 
@@ -2494,6 +2921,14 @@ def _candidate_str(candidate: "memory.Candidate") -> str:
         else "раньше ключа не было"
     )
     return f"{proposal} ({previous})"
+
+
+def _route_update(choice: "user_profile.ModeChoice") -> str:
+    """`ModeChoice` для лога и `ServiceCall.memory_update` (день 12, §5.3):
+    «„Учу новичка“ — выбран роутером» или, без режима, просто заметка."""
+    if choice.mode is None:
+        return choice.note
+    return f"«{choice.mode}» — {choice.note}"
 
 
 def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:
