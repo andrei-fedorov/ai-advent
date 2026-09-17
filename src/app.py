@@ -63,6 +63,7 @@
 #
 # Запуск: ./run.sh (или python app.py из src/ с активированным .venv)
 
+import functools
 import logging
 from dataclasses import asdict
 
@@ -97,9 +98,11 @@ from presets import (
     PROFILE_VARIANTS,
     ROUTING_SCENARIO,
     STRATEGIES,
+    TASK_SCENARIO,
     make_memory,
     make_router,
     make_strategies,
+    make_task_machine,
 )
 from storage import (
     JsonHistoryStore,
@@ -107,6 +110,18 @@ from storage import (
     JsonProfileStore,
     StorageError,
     display_path,
+)
+from task_state import (
+    EVENT_CANCEL,
+    EVENT_PAUSE,
+    EVENT_RESUME,
+    MAIN_PATH,
+    NO_TASK,
+    STAGE_CANCELLED,
+    STAGE_DONE,
+    STAGE_EXECUTION,
+    STAGE_VALIDATION,
+    TRANSITIONS,
 )
 from tokens import FILLER_MAX_TOKENS, estimate_tokens, filler_text
 from user_profile import (
@@ -257,6 +272,8 @@ def _metrics_md(last_call: dict | None) -> str:
         service += _memory_call_lines(last_call.get("memory_call"))
         # Роутер профиля (день 12) — тем же правилом.
         service += _route_call_lines(last_call)
+        # Трекер задачи (день 13) — тем же правилом.
+        service += _task_tracker_lines(last_call)
         if service:
             lines += ["", *service]
         return "\n".join(lines)
@@ -296,6 +313,7 @@ def _metrics_md(last_call: dict | None) -> str:
     lines += _service_lines(last_call.get("service_call"))
     lines += _memory_call_lines(last_call.get("memory_call"))
     lines += _route_call_lines(last_call)
+    lines += _task_tracker_lines(last_call)
     return "\n".join(lines)
 
 
@@ -414,6 +432,36 @@ def _route_call_lines(last_call: dict) -> list[str]:
     return [line]
 
 
+def _task_tracker_lines(last_call: dict) -> list[str]:
+    """Трекер задачи этого хода (день 13, §7.5) — строкой следом за
+    роутером профиля, по образцу `_route_call_lines()`.
+
+    Трекер не вызывался, а задача есть, — отдельная строка про саму задачу:
+    панель не знает причину («задачи нет», «задача завершена», …), это
+    `task_note`/`task_event` из `AgentReply`.
+    """
+    call = last_call.get("task_call")
+    note = last_call.get("task_note") or ""
+    if call is None:
+        return [f"- **📋 Задача:** {note}"] if note else []
+    if not call["ok"]:
+        line = f"- **📋 Трекер задачи не удался — {call['label']}:** {call['error']}"
+        if call["text"]:
+            line += f" (начало ответа: «{call['text'][:120]}»)"
+        line += (
+            f" — не применён, ход состоялся. Потрачено "
+            f"{_fmt_int(call['total_tokens'] or 0)} токенов."
+        )
+        return [line]
+    line = (
+        f"- **📋 Трекер задачи — {call['label']}:** {note}; ответ "
+        f"≈{_fmt_int(estimate_tokens(call['text']))} токенов, вызов "
+        f"{_fmt_int(call['total_tokens'])} токенов, "
+        f"{_fmt_cost(call['cost_usd'])}, {call['elapsed']:.2f} s"
+    )
+    return [line]
+
+
 _LEVEL_MARKERS = {"ok": "🟢", "warn": "🟡", "danger": "🔴", "over": "🔴"}
 
 # Тексты предупреждений не называют стратегий: панель не знает, какие они
@@ -497,15 +545,15 @@ def _context_md(
         + f", резерв под ответ {_fmt_int(usage['answer_reserve'])}",
         # Память стратегии (день 9: сводка; день 10: факты) — слагаемое
         # наравне с остальными: без неё сумма в строке не сходилась бы с
-        # итогом ровно на размер этой памяти. Профиль (день 12) и слои
-        # памяти дня 11 — тем же правилом, в порядке блоков запроса: профиль
-        # сразу за системой, дальше долговременная и рабочая, потом память
-        # стратегии.
+        # итогом ровно на размер этой памяти. Профиль (день 12), слои памяти
+        # дня 11 и задача (день 13) — тем же правилом, в порядке блоков
+        # запроса: профиль сразу за системой, дальше долговременная и
+        # рабочая, задача, потом память стратегии.
         f"- **В запросе:** система {_fmt_int(request['system'])} + профиль "
         f"{_fmt_int(request['profile'])} + долговременная "
         f"{_fmt_int(request['long_term'])} + рабочая "
-        f"{_fmt_int(request['working'])} + память стратегии "
-        f"{_fmt_int(request['memory'])} + история "
+        f"{_fmt_int(request['working'])} + задача {_fmt_int(request['task'])} + "
+        f"память стратегии {_fmt_int(request['memory'])} + история "
         f"{_fmt_int(request['history'])} ({len(request['per_message'])} сообщ.) + "
         f"вопрос {_fmt_int(request['question'])} + служебные "
         f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(request['total'])}**",
@@ -594,15 +642,16 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
         "### Контекст: что уходит в модель",
         "",
         f"- **Стратегия:** «{view['strategy']}» — {state['description']}",
-        # Профиль (день 12) и слои памяти (день 11) — слагаемыми между
-        # системой и памятью стратегии: без них сумма не сошлась бы с
-        # итогом. Ни стратегия, ни профиль друг о друге не знают, и в
-        # экономию ниже они не входят — база «вся история» собрана с тем же
-        # профилем и теми же слоями.
+        # Профиль (день 12), слои памяти (день 11) и задача (день 13) —
+        # слагаемыми между системой и памятью стратегии: без них сумма не
+        # сошлась бы с итогом. Ни стратегия, ни профиль, ни задача друг о
+        # друге не знают, и в экономию ниже они не входят — база «вся
+        # история» собрана с тем же профилем, теми же слоями и тем же
+        # блоком задачи.
         f"- **Состав запроса:** система {_fmt_int(request['system'])} + "
         f"профиль {_fmt_int(request['profile'])} + долговременная "
         f"{_fmt_int(request['long_term'])} + рабочая "
-        f"{_fmt_int(request['working'])} + "
+        f"{_fmt_int(request['working'])} + задача {_fmt_int(request['task'])} + "
         f"{memory_name} {_fmt_int(request['memory'])} + "
         f"{view['sent_messages']} сообщ. истории {_fmt_int(request['history'])} + "
         f"вопрос {_fmt_int(request['question'])} + служебные "
@@ -781,6 +830,20 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             "профиль": turn["profile_tokens"],
             "роутер": turn["route_tokens"],
             "время роутера, s": f"{turn['route_elapsed']:.2f}",
+            # Колонки дня 13 — в конце (§5.9, §7.5): этап и шаг после хода
+            # (пауза — пометкой, задачи нет — прочерком), событие перехода
+            # трекера этого хода, корзина задачи и цена трекера — своя
+            # колонка, а не часть «служебных»/«разбора памяти»/«роутера».
+            "этап": (
+                f"{turn['task_stage']}, шаг {turn['task_step']}"
+                f"{' ⏸' if turn['task_paused'] else ''}"
+                if turn["task_stage"]
+                else "—"
+            ),
+            "переход": turn["task_event"] or "—",
+            "задача": turn["task_tokens"],
+            "трекер": turn["tracker_tokens"],
+            "время трекера, s": f"{turn['tracker_elapsed']:.2f}",
         }
         for turn in turns
     ]
@@ -792,7 +855,8 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
                  "время ответа, s", "время служебного, s",
                  "долговременная", "рабочая", "разбор памяти",
                  "время разбора, s", "режим", "профиль", "роутер",
-                 "время роутера, s"],
+                 "время роутера, s", "этап", "переход", "задача", "трекер",
+                 "время трекера, s"],
     )
 
 
@@ -806,7 +870,7 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"- **Вызовов:** {totals['calls']} (из них с ошибкой: "
         f"{totals['errors']}, служебных: {totals['service_calls']}, "
         f"разборов памяти: {totals['memory_calls']}, роутера профиля: "
-        f"{totals['route_calls']})\n"
+        f"{totals['route_calls']}, трекера задачи: {totals['tracker_calls']})\n"
         f"- **🔢 Токены:** prompt={totals['prompt_tokens']} / "
         f"completion={totals['completion_tokens']} / "
         f"total={totals['total_tokens']}\n"
@@ -830,6 +894,14 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"{_fmt_int(totals['route_tokens'])} токенов, "
         f"{_fmt_cost(totals['route_cost_usd'])} — цена автоматического "
         f"выбора режима; в экономию стратегии не входит\n"
+        # Строка дня 13 (§5.9, §7.5): трекер задачи — цена ведения задачи по
+        # разговору, не входит ни в служебные вызовы, ни в разбор памяти,
+        # ни в роутер.
+        f"- **📋 Трекер задачи:** {totals['tracker_calls']} "
+        f"{_calls_word(totals['tracker_calls'])}, "
+        f"{_fmt_int(totals['tracker_tokens'])} токенов, "
+        f"{_fmt_cost(totals['tracker_cost_usd'])} — цена ведения задачи по "
+        f"разговору; в экономию стратегии не входит\n"
         f"- **💲 Стоимость:** {_fmt_cost(totals['cost_usd'])}"
     )
 
@@ -1276,6 +1348,178 @@ def _candidates_update(state: dict) -> dict:
     )
 
 
+# --- Состояние задачи (день 13) --------------------------------------------
+# Блок «Состояние задачи», переключатель «Состояние задачи в запросе» и
+# таблица автомата в аккордеоне. Панель не знает, какие бывают этапы и
+# события, — рисует то, что вернул `TaskView` из `debug_state()["task"]`.
+
+def _task_plan_lines(view: dict) -> list[str]:
+    """Строки плана с отметками ✓/→ — тем же правилом, что блок задачи в
+    запросе (`task_state._plan_block()`): на выполнении отмечены шаги, на
+    проверке — все шаги и текущая проверка, на «готово»/«отменена» — все
+    пункты."""
+    steps, checks, results = view["steps"], view["checks"], view["results"]
+    stage, step = view["stage"], view["step"]
+    if not steps:
+        return [
+            "**План:** ещё не утверждён — его предлагает ассистент, "
+            "утверждает пользователь."
+        ]
+    lines = ["**План:**"]
+    for i, text in enumerate(steps):
+        idx = i + 1
+        if stage in (STAGE_DONE, STAGE_CANCELLED, STAGE_VALIDATION):
+            mark = "✓"
+        elif stage == STAGE_EXECUTION:
+            mark = "✓" if idx < step else "→" if idx == step else " "
+        else:
+            mark = " "
+        result = results[i] if i < len(results) else ""
+        suffix = f" — итог: {result}" if result else ""
+        lines.append(f"{mark} {idx}. {text}{suffix}")
+    lines.append("**Проверки:**")
+    for i, text in enumerate(checks):
+        idx = i + 1
+        if stage in (STAGE_DONE, STAGE_CANCELLED):
+            mark = "✓"
+        elif stage == STAGE_VALIDATION:
+            mark = "✓" if idx < step else "→" if idx == step else " "
+        else:
+            mark = " "
+        lines.append(f"{mark} {idx}. {text}")
+    return lines
+
+
+def _task_md(state: dict, view: dict) -> str:
+    """Блок «Состояние задачи» (день 13, §7.4) — сразу под «Слоями памяти»,
+    в порядке блоков запроса."""
+    task = state["task"]
+    lines = ["### Состояние задачи", ""]
+    if task is None:
+        lines.append("У этого агента нет автомата задачи: он ведёт себя как на дне 12.")
+        return "\n".join(lines)
+
+    task_view = task["view"]
+    if task_view["stage"] == NO_TASK:
+        lines += [
+            "Задачи нет. Начать — кнопкой «Начать задачу с этим сообщением»: "
+            "текст поля ввода станет целью, этап — планирование.",
+            "",
+            "**Допустимо сейчас:** человек — начать.",
+        ]
+        return "\n".join(lines)
+
+    goal = task_view["goal"]
+    lines.append(f"- **Задача:** {goal[:200]}")
+    if task_view["stage"] == STAGE_CANCELLED:
+        cancelled_from = (
+            task_view["transitions"][-1]["from_stage"]
+            if task_view["transitions"] else "?"
+        )
+        lines.append(f"- **Этап:** отменена (была на этапе «{cancelled_from}»)")
+    else:
+        stage_line = " → ".join(
+            f"**{stage}**" if stage == task_view["stage"] else stage
+            for stage in MAIN_PATH
+        )
+        if task_view["paused"]:
+            when = task_view["paused_at"]
+            stage_line += f" ⏸ на паузе{f' с {when}' if when else ''}"
+        lines.append(f"- **Этап:** {stage_line}")
+    if task_view["stage"] not in (STAGE_DONE, STAGE_CANCELLED):
+        lines.append(f"- **Текущий шаг:** {task_view['step_text']}")
+        lines.append(f"- **Ожидается:** {task_view['expected']}")
+    lines += ["", *_task_plan_lines(task_view), ""]
+    lines.append(
+        f"- **Допустимо сейчас:** человек — "
+        f"{', '.join(task_view['allowed_human']) or 'ничего'}; трекер — "
+        f"{', '.join(task_view['allowed_tracker']) or 'ничего'}"
+    )
+    if task_view["transitions"]:
+        last = task_view["transitions"][-1]
+        note = f" — {last['note']}" if last["note"] else ""
+        lines.append(
+            f"- **Последний переход:** {last['event']} ({last['source']}) — "
+            f"{last['from_stage']} → {last['to_stage']}, {_time_of(last['at'])}{note}"
+        )
+    rejection = task_view["rejection"]
+    if rejection:
+        lines.append(
+            f"- **Последний отказ:** «{rejection['event']}» ({rejection['source']}) "
+            f"— {rejection['reason']}, {_time_of(rejection['at'])}"
+        )
+    if not task["in_request"]:
+        lines.append(
+            "- **В запросе:** не уходит — «Состояние задачи в запросе» выключено"
+        )
+    elif not task_view["block_due"]:
+        lines.append("- **В запросе:** не уходит — задача завершена")
+    else:
+        task_tokens = view["usage"]["request"]["task"]
+        lines.append(
+            f"- **В запросе:** блок ≈{_fmt_int(task_tokens)} токенов уйдёт в "
+            f"следующий запрос"
+        )
+    lines.append(
+        f"- **Где лежит:** `{display_path(STORE.path_for(state['session_id']))}` "
+        f"→ `context.task`"
+    )
+    lines.append(
+        "- **Трекер на следующем ходе:** будет вызван"
+        if task_view["tracker_due"]
+        else f"- **Трекер на следующем ходе:** {task_view['tracker_note']}"
+    )
+    if task_view["transitions"]:
+        lines += [
+            "",
+            "**Журнал переходов:**",
+            "",
+            "| время | событие | источник | из → в | шаг | заметка |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        lines += [
+            f"| {_time_of(r['at'])} | {r['event']} | {r['source']} | "
+            f"{r['from_stage']} → {r['to_stage']} | {r['step']} | "
+            f"{r['note'] or '—'} |"
+            for r in task_view["transitions"]
+        ]
+    lines += [
+        "",
+        "_Этап и шаг меняет только автомат по таблице переходов; событие "
+        "называет трекер по разговору или вы кнопками; модель, которая "
+        "отвечает, переходов не делает._",
+    ]
+    return "\n".join(lines)
+
+
+def _task_in_request_update(state: dict) -> dict:
+    """Переключатель «Состояние задачи в запросе»: значение и активность
+    подтягиваются к агенту; нет автомата — список неактивен."""
+    task = state["task"]
+    return gr.update(
+        value=task["in_request"] if task is not None else False,
+        interactive=task is not None,
+    )
+
+
+def _task_transitions_table_md() -> str:
+    """Таблица автомата для аккордеона (§7.4) — собирается один раз при
+    построении интерфейса из `task_state.TRANSITIONS`, в `_view()` не входит:
+    таблица статична."""
+    lines = [
+        "| Событие | Кто | Из этапа | Пауза | Куда | Условие | Что значит |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in TRANSITIONS:
+        pause = "—" if row.paused is None else ("на паузе" if row.paused else "не на паузе")
+        lines.append(
+            f"| {row.event} | {', '.join(row.sources)} | "
+            f"{', '.join(row.stages)} | {pause} | {row.target} | "
+            f"{row.condition or '—'} | {row.meaning} |"
+        )
+    return "\n".join(lines)
+
+
 # --- «Агенты процесса»: расход по журналам всех агентов реестра -----------
 
 def _turn_strategies_label(agent: Agent) -> str:
@@ -1311,6 +1555,10 @@ def _agents_table() -> pd.DataFrame:
         # в запросе» и токены роутера. Стоимость и среднее время хода
         # включают и роутер.
         "профиль в запросе", "токены роутера",
+        # Колонки дня 13 — в конце (§5.9, §7.5): этап и шаг задачи (пауза —
+        # пометкой, задачи нет — прочерком) и токены трекера. Стоимость и
+        # среднее время хода включают и трекер.
+        "задача", "токены трекера",
     ]
     rows = []
     for a in agents():
@@ -1321,13 +1569,21 @@ def _agents_table() -> pd.DataFrame:
             total_cost = sum(
                 (t.cost_usd or 0.0) + (t.service_cost_usd or 0.0)
                 + (t.memory_cost_usd or 0.0) + (t.route_cost_usd or 0.0)
+                + (t.tracker_cost_usd or 0.0)
                 for t in turns
             )
             cost_str = _fmt_cost(total_cost)
         avg_time = (
-            f"{sum(t.elapsed + t.service_elapsed + t.memory_elapsed + t.route_elapsed for t in turns) / len(turns):.2f}"
+            f"{sum(t.elapsed + t.service_elapsed + t.memory_elapsed + t.route_elapsed + t.tracker_elapsed for t in turns) / len(turns):.2f}"
             if turns else "н/д"
         )
+        task_view = a.task_view
+        if task_view is None or task_view.stage == NO_TASK:
+            task_str = "—"
+        else:
+            task_str = f"{task_view.stage}, шаг {task_view.step}"
+            if task_view.paused:
+                task_str += " ⏸"
         rows.append({
             "агент": _agent_title(a),
             "сессия": a.session_id,
@@ -1345,6 +1601,8 @@ def _agents_table() -> pd.DataFrame:
             "токены разбора памяти": sum(t.memory_tokens for t in turns),
             "профиль в запросе": a.profile_choice or "—",
             "токены роутера": sum(t.route_tokens for t in turns),
+            "задача": task_str,
+            "токены трекера": sum(t.tracker_tokens for t in turns),
         })
     return pd.DataFrame(rows, columns=columns)
 
@@ -1361,9 +1619,9 @@ def _profile_choice_options(choices: list[str]) -> list[tuple[str, str]]:
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 29 значений
-    (18 — до дня 10, 22 — до дня 11, 26 — до дня 12), позиционно
-    раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
+    """Полный вид на состояние агента — фиксированный кортеж из 31 значения
+    (18 — до дня 10, 22 — до дня 11, 26 — до дня 12, 29 — до дня 13),
+    позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
     Значения всех выпадающих списков — тоже часть вида: иначе после
@@ -1496,6 +1754,12 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
                 else f"Файл профиля · {PROFILE.path} — файла нет"
             ),
         ),
+        # Значения дня 13 — в конце кортежа и в конце VIEW_OUTPUTS (§7.7).
+        # 30. переключатель «Состояние задачи в запросе» — значение и
+        #     активность подтянуты к агенту; нет автомата — неактивен
+        _task_in_request_update(state),
+        # 31. блок «Состояние задачи»
+        _task_md(state, view),
     )
 
 
@@ -1533,6 +1797,8 @@ def _new_agent(preset_name: str) -> Agent:
         # приёмом (день 12, §7.1).
         profile=PROFILE,
         router=make_router(),
+        # Автомат задачи свой у каждого агента — тем же приёмом (день 13, §7.1).
+        task=make_task_machine(),
     )
 
 
@@ -1608,6 +1874,9 @@ def _restore_agents() -> int:
             # `авто`, режима прошлого хода нет (день 12, §5.7).
             profile=PROFILE,
             router=make_router(),
+            # Автомат задачи свой у восстановленного агента — состояние и
+            # журнал из файла, переключатель включён (день 13, §5.8).
+            task=make_task_machine(),
         )
         restored += 1
     logger.info(
@@ -1802,25 +2071,10 @@ def on_strategy_change(agent: Agent | None, strategy_name: str, preset_name: str
     )
 
 
-def on_send(agent: Agent | None, message: str, preset_name: str):
-    """Ход диалога. Вся работа — один вызов `agent.ask()`: стек сообщений
-    ведёт агент, интерфейс только перерисовывает его состояние.
-
-    Функция намеренно не генератор: Gradio показывает нормальный оверлей
-    ожидания (спиннер и таймер) только для функций с одним `return`.
-    """
-    if agent is None:  # страховка на случай сессии без сработавшего load
-        agent = _new_agent(preset_name)
-
-    message = (message or "").strip()
-    if not message:
-        return (
-            agent,
-            gr.update(),
-            *_view(agent, "Введите вопрос — пустой запрос в модель не уходит."),
-        )
-
-    reply = agent.ask(message)
+def _reply_status(agent: Agent, reply) -> str:
+    """Статус хода по `AgentReply` — общий код для «Отправить» и «Начать
+    задачу с этим сообщением» (день 13, §7.2): вынесен из `on_send()` без
+    изменения существующих текстов."""
     if reply.ok:
         status = (
             f"Ответ получен за {reply.elapsed:.2f} s. "
@@ -1863,29 +2117,71 @@ def on_send(agent: Agent | None, message: str, preset_name: str):
                 f"состоялся, рабочая память и кандидаты не сдвинулись; разбор "
                 f"повторится на следующем ходе."
             )
+        # Трекер задачи (день 13, §7.5) — тем же приёмом, после разбора
+        # памяти: короткая фраза про переход этого хода. «Событий нет» не
+        # показывается — это штатный результат почти каждого хода задачи.
+        task_call = reply.task_call
+        task_note = reply.task_note
+        if task_note and task_note != "событий нет":
+            if task_note.startswith("отклонено"):
+                status += f" ⚠️ Переход не состоялся: {task_note}."
+            else:
+                status += f" 📋 Задача — {task_note}."
+        elif task_call is not None and not task_call.ok:
+            status += (
+                f" ⚠️ Трекер задачи не удался ({task_call.error}) — состояние "
+                f"задачи не тронуто."
+            )
         # Поле ввода чистим только при успехе; при ошибке вопрос остаётся
         # в поле, чтобы его можно было отправить повторно.
-        message_update = ""
-    else:
-        status = f"❌ {reply.error}"
-        service = reply.service_call
-        if service is not None and service.ok:
-            # Применённое обновление до упавшего вызова уже оплачено и
-            # сохранено: следующий вопрос уйдёт с ним, и это не должно стать
-            # сюрпризом.
-            status += (
-                f" 🧵 Перед вызовом при этом сработал служебный вызов — "
-                f"{service.label}: {service.memory_update} — применённая "
-                f"память уйдёт со следующим вопросом."
-            )
-        memory_call = reply.memory_call
-        if memory_call is not None and memory_call.ok:
-            status += (
-                f" 🧠 Разбор памяти перед вызовом при этом применился — "
-                f"{memory_call.memory_update} — рабочая память уйдёт со "
-                f"следующим вопросом."
-            )
-        message_update = gr.update()
+        return status
+    status = f"❌ {reply.error}"
+    service = reply.service_call
+    if service is not None and service.ok:
+        # Применённое обновление до упавшего вызова уже оплачено и
+        # сохранено: следующий вопрос уйдёт с ним, и это не должно стать
+        # сюрпризом.
+        status += (
+            f" 🧵 Перед вызовом при этом сработал служебный вызов — "
+            f"{service.label}: {service.memory_update} — применённая "
+            f"память уйдёт со следующим вопросом."
+        )
+    memory_call = reply.memory_call
+    if memory_call is not None and memory_call.ok:
+        status += (
+            f" 🧠 Разбор памяти перед вызовом при этом применился — "
+            f"{memory_call.memory_update} — рабочая память уйдёт со "
+            f"следующим вопросом."
+        )
+    if reply.task_event:
+        status += (
+            f" 📋 Переход трекера задачи перед вызовом при этом применился — "
+            f"{reply.task_note} — состояние уйдёт со следующим вопросом."
+        )
+    return status
+
+
+def on_send(agent: Agent | None, message: str, preset_name: str):
+    """Ход диалога. Вся работа — один вызов `agent.ask()`: стек сообщений
+    ведёт агент, интерфейс только перерисовывает его состояние.
+
+    Функция намеренно не генератор: Gradio показывает нормальный оверлей
+    ожидания (спиннер и таймер) только для функций с одним `return`.
+    """
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    message = (message or "").strip()
+    if not message:
+        return (
+            agent,
+            gr.update(),
+            *_view(agent, "Введите вопрос — пустой запрос в модель не уходит."),
+        )
+
+    reply = agent.ask(message)
+    status = _reply_status(agent, reply)
+    message_update = "" if reply.ok else gr.update()
 
     # Если есть кандидаты — это главное в статусе (§7.4): человеку есть что
     # решить, и без его решения в долговременную память ничего не попадёт.
@@ -2052,8 +2348,11 @@ def on_fork(agent: Agent | None, checkpoint_choice: str | None, preset_name: str
     # снимка checkpoint'а, долговременную — от родителя тем же хранилищем
     # (день 11, §7.1). Роутер — тоже свежий («авто», без режима прошлого
     # хода), хранилище профиля ветка берёт у родителя (день 12, §5.7).
+    # Автомат задачи — тоже свежий, с состоянием и журналом из снимка
+    # checkpoint'а, переключатель включён (день 13, §5.8).
     branch = agent.fork(
-        checkpoint_id, session_id, make_strategies(), make_memory(), make_router()
+        checkpoint_id, session_id, make_strategies(), make_memory(),
+        make_router(), make_task_machine(),
     )
     if branch is None:
         return (
@@ -2227,6 +2526,91 @@ def on_reject_candidates(agent: Agent | None, keys: list[str] | None, preset_nam
             f"Отклонено: {', '.join(decision.keys)} — в долговременную память "
             f"не попало; сказанное осталось в истории разговора."
         )
+    return (agent, gr.update(), *_view(agent, status))
+
+
+# --- Состояние задачи: обработчики (день 13, §7.2) -------------------------
+
+def on_start_task(agent: Agent | None, message: str, preset_name: str):
+    """«Начать задачу с этим сообщением» — текст поля ввода становится
+    целью; следом сразу `ask(message)` тем же сообщением, старт и первый
+    ответ — один клик. Отказ не зовёт `ask()`; поле ввода не очищается —
+    ни отказом, ни упавшим ответом."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    message = (message or "").strip()
+    if not message:
+        return (
+            agent,
+            gr.update(),
+            *_view(agent, "Введите цель задачи — ей станет текст поля ввода."),
+        )
+
+    outcome = agent.start_task(message)
+    if not outcome.changed:
+        return (
+            agent,
+            gr.update(),
+            *_view(agent, f"❌ Задача не начата: {outcome.rejection.reason}."),
+        )
+
+    reply = agent.ask(message)
+    status = (
+        f"📋 Задача начата — этап «планирование»: цель — ваше сообщение, "
+        f"план предложит ассистент, утверждаете его вы словами. "
+        f"{_reply_status(agent, reply)}"
+    )
+    message_update = "" if reply.ok else gr.update()
+    return (agent, message_update, *_view(agent, status))
+
+
+def on_task_event(agent: Agent | None, preset_name: str, *, event: str):
+    """«Пауза», «Продолжить» и «Отменить задачу» — одна функция на три
+    кнопки: событие передаёт `functools.partial` при подписке (`event` —
+    keyword-only, чтобы позиционные входы Gradio не столкнулись с ним)."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    outcome = agent.task_event(event)
+    if not outcome.changed:
+        allowed = ", ".join(agent.task_view.allowed_human) if agent.task_view else ""
+        status = f"Переход «{event}» не выполнен: {outcome.rejection.reason}."
+        if allowed:
+            status += f" Допустимо сейчас: {allowed}."
+    elif event == EVENT_PAUSE:
+        view = agent.task_view
+        status = (
+            f"📋 Задача: пауза — {view.stage}, {view.step_text}. Ожидается: "
+            f"{view.expected}. Вопросы задавайте как обычно — задача не "
+            f"сдвинется."
+        )
+    elif event == EVENT_RESUME:
+        view = agent.task_view
+        status = (
+            f"📋 Задача: продолжена — {view.stage}, {view.step_text}. "
+            f"Следующий ответ начнётся с напоминания, где остановились."
+        )
+    else:  # EVENT_CANCEL
+        status = (
+            "📋 Задача отменена. Новую можно начать кнопкой «Начать задачу "
+            "с этим сообщением»."
+        )
+    return (agent, gr.update(), *_view(agent, status))
+
+
+def on_task_in_request(agent: Agent | None, enabled: bool, preset_name: str):
+    """«Состояние задачи в запросе» — меняет запрос, а не задачу (§5.6):
+    трекер вызывается и переходы применяются при любом положении."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    agent.set_task_in_request(bool(enabled))
+    state_word = "включено" if agent.task_in_request else "выключено"
+    status = (
+        f"Состояние задачи в запросе: {state_word}. Трекер продолжает вести "
+        f"задачу; стек, память и задача не тронуты."
+    )
     return (agent, gr.update(), *_view(agent, status))
 
 
@@ -2417,25 +2801,48 @@ _PROFILE_SCENARIO_LABELS: list[str] = [
     "Р8 · граница (после смены профиля на Б)",
 ]
 
+# --- Сценарий проверки состояния задачи: подписи для gr.Examples (день 13,
+# §7.6, §9.1). Тексты живут в `presets.py` (`TASK_SCENARIO`), здесь только
+# подписи и порядок показа под чатом.
+_TASK_SCENARIO_LABELS: list[str] = [
+    "З1 · цель — кнопкой «Начать задачу»",
+    "З2 · пауза на планировании",
+    "В1 · вопрос на паузе",
+    "В2 · вопрос на паузе",
+    "В3 · вопрос на паузе (цель и план выпадают из окна)",
+    "З3 · продолжение планирования",
+    "З4 · план утверждён",
+    "Г · шаг выполнен (повторять)",
+    "З5 · пауза на выполнении",
+    "В4 · вопрос на паузе",
+    "В5 · вопрос на паузе",
+    "В6 · вопрос на паузе (объяснение шага выпадает из окна)",
+    "З6 · продолжение выполнения (после перезапуска / в ветке)",
+    "З7 · возврат к несуществующему шагу — отказ",
+    "З8 · после кнопок «Пауза»/«Продолжить»",
+    "З9 · проверка не пройдена — возврат к шагу",
+    "Д · проверка пройдена (повторять)",
+]
+
 
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 12: агент отвечает по-разному в зависимости от того, кто "
-        "спрашивает и зачем. **Профиль** — настройки, которые вы задаёте "
-        "сами в редакторе слева: как к вам обращаться, на каком языке, "
-        "какой у вас уровень, и режимы под задачу («За столом», «Учу "
-        "новичка», «Разбор после партии»). Профиль уходит в каждый запрос "
-        "**блоком сразу за системным промптом**, а режим на конкретный ход "
-        "выбирает либо роутер (переключатель «авто»), либо вы сами. Это не "
-        "память и не пресет: память (ниже) — то, что агент **узнал** из "
-        "разговоров, профиль — то, что вы **задали сами**; пресет выбирает "
-        "разработчик, профиль — пользователь. У агента по-прежнему три слоя "
-        "памяти разного времени жизни (день 11): **краткосрочная** — "
-        "разговор этой сессии, **рабочая** — данные текущей партии, "
-        "**долговременная** — игрок вообще, с записью только по вашему "
-        "согласию. Стратегии, checkpoint'ы и ветки дня 10 работают как "
-        "раньше. Сценарий проверки персонализации — под чатом."
+        "День 13: у агента появилось **состояние задачи** — конечный "
+        "автомат с этапом (планирование → выполнение → проверка → готово), "
+        "текущим шагом, ожидаемым действием и планом с отметками. Пауза — "
+        "не отдельный этап, а флаг на любом активном этапе. Событие для "
+        "перехода называет трекер (служебный вызов перед ответом) по "
+        "разговору или вы сами кнопками под чатом; допустим ли переход, "
+        "решает таблица переходов (аккордеон справа), а не модель. Задачу "
+        "начинает и отменяет только человек. Блок состояния уходит в запрос "
+        "**сразу за рабочей памятью**, поэтому пауза и продолжение не "
+        "зависят от того, что осталось в окне контекста. Это не слой "
+        "памяти и не режим профиля: рабочая память (ниже) помнит, **что** "
+        "известно о партии, состояние задачи — **где мы в работе** и чего "
+        "ждём. Профиль, слои памяти, стратегии, checkpoint'ы и ветки "
+        "работают как раньше. Сценарий проверки состояния задачи — под "
+        "чатом."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -2528,6 +2935,19 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "не профиль — он никуда не девается."
                 ),
             )
+            # «Состояние задачи в запросе» (день 13, §7.3) — сразу под
+            # «Профилем в запросе»: ещё один переключатель того, что уходит
+            # в модель, и снова не того, чем занят автомат.
+            task_in_request_checkbox = gr.Checkbox(
+                value=True,
+                label="Состояние задачи в запросе",
+                info=(
+                    "Выключенный блок не уходит в модель, но трекер "
+                    "продолжает вести задачу, и включённый обратно блок "
+                    "сразу актуален. Начинают и завершают задачу кнопки под "
+                    "чатом."
+                ),
+            )
 
             # Формат значения — список сообщений {"role", "content"}, то есть
             # ровно `agent.history`. Аргумент `type="messages"` из спецификации
@@ -2551,6 +2971,20 @@ with gr.Blocks(title="TooManyRules") as demo:
                 new_agent_btn = gr.Button("Новый агент", scale=1)
                 delete_agent_btn = gr.Button(
                     "Удалить агент", variant="stop", scale=1
+                )
+            # Ряд кнопок задачи (день 13, §7.2) — сразу под рядом «Отправить
+            # / Сбросить диалог / Новый агент / Удалить агент»: старт задачи
+            # идёт от поля ввода, поэтому рядом с ним. Кнопки активны
+            # всегда — недопустимое нажатие отклоняет автомат, и в статусе
+            # видно почему (это часть проверки, а не недосмотр интерфейса).
+            with gr.Row():
+                start_task_btn = gr.Button(
+                    "Начать задачу с этим сообщением", variant="primary", scale=2
+                )
+                pause_task_btn = gr.Button("⏸ Пауза", scale=1)
+                resume_task_btn = gr.Button("▶ Продолжить", scale=1)
+                cancel_task_btn = gr.Button(
+                    "Отменить задачу", variant="stop", scale=1
                 )
             # Ряд checkpoint'ов и веток (день 10): своя строка под кнопками
             # чата — жест здесь другой, чем у кнопок выше (они не трогают
@@ -2693,6 +3127,22 @@ with gr.Blocks(title="TooManyRules") as demo:
                 label="Сценарий проверки профиля (В1, Р1-Р8 — см. §9 спецификации дня 12)",
             )
 
+            # Сценарий проверки состояния задачи (день 13, §7.6, §9.1): З1-З9,
+            # В1-В6, Г и Д (Г и Д повторяются — по строке в списке, отправка
+            # несколько раз). Клик кладёт текст в поле ввода; З1 отправляется
+            # кнопкой «Начать задачу с этим сообщением», остальные — «Отправить».
+            gr.Examples(
+                examples=[[text] for text in TASK_SCENARIO],
+                inputs=[question_input],
+                example_labels=_TASK_SCENARIO_LABELS,
+                examples_per_page=len(TASK_SCENARIO),
+                label=(
+                    "Сценарий проверки состояния задачи (З1-З9, В1-В6, Г и Д "
+                    "— см. docs/TooManyRules — День 13 проверка состояния "
+                    "задачи.md)"
+                ),
+            )
+
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=2):
             gr.Markdown("## Дебаг-панель")
@@ -2711,6 +3161,14 @@ with gr.Blocks(title="TooManyRules") as demo:
             # «Контекстом»: сначала что агент знает, потом что из этого
             # отправляется.
             layers_md = gr.Markdown("")
+            # «Состояние задачи» (день 13, §7.4) — сразу под «Слоями памяти»,
+            # в порядке блоков запроса: задача встаёт за рабочей памятью.
+            task_md = gr.Markdown("")
+            # Таблица автомата — в аккордеоне, закрыт по умолчанию; собрана
+            # один раз при построении интерфейса, в `_view()` не входит:
+            # таблица статична.
+            with gr.Accordion("Автомат задачи — таблица переходов", open=False):
+                gr.Markdown(_task_transitions_table_md())
             # Сначала «что отправляем» (день 9), потом «сколько это от окна»
             # (день 8): блок контекста стоит над бюджетом, а сводка — сразу
             # под ним, потому что объясняет числа над собой.
@@ -2839,8 +3297,8 @@ with gr.Blocks(title="TooManyRules") as demo:
             )
 
     # Порядок выходов совпадает с порядком значений в `_view()`. Значения
-    # дня 10, дня 11 и дня 12 — в конце списка, как и в кортеже `_view()`
-    # (§7.7).
+    # дня 10, дня 11, дня 12 и дня 13 — в конце списка, как и в кортеже
+    # `_view()` (§7.7).
     VIEW_OUTPUTS = [
         chatbot,
         status_md,
@@ -2871,6 +3329,8 @@ with gr.Blocks(title="TooManyRules") as demo:
         profile_dropdown,
         profile_md,
         profile_file_json,
+        task_in_request_checkbox,
+        task_md,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
     # Выходы формы редактора профиля (день 12, §7.3) — отдельно от
@@ -2999,6 +3459,40 @@ with gr.Blocks(title="TooManyRules") as demo:
     profile_dropdown.select(
         on_profile_choice,
         inputs=[agent_state, profile_dropdown, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+
+    # Кнопки задачи (день 13, §7.2) — активны всегда, недопустимое нажатие
+    # отклоняет автомат. «Начать задачу» знает содержимое поля ввода — цель;
+    # остальные три кнопки — один обработчик на всех, событие передаёт
+    # `functools.partial`.
+    start_task_btn.click(
+        on_start_task,
+        inputs=[agent_state, question_input, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    pause_task_btn.click(
+        functools.partial(on_task_event, event=EVENT_PAUSE),
+        inputs=[agent_state, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    resume_task_btn.click(
+        functools.partial(on_task_event, event=EVENT_RESUME),
+        inputs=[agent_state, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    cancel_task_btn.click(
+        functools.partial(on_task_event, event=EVENT_CANCEL),
+        inputs=[agent_state, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # «Состояние задачи в запросе» — `input`, тем же правилом и по тому же
+    # замеру, что «Слои памяти в запросе» (`gr.Checkbox` ведёт себя как
+    # `gr.CheckboxGroup` в Gradio 6.26): один запрос на клик, не срабатывает
+    # на программное обновление из `_view()`.
+    task_in_request_checkbox.input(
+        on_task_in_request,
+        inputs=[agent_state, task_in_request_checkbox, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
 

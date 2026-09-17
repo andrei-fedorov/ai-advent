@@ -49,6 +49,15 @@
 # без них агент ведёт себя ровно как на дне 11. Роутер — третья служебная
 # работа вокруг `_call_service_model()`; блок профиля встаёт в запрос сразу
 # за системным промптом, перед слоями памяти.
+#
+# День 13 добавляет состояние задачи — конечный автомат (`task_state.TaskMachine`),
+# ещё одна необязательная зависимость: без неё агент ведёт себя ровно как на
+# дне 12. Трекер — четвёртая служебная работа вокруг `_call_service_model()`,
+# идёт после роутера и перед сборкой запроса; блок состояния задачи встаёт
+# сразу за рабочей памятью, перед памятью стратегии. Задачу начинает и
+# отменяет только человек — кнопками (`start_task()`, `task_event()`); этап и
+# шаг меняет только таблица переходов в `task_state.py`, агент лишь применяет
+# её решения и сохраняет их.
 
 import copy
 import functools
@@ -66,6 +75,7 @@ from openai import OpenAI
 
 import context
 import memory
+import task_state
 import tokens
 import user_profile
 
@@ -131,6 +141,10 @@ MEMORY_CALL_LABEL = "Слои памяти"
 # входит ни в `service_*` (цена памяти стратегий), ни в `memory_*` (цена
 # разбора памяти).
 ROUTE_CALL_LABEL = "Роутер профиля"
+
+# То же для трекера задачи (день 13) — подпись живёт в `task_state.py`
+# (`TASK_CALL_LABEL`, как `MEMORY_CALL_LABEL`/`ROUTE_CALL_LABEL` здесь): своя
+# цена, не входит ни в `service_*`, ни в `memory_*`, ни в `route_*`.
 
 # Слои в запросе по умолчанию — все переключаемые. Отдельное имя, а не
 # `memory.REQUEST_LAYERS` на месте: в конструкторе и в `fork()` имя `memory`
@@ -282,6 +296,16 @@ class AgentReply:
     route_call: ServiceCall | None = None
     profile_mode: str = ""
     profile_note: str = ""
+    # Поля дня 13 — в конце. `task_call` — вызов трекера задачи этого хода;
+    # `None` — трекер не вызывался (задачи нет, конечный этап, пустой вопрос,
+    # ход «Начать задачу» или повтор на месте истории, где переход трекера
+    # уже применён). `task_event` — событие перехода трекера этого хода,
+    # `""` — перехода не было; `task_note` — `Outcome.note` трекера этого
+    # хода, в том числе «событий нет» и отказ, `""` — трекер не вызывался или
+    # не разобрался.
+    task_call: ServiceCall | None = None
+    task_event: str = ""
+    task_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -332,6 +356,18 @@ class TurnStats:
     route_tokens: int = 0
     route_cost_usd: float | None = None
     route_elapsed: float = 0.0
+    # Поля дня 13 — снова в конце: корзина блока задачи в оценке запроса
+    # хода, этап и шаг после хода (`""`/0 — задачи нет), событие перехода
+    # трекера этого хода и цена трекера — своя колонка, а не часть
+    # `service_*`/`memory_*`/`route_*` (спецификация дня 13, §5.9).
+    task_tokens: int = 0
+    task_stage: str = ""
+    task_step: int = 0
+    task_paused: bool = False
+    task_event: str = ""
+    tracker_tokens: int = 0
+    tracker_cost_usd: float | None = None
+    tracker_elapsed: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -379,6 +415,11 @@ class Checkpoint:
     # этого ключа даёт ветку с пустой рабочей памятью (спецификация дня 11,
     # §5.7). Кандидатов в снимке нет — они вопрос к человеку, а не память.
     working: dict = field(default_factory=dict)
+    # Поле дня 13 — в конце и с умолчанием: снимок состояния задачи
+    # (`task_state.TaskMachine.dump()`) на момент сохранения, тем же
+    # приёмом, что снимок рабочей памяти. Ветка получает его копию и дальше
+    # у родителя и у ветки задача идёт независимо (спецификация дня 13, §5.8).
+    task: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -679,6 +720,11 @@ class Agent:
         # вызывается (§5.1).
         profile: ProfileStore | None = None,
         router: "user_profile.ModeRouter | None" = None,
+        # Зависимость дня 13 (§5.1) — снова в конце и необязательная:
+        # `task=None` — автомата нет, агент ведёт себя ровно как на дне 12.
+        # Свой у каждого агента (`presets.make_task_machine()`), как модель
+        # памяти и роутер: задача относится к конкретной сессии.
+        task: "task_state.TaskMachine | None" = None,
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -693,6 +739,14 @@ class Agent:
         # зависимости в конце», что и у памяти.
         self._profile = profile
         self._router = router
+        # Автомат задачи (день 13) — тем же порядком, до чтения хранилища:
+        # состояние задачи читает тот же `_load_context()`, что и рабочая
+        # память.
+        self._task = task
+        # Положение переключателя «Состояние задачи в запросе» — состояние
+        # агента, но не диалога (§5.6): на диск не едет, в checkpoint не
+        # входит, у нового, восстановленного агента и у ветки — включено.
+        self._task_in_request: bool = True
         # Какие слои уходят в запрос — состояние агента, но не диалога
         # (§2.5): на диск не едет, в checkpoint не входит, у нового,
         # восстановленного агента и у ветки включены оба.
@@ -744,6 +798,13 @@ class Agent:
             "route_calls": 0,
             "route_tokens": 0,
             "route_cost_usd": 0.0,
+            # Счётчики дня 13: трекер задачи. Считается в общих счётчиках
+            # выше, как любой вызов, но не в `service_*`, `memory_*` и
+            # `route_*` — у каждой служебной работы своя цена (спецификация
+            # дня 13, §5.9).
+            "tracker_calls": 0,
+            "tracker_tokens": 0,
+            "tracker_cost_usd": 0.0,
         }
         # Журнал ходов (день 8). Ведёт себя как счётчики агента, а не как стек
         # сообщений: `reset()` его не чистит, на диск он не едет, и после
@@ -838,19 +899,19 @@ class Agent:
             logger.info(
                 "[%s] агент создан как ветка от %s · %s: общий префикс %d "
                 "сообщ., стратегия «%s», память стратегий из снимка "
-                "checkpoint'а%s%s; живых агентов: %d",
+                "checkpoint'а%s%s%s; живых агентов: %d",
                 self._log_name, self._branch.parent, self._branch.checkpoint,
                 self._branch.messages, self._strategy_name, self._layers_note(),
-                self._profile_note(), process_stats()["agents_alive"],
+                self._profile_note(), self._task_note(), process_stats()["agents_alive"],
             )
         else:
             logger.info(
                 "[%s] агент создан: model=%s thinking=%s стратегия=«%s» "
-                "восстановлено из хранилища=%d сообщ.%s%s%s, живых агентов: %d",
+                "восстановлено из хранилища=%d сообщ.%s%s%s%s, живых агентов: %d",
                 self._log_name, config.model, _thinking_label(config.thinking),
                 self._strategy_name, self._restored_messages,
                 _memory_note(self.strategy.describe(self._messages)),
-                self._layers_note(), self._profile_note(),
+                self._layers_note(), self._profile_note(), self._task_note(),
                 process_stats()["agents_alive"],
             )
         # Сбой загрузки логируется здесь, а не на месте: до регистрации в
@@ -1073,6 +1134,12 @@ class Agent:
         profile = self._profile_snapshot()
         mode_choice, route_call = self._run_route_task(client, user_message, profile)
 
+        # Трекер задачи (день 13, §5.2) — после роутера и до сборки. Переход
+        # сохраняется сразу, до основного вызова (§2.6): падение основного
+        # вызова не должно его терять. Сбой трекера ход не отменяет —
+        # состояние остаётся прежним, основной вызов идёт с ним.
+        task_outcome, task_call = self._run_task_tracker(client, user_message)
+
         # Счёт до запроса (день 8): считаем ровно тот список сообщений, который
         # сейчас уйдёт в API, — и логируем бюджет до вызова, а не после.
         # Сборка и расчёт идут одним вызовом, чтобы «что отправляем» и «что
@@ -1112,6 +1179,9 @@ class Agent:
                 route_call=route_call,
                 profile_mode=mode_choice.mode or "",
                 profile_note=mode_choice.note,
+                task_call=task_call,
+                task_event=task_outcome.event if task_outcome and task_outcome.changed else "",
+                task_note=task_outcome.note if task_outcome is not None else "",
             )
         elapsed = time.perf_counter() - started
 
@@ -1152,6 +1222,9 @@ class Agent:
             route_call=route_call,
             profile_mode=mode_choice.mode or "",
             profile_note=mode_choice.note,
+            task_call=task_call,
+            task_event=task_outcome.event if task_outcome and task_outcome.changed else "",
+            task_note=task_outcome.note if task_outcome is not None else "",
         )
 
         if self._config.keep_history:
@@ -1160,7 +1233,7 @@ class Agent:
             self._persist()
 
         self._record(reply)
-        self._record_turn(reply, history_before, view, service, memory_call, route_call)
+        self._record_turn(reply, history_before, view, service, memory_call, route_call, task_call)
         logger.info(
             "[%s] model=%s thinking=%s finish_reason=%s time=%.2fs "
             "tokens(prompt/completion/total)=%s/%s/%s "
@@ -1200,6 +1273,10 @@ class Agent:
         С дня 12 сброс дополнительно зовёт `router.reset()`: режим прошлого
         хода ушёл вместе с диалогом. Положение переключателя «Профиль в
         запросе» и сам профиль сброс не трогает — они не диалог (§5.7).
+
+        С дня 13 сброс дополнительно зовёт `task.reset()`: задача пришла из
+        этого диалога и уходит вместе с ним. Переключатель «Состояние
+        задачи в запросе» сброс не трогает (§5.8).
         """
         self._messages = []
         for strategy in self._strategies.values():
@@ -1208,12 +1285,15 @@ class Agent:
             self._memory.reset()
         if self._router is not None:
             self._router.reset()
+        if self._task is not None:
+            self._task.reset()
         self._checkpoints = []
         self._branch = None
         self._persist()
         logger.info(
             "[%s] стек сообщений очищен (reset); память стратегий (%s), "
-            "checkpoint'ы и происхождение ветки очищены вместе с ним%s",
+            "checkpoint'ы и происхождение ветки очищены вместе с ним%s; "
+            "состояние задачи — тоже",
             self._log_name, ", ".join(f"«{name}»" for name in self._strategies),
             (
                 f"; рабочая память и кандидаты — тоже, долговременная память "
@@ -1250,7 +1330,12 @@ class Agent:
         working = (
             copy.deepcopy(self._memory.dump()) if self._memory is not None else {}
         )
-        existing = self._unchanged_checkpoint(memory, working)
+        # Снимок состояния задачи (день 13, §5.8) — тем же приёмом: переход
+        # трекера тоже меняет задачу без удлинения истории.
+        task_snapshot = (
+            copy.deepcopy(self._task.dump()) if self._task is not None else {}
+        )
+        existing = self._unchanged_checkpoint(memory, working, task_snapshot)
         if existing is not None:
             logger.info(
                 "[%s] checkpoint не сохранён: совпадает с существующим %s",
@@ -1265,18 +1350,24 @@ class Agent:
             memory=memory,
             created_at=_now_iso(),
             working=working,
+            task=task_snapshot,
         )
         self._checkpoints.append(checkpoint)
         self._persist()
         logger.info(
             "[%s] checkpoint %s: %d сообщ., стратегия «%s», снимок памяти "
-            "стратегий: %s%s",
+            "стратегий: %s%s%s",
             self._log_name, checkpoint.id, checkpoint.messages,
             checkpoint.strategy, ", ".join(memory) if memory else "нет памяти",
             (
                 f", снимок рабочей памяти: "
                 f"{len(working.get('entries') or {})} зап."
                 if self._memory is not None
+                else ""
+            ),
+            (
+                f", снимок задачи: {task_snapshot.get('stage')}"
+                if task_snapshot
                 else ""
             ),
         )
@@ -1290,6 +1381,7 @@ class Agent:
         strategies: dict[str, context.ContextStrategy] | None = None,
         memory: "memory.AgentMemory | None" = None,
         router: "user_profile.ModeRouter | None" = None,
+        task: "task_state.TaskMachine | None" = None,
     ) -> "Agent | None":
         """Создаёт ветку от одного из checkpoint'ов этой сессии: новый агент
         с новой сессией, в историю которого скопирован префикс до
@@ -1310,6 +1402,12 @@ class Agent:
         прошлого хода нет) и то же хранилище профиля, что у родителя, тем же
         объектом: профиль пользователя не привязан к диалогу. В checkpoint
         профиль и переключатель не входят.
+
+        С дня 13 (§5.8) ветка получает свежий автомат задачи (`task`) с
+        состоянием и журналом из снимка checkpoint'а. Дальше у родителя и у
+        ветки задача идёт независимо: пауза, отмена или новый шаг в одной не
+        трогают другую. Переключатель «Состояние задачи в запросе» у ветки —
+        включён, как у нового агента.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -1347,6 +1445,10 @@ class Agent:
             # Рабочая память ветки — копия снимка, а не ссылка: дальше у
             # родителя и у ветки она пишется независимо (день 11, §5.7).
             seed["context"]["working"] = copy.deepcopy(checkpoint.working)
+        if checkpoint.task:
+            # Состояние задачи ветки — копия снимка, тем же приёмом (день 13,
+            # §5.8).
+            seed["context"]["task"] = copy.deepcopy(checkpoint.task)
         return Agent(
             self._config,
             session_id=session_id,
@@ -1357,6 +1459,7 @@ class Agent:
             long_term=self._long_term,
             profile=self._profile,
             router=router,
+            task=task,
         )
 
     @_locked
@@ -1498,6 +1601,86 @@ class Agent:
             keys=[candidate.key for candidate in dropped], error=None
         )
 
+    @property
+    def task_view(self) -> "task_state.TaskView | None":
+        """Что про задачу показывают панель и статус (день 13, §5.4); `None`
+        — автомата у агента нет. Чистое чтение, без замка."""
+        if self._task is None:
+            return None
+        return self._task.describe(self._messages)
+
+    @_locked
+    def start_task(self, goal: str) -> "task_state.Outcome":
+        """«Начать» от человека на текущей длине истории (день 13, §5.4).
+        Сам вопрос в модель не отправляет: интерфейс зовёт `ask(goal)`
+        следом, и на этом ходе трекер не вызывается — переход «начать» на
+        этом же месте истории уже применён. Под замком агента: во время
+        чужого хода задача дождётся его конца."""
+        if self._task is None:
+            return task_state.Outcome(
+                False, task_state.EVENT_NONE, "у агента нет автомата задачи", None
+            )
+        if not self._config.keep_history:
+            return task_state.Outcome(
+                False, task_state.EVENT_NONE,
+                "у агента без истории задач нет", None,
+            )
+        outcome = self._task.start(goal, self._messages, _now_iso())
+        if outcome.changed:
+            self._persist()
+            logger.info(
+                "[%s] задача: %s; трекер на этом ходе не вызывается",
+                self._log_name, outcome.note,
+            )
+        else:
+            logger.info(
+                "[%s] задача: %s", self._log_name, outcome.note,
+            )
+        return outcome
+
+    @_locked
+    def task_event(self, event: str) -> "task_state.Outcome":
+        """«Пауза», «продолжить» или «отменить» от человека (день 13, §5.4).
+        Под замком по той же причине: пауза, нажатая во время хода, встанет
+        после перехода, который этот ход уже сделал."""
+        if self._task is None:
+            return task_state.Outcome(
+                False, task_state.EVENT_NONE, "у агента нет автомата задачи", None
+            )
+        if not self._config.keep_history:
+            return task_state.Outcome(
+                False, task_state.EVENT_NONE,
+                "у агента без истории задач нет", None,
+            )
+        outcome = self._task.fire(event, self._messages, _now_iso())
+        if outcome.changed:
+            self._persist()
+        logger.info("[%s] задача: %s", self._log_name, outcome.note)
+        return outcome
+
+    @property
+    def task_in_request(self) -> bool:
+        """Положение переключателя «Состояние задачи в запросе» (день 13,
+        §5.6)."""
+        return self._task_in_request
+
+    @_locked
+    def set_task_in_request(self, enabled: bool) -> bool:
+        """Меняет запрос, а не состояние (день 13, §5.6): трекер вызывается
+        при любом положении, переходы применяются и пишутся. `False` —
+        автомата нет или значение не изменилось. Стек, файл сессии, память и
+        задача не трогаются, на диск ничего не пишется."""
+        if self._task is None or enabled == self._task_in_request:
+            return False
+        previous = self._task_in_request
+        self._task_in_request = enabled
+        logger.info(
+            "[%s] состояние задачи в запросе: %s → %s; трекер продолжает "
+            "вести задачу, стек, память и задача не тронуты",
+            self._log_name, previous, enabled,
+        )
+        return True
+
     def debug_state(self) -> dict:
         """Состояние агента для дебаг-панели: конфиг, стек, метрики
         последнего вызова, накопленное за время жизни и счётчики процесса."""
@@ -1597,6 +1780,15 @@ class Agent:
                 if self._profile is not None
                 else None
             ),
+            # Ключ дня 13 — в конце. `None` — автомата у агента нет.
+            "task": (
+                {
+                    "in_request": self._task_in_request,
+                    "view": asdict(self._task.describe(self._messages)),
+                }
+                if self._task is not None
+                else None
+            ),
         }
 
     # --- Внутреннее ------------------------------------------------------
@@ -1628,6 +1820,11 @@ class Agent:
         системного промпта, поэтому в итоге он оказывается перед слоями
         (порядок блоков — §2.4). `profile`/`mode_choice` — снимок и решение
         этого хода; `None` — взять свежие (панель).
+
+        День 13 дописывает блок состояния задачи (§5.5): `_with_task()`
+        вызывается первым — до слоёв и профиля, — поэтому в итоге он
+        оказывается последним из трёх, сразу за рабочей памятью и перед
+        памятью стратегии: порядок вызовов обратен порядку блоков.
         """
         if long_term is None:
             long_term = self._long_term_entries()
@@ -1638,8 +1835,23 @@ class Agent:
         messages = self.strategy.build(
             self._config.system_prompt, self._messages, user_message
         )
+        messages = self._with_task(messages)
         messages = self._with_layers(messages, long_term)
         return self._with_profile(messages, profile, mode_choice)
+
+    def _with_task(self, messages: list[dict]) -> list[dict]:
+        """Блок состояния задачи в готовом списке сообщений — единственное
+        место, где он туда попадает (спецификация дня 13, §5.5). Уходит
+        только если блок не `None` (задачи нет, или она на конечном этапе и
+        переход не свежий — решает `TaskMachine.block()`) и переключатель
+        «Состояние задачи в запросе» включён. Стратегии, модель памяти и
+        профиль о задаче не знают."""
+        if self._task is None or not self._task_in_request or not messages:
+            return messages
+        block = self._task.block(self._messages)
+        if block is None:
+            return messages
+        return messages[:1] + [block] + messages[1:]
 
     def _with_layers(self, messages: list[dict], long_term: dict) -> list[dict]:
         """Блоки слоёв памяти в готовом списке сообщений — единственное место,
@@ -1762,13 +1974,16 @@ class Agent:
         # База для сравнения: во сколько обошёлся бы тот же ход без всякого
         # управления контекстом. Считается тем же счётчиком по той же сборке,
         # только стратегией «Вся история». С дня 11 — с теми же слоями памяти,
-        # с дня 12 — с тем же профилем: экономия говорит только о стратегии,
-        # а не о том, что слои или профиль добавили.
+        # с дня 12 — с тем же профилем, с дня 13 — с тем же блоком задачи:
+        # экономия говорит только о стратегии, а не о том, что слои, профиль
+        # или задача добавили.
         full = self._count_messages(
             self._with_profile(
                 self._with_layers(
-                    _FULL_HISTORY.build(
-                        self._config.system_prompt, self._messages, question
+                    self._with_task(
+                        _FULL_HISTORY.build(
+                            self._config.system_prompt, self._messages, question
+                        )
                     ),
                     long_term,
                 ),
@@ -2206,6 +2421,133 @@ class Agent:
             )
         return choice, call
 
+    def _run_task_tracker(
+        self, client: OpenAI, question: str
+    ) -> tuple["task_state.Outcome | None", ServiceCall | None]:
+        """Трекер задачи перед ответом (спецификация дня 13, §5.3):
+        `prepare()` → `_call_service_model()` → `apply()`.
+
+        Задачи для трекера нет — `(None, None)`: нет автомата, нет истории,
+        задача не на активном этапе, вопрос пустой, ход «Начать задачу» или
+        повтор на месте истории, где переход трекера уже применён
+        (`task_state.TaskMachine.prepare()` сам это решает).
+
+        Сбой хода не отменяет (правило дня 9 для служебного вызова):
+        исключение API, пустой ответ и ответ, оборванный потолком, состояние
+        не трогают. **Обрезанный ответ здесь не применяется** — в отличие от
+        сводки, фактов и разбора памяти: оборванный ответ трекера — это
+        оборванный план, а утверждённый план с потерянными шагами пользователь
+        не заметит до этапа проверки (§2.4).
+        """
+        if self._task is None or not self._config.keep_history:
+            return None, None
+        task = self._task.prepare(self._messages, question)
+        if task is None:
+            return None, None
+
+        started = time.perf_counter()
+        try:
+            result = self._call_service_model(client, task.messages, task.max_tokens)
+        except Exception as exc:
+            logger.exception("[%s] трекер задачи упал", self._log_name)
+            call = ServiceCall(
+                kind="task", label=task.label, ok=False, error=str(exc),
+                elapsed=time.perf_counter() - started,
+                prompt_tokens=None, completion_tokens=None, total_tokens=None,
+                cost_usd=None, covers=0, folded_tokens=0, text="",
+                memory_label=task_state.TASK_CALL_LABEL,
+            )
+            self._record_task_tracker(call)
+            logger.warning(
+                "[%s] трекер задачи — %s: не удался (%s); ход не "
+                "отменяется — состояние задачи не тронуто",
+                self._log_name, task.label, call.error,
+            )
+            return None, call
+
+        text = result.text
+        if not text:
+            call = ServiceCall(
+                kind="task", label=task.label, ok=False,
+                error="модель вернула пустой ответ",
+                elapsed=result.elapsed,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens, cost_usd=result.cost_usd,
+                covers=0, folded_tokens=0, text="",
+                finish_reason=result.finish_reason,
+                memory_label=task_state.TASK_CALL_LABEL,
+            )
+            self._record_task_tracker(call)
+            logger.warning(
+                "[%s] трекер задачи — %s: модель вернула пустой ответ — "
+                "состояние задачи не тронуто",
+                self._log_name, task.label,
+            )
+            return None, call
+
+        if result.finish_reason == "length":
+            call = ServiceCall(
+                kind="task", label=task.label, ok=False,
+                error="ответ упёрся в потолок и оборван — не применён",
+                elapsed=result.elapsed,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens, cost_usd=result.cost_usd,
+                covers=0, folded_tokens=0, text=text,
+                finish_reason=result.finish_reason,
+                memory_label=task_state.TASK_CALL_LABEL,
+            )
+            self._record_task_tracker(call)
+            logger.warning(
+                "[%s] трекер задачи — %s: ответ упёрся в max_tokens=%s и "
+                "оборван на полуслове — НЕ применён (оборванный план хуже "
+                "отсутствия перехода); состояние задачи не тронуто",
+                self._log_name, task.label, task.max_tokens,
+            )
+            return None, call
+
+        outcome, parsed = self._task.apply(task, text, self._messages, _now_iso())
+        call = ServiceCall(
+            kind="task",
+            label=task.label,
+            ok=parsed,
+            error=None if parsed else "ответ трекера не разобран",
+            elapsed=result.elapsed,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            cost_usd=result.cost_usd,
+            covers=0,
+            folded_tokens=0,
+            text=text,
+            finish_reason=result.finish_reason,
+            memory_label=task_state.TASK_CALL_LABEL,
+            memory_update=outcome.note if parsed else "",
+        )
+        self._record_task_tracker(call)
+        # Переход сохраняется сразу, как разбор памяти: падение основного
+        # вызова не должно его терять (§2.6). Отказ и «событий нет» состояние
+        # не меняют — сохранять нечего.
+        if outcome.changed:
+            self._persist()
+        if not parsed:
+            logger.warning(
+                "[%s] трекер задачи — %s: ответ не разобран (начало: %r) — "
+                "состояние задачи не тронуто",
+                self._log_name, task.label, text[:200],
+            )
+        else:
+            logger.info(
+                "[%s] трекер задачи — %s → %s; finish_reason=%s %.2fs, "
+                "tokens=%s/%s/%s, cost=%s; ответ: %r",
+                self._log_name, task.label, outcome.note, result.finish_reason,
+                result.elapsed, _num(result.prompt_tokens),
+                _num(result.completion_tokens), _num(result.total_tokens),
+                _cost_str(result.cost_usd), text,
+            )
+        return outcome, call
+
     def _warn_stale_profile_choice(self, profile: "user_profile.UserProfile") -> None:
         """Устаревшее название режима в переключателе «Профиль в запросе»
         (день 12, §5.9): режима с таким именем в профиле больше нет.
@@ -2244,8 +2586,11 @@ class Agent:
 
         С дня 12 (§5.6) так же отделяется блок профиля: то, что начинается с
         `user_profile.PROFILE_HEADER`, — корзина `profile`; корзина `memory`
-        (память стратегии) — то, что не начинается ни с одного из трёх
+        (память стратегии) — то, что не начинается ни с одного из четырёх
         заголовков.
+
+        С дня 13 (§5.7) так же отделяется блок состояния задачи: то, что
+        начинается с `task_state.TASK_HEADER`, — корзина `task`.
         """
         middle = messages[1:-1]
         system = [
@@ -2253,7 +2598,7 @@ class Agent:
         ]
         named = (
             memory.LONG_TERM_HEADER, memory.WORKING_HEADER,
-            user_profile.PROFILE_HEADER,
+            user_profile.PROFILE_HEADER, task_state.TASK_HEADER,
         )
         return tokens.count_request(
             system_prompt=messages[0]["content"],
@@ -2268,6 +2613,9 @@ class Agent:
             ),
             profile="\n\n".join(
                 text for text in system if text.startswith(user_profile.PROFILE_HEADER)
+            ),
+            task="\n\n".join(
+                text for text in system if text.startswith(task_state.TASK_HEADER)
             ),
         )
 
@@ -2291,19 +2639,19 @@ class Agent:
         когда занято больше `WARN_RATIO`: приближение к лимиту должно быть
         видно в терминале, а не только в панели."""
         request = budget.request
-        # Слагаемые — в порядке блоков запроса (день 12, §2.4): профиль,
-        # долговременная и рабочая память стоят между системным промптом и
-        # памятью стратегии.
+        # Слагаемые — в порядке блоков запроса (день 13, §2.7): профиль,
+        # долговременная и рабочая память, задача стоят между системным
+        # промптом и памятью стратегии.
         logger.info(
             "[%s] бюджет: система %s + профиль %s + долговременная %s + "
-            "рабочая %s + память стратегии %s + история %s + вопрос %s + "
-            "служебные %s ≈ %s из %s доступных (%s); окно %s, резерв под "
-            "ответ %s",
+            "рабочая %s + задача %s + память стратегии %s + история %s + "
+            "вопрос %s + служебные %s ≈ %s из %s доступных (%s); окно %s, "
+            "резерв под ответ %s",
             self._log_name,
             _num(request.system), _num(request.profile), _num(request.long_term),
-            _num(request.working), _num(request.memory), _num(request.history),
-            _num(request.question), _num(request.overhead), _num(budget.used),
-            _num(budget.available), _ratio_str(budget.ratio),
+            _num(request.working), _num(request.task), _num(request.memory),
+            _num(request.history), _num(request.question), _num(request.overhead),
+            _num(budget.used), _num(budget.available), _ratio_str(budget.ratio),
             _num(budget.limit), _num(budget.answer_reserve),
         )
         if budget.level in ("warn", "danger", "over"):
@@ -2384,6 +2732,10 @@ class Agent:
         # запросе здесь нет никогда — они не состояние сессии.
         if self._memory is not None and (working := self._memory.dump()):
             data["working"] = working
+        # Состояние задачи (день 13, §5.8) — рядом с рабочей памятью и тем же
+        # правилом: только непустое.
+        if self._task is not None and (task_dump := self._task.dump()):
+            data["task"] = task_dump
         if self._checkpoints:
             data["checkpoints"] = [_checkpoint_dump(cp) for cp in self._checkpoints]
         if self._branch is not None:
@@ -2438,6 +2790,9 @@ class Agent:
         # Рабочая память (день 11) — тем же кодом и из файла сессии, и из
         # `seed` ветки.
         self._load_working(data.get("working"))
+        # Состояние задачи (день 13) — тем же приёмом и из файла сессии, и из
+        # `seed` ветки.
+        self._load_task(data.get("task"))
         # Checkpoint'ы и происхождение ветки (день 10) — тем же приёмом, что
         # память стратегий: мусор переживается с предупреждением, историю
         # читать это не мешает. `self._messages` здесь уже проставлены — и при
@@ -2469,6 +2824,30 @@ class Agent:
                 "рабочая память в файле прочитана не целиком (битые поля или "
                 "ключи вне рабочей части карты) — работаем с тем, что удалось "
                 "разобрать"
+            )
+
+    def _load_task(self, data: object) -> None:
+        """Состояние задачи из `context.task` (день 13, §5.8). Ключа нет —
+        пусто без предупреждений: это файл дня 12. Не словарь — пусто с
+        предупреждением. Мусор внутри словаря автомат переживает молча
+        (логов у `task_state.py` нет), и что прочитано не всё, агент узнаёт
+        сам приёмом дня 9: сравнивает `dump()` с прочитанным.
+
+        У агента без автомата состояние задачи из файла не читается — это
+        поведение дня 12, и первая запись перепишет блок `context` без неё."""
+        if self._task is None or data is None:
+            return
+        if not isinstance(data, dict):
+            self._startup_warnings.append(
+                f"состояние задачи в файле имеет тип {type(data).__name__} "
+                f"вместо словаря — задачи нет"
+            )
+            return
+        self._task.load(data)
+        if self._task.dump() != data:
+            self._startup_warnings.append(
+                "состояние задачи в файле прочитано не целиком (битые или "
+                "лишние поля) — работаем с тем, что удалось разобрать"
             )
 
     def _parse_checkpoints(self, data: object) -> list[Checkpoint]:
@@ -2538,9 +2917,21 @@ class Agent:
                 f"с пустым снимком"
             )
             working = {}
+        # Снимок состояния задачи (день 13, §5.8) — тем же приёмом.
+        task_snapshot = item.get("task")
+        if task_snapshot is None:
+            task_snapshot = {}
+        elif not isinstance(task_snapshot, dict):
+            self._startup_warnings.append(
+                f"checkpoint «{checkpoint_id}»: снимок задачи имеет тип "
+                f"{type(task_snapshot).__name__} вместо словаря — checkpoint "
+                f"прочитан с пустым снимком"
+            )
+            task_snapshot = {}
         return Checkpoint(
             id=checkpoint_id, messages=messages, strategy=strategy,
             memory=memory, created_at=created_at, working=working,
+            task=task_snapshot,
         )
 
     def _parse_branch(self, data: object) -> BranchOrigin | None:
@@ -2589,13 +2980,13 @@ class Agent:
         return max(numbers, default=0) + 1
 
     def _unchanged_checkpoint(
-        self, memory: dict, working: dict | None = None
+        self, memory: dict, working: dict | None = None, task: dict | None = None
     ) -> Checkpoint | None:
         """Последний checkpoint, если он совпадает с тем, что получился бы
         сейчас, — та же длина истории, та же стратегия, тот же снимок памяти
-        стратегий и (день 11) тот же снимок рабочей памяти. Только последний:
-        более ранний совпадающий checkpoint не должен мешать завести новый в
-        другой точке истории."""
+        стратегий, (день 11) тот же снимок рабочей памяти и (день 13) тот же
+        снимок задачи. Только последний: более ранний совпадающий checkpoint
+        не должен мешать завести новый в другой точке истории."""
         if not self._checkpoints:
             return None
         last = self._checkpoints[-1]
@@ -2604,6 +2995,7 @@ class Agent:
             and last.strategy == self._strategy_name
             and last.memory == memory
             and last.working == (working or {})
+            and last.task == (task or {})
         ):
             return last
         return None
@@ -2635,6 +3027,18 @@ class Agent:
             f", профиль: {self._profile.path} ({len(profile.modes)} "
             f"{_modes_word(len(profile.modes))}), в запросе: {choice}"
         )
+
+    def _task_note(self) -> str:
+        """Кусок строки «агент создан» про задачу (день 13, §5.9): «задачи
+        нет» или этап и шаг, с пометкой паузы."""
+        if self._task is None:
+            return ", автомата задачи нет"
+        state = self._task.state
+        if state is None:
+            return ", задачи нет"
+        view = self._task.describe(self._messages)
+        pause = ", на паузе" if view.paused else ""
+        return f", задача: {view.stage}, {view.step_text}{pause}"
 
     def _long_term_count_str(self) -> str:
         """«5 зап. в src/data/memory/long_term.json» — сколько записей
@@ -2673,13 +3077,16 @@ class Agent:
         route_call: ServiceCall | None = None,
         profile_mode: str = "",
         profile_note: str = "",
+        task_call: ServiceCall | None = None,
+        task_event: str = "",
+        task_note: str = "",
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
         случай, когда оценку хочется видеть. У ошибки без ключа считать нечего.
-        Разбор памяти (день 11) и роутер профиля (день 12), применённые до
-        упавшего вызова, уже оплачены и сохранены — они едут в ответ, чтобы
-        панель показала и их.
+        Разбор памяти (день 11), роутер профиля (день 12) и трекер задачи
+        (день 13), применённые до упавшего вызова, уже оплачены и сохранены —
+        они едут в ответ, чтобы панель показала и их.
         """
         reply = AgentReply(
             ok=False,
@@ -2700,6 +3107,9 @@ class Agent:
             route_call=route_call,
             profile_mode=profile_mode,
             profile_note=profile_note,
+            task_call=task_call,
+            task_event=task_event,
+            task_note=task_note,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
@@ -2713,6 +3123,7 @@ class Agent:
         service: ServiceCall | None,
         memory_call: ServiceCall | None = None,
         route_call: ServiceCall | None = None,
+        task_call: ServiceCall | None = None,
     ) -> None:
         """Строка журнала ходов — только на успешный вызов и после `_record()`:
         накопительные числа берутся из уже обновлённых счётчиков агента.
@@ -2755,6 +3166,16 @@ class Agent:
                 route_tokens=(route_call.total_tokens or 0) if route_call else 0,
                 route_cost_usd=route_call.cost_usd if route_call else None,
                 route_elapsed=route_call.elapsed if route_call else 0.0,
+                # Корзина задачи, этап и шаг после хода, событие перехода
+                # трекера этого хода и цена трекера (день 13, §5.9).
+                task_tokens=view.usage.request.task,
+                task_stage=self._task.state.stage if self._task and self._task.state else "",
+                task_step=self._task.state.step if self._task and self._task.state else 0,
+                task_paused=bool(self._task.state.paused) if self._task and self._task.state else False,
+                task_event=reply.task_event,
+                tracker_tokens=(task_call.total_tokens or 0) if task_call else 0,
+                tracker_cost_usd=task_call.cost_usd if task_call else None,
+                tracker_elapsed=task_call.elapsed if task_call else 0.0,
             )
         )
         # Экономия копится по ходам и может быть отрицательной: на коротком
@@ -2797,6 +3218,17 @@ class Agent:
         self._totals["route_calls"] += 1
         self._totals["route_tokens"] += call.total_tokens or 0
         self._totals["route_cost_usd"] += call.cost_usd or 0.0
+
+    def _record_task_tracker(self, call: ServiceCall) -> None:
+        """Учёт трекера задачи (день 13, §5.9): в общих счётчиках агента и
+        процесса — как любой вызов, и отдельно в своих `tracker_*`. Не в
+        `service_*`, `memory_*` и `route_*` — у каждой служебной работы своя
+        цена. В калибровку не идёт по той же причине, что остальные
+        служебные вызовы."""
+        self._record_extra_call(call)
+        self._totals["tracker_calls"] += 1
+        self._totals["tracker_tokens"] += call.total_tokens or 0
+        self._totals["tracker_cost_usd"] += call.cost_usd or 0.0
 
     def _record_extra_call(self, call: ServiceCall) -> None:
         """Общая часть учёта служебного вызова и разбора памяти: вызов, ошибка,
@@ -2876,12 +3308,15 @@ def _now_iso() -> str:
 
 
 def _checkpoint_dump(checkpoint: Checkpoint) -> dict:
-    """Checkpoint для файла сессии. Пустой снимок рабочей памяти (день 11) не
-    пишется — тем же правилом, что пустая память стратегий: checkpoint агента
-    без рабочей памяти выглядит на диске ровно как checkpoint дня 10."""
+    """Checkpoint для файла сессии. Пустой снимок рабочей памяти (день 11) и
+    пустой снимок задачи (день 13) не пишутся — тем же правилом, что пустая
+    память стратегий: checkpoint агента без них выглядит на диске ровно как
+    checkpoint дня 10."""
     data = asdict(checkpoint)
     if not data.get("working"):
         data.pop("working", None)
+    if not data.get("task"):
+        data.pop("task", None)
     return data
 
 
