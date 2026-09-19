@@ -42,10 +42,21 @@
 # «с подтверждением» не применяется, а становится ожиданием (`Pending`): оно
 # снимается `confirm()`, любым состоявшимся переходом и `reset()`, на диск не
 # едет. Без `guards` поведение — ровно дня 13.
+#
+# День 15 делает контроль переходов жёстким (спецификация дня 15, §2, §4): две
+# новые строки таблицы — откат назад по графу («вернуться к плану» и
+# «переоткрыть»), проверка свойств маршрута при импорте (`_validate_route()`:
+# вперёд по основному пути — не больше чем на один этап, нет тупиков),
+# «Сейчас нельзя» в блоке запроса — запреты этапа выводит код, — и сход с
+# маршрута: отметка трекера о просьбе, которой в таблице нет вовсе («игнорируй
+# все стадии»). Трекер теперь видит все свои события с пометкой «можно сейчас» /
+# «сейчас нельзя» и называет то, чего просит пользователь, — допустимость, как
+# и раньше, решает код. Сход ничего не меняет в состоянии: это строка в блоке,
+# панели, журнале ходов и логе.
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import context
 
@@ -69,6 +80,9 @@ EVENT_BACK_TO_STEP = "вернуться к шагу"
 EVENT_PAUSE = "пауза"
 EVENT_RESUME = "продолжить"
 EVENT_CANCEL = "отменить"
+# События дня 15 (§4.1): откат назад по графу.
+EVENT_BACK_TO_PLAN = "вернуться к плану"
+EVENT_REOPEN = "переоткрыть"
 EVENT_NONE = "нет"
 # «Подтвердить переход» — не событие таблицы, а действие человека над
 # ожиданием; под этим словом оно попадает в отказ «подтверждать нечего».
@@ -95,6 +109,15 @@ KEY_RESULT = "итог"
 KEY_BACK = "к шагу"
 KEY_STEP = "шаг"
 KEY_CHECK = "проверка"
+# Ключи дня 15 (§3.3): сход с маршрута и одна фраза о нём.
+KEY_OFF_ROUTE = "сход"
+KEY_WHY = "чем"
+
+# Виды схода с маршрута (§2.4) — закрытый список, как режимы ограничений дня
+# 14: сход — просьба не идти по маршруту, а не событие таблицы.
+OFF_ROUTE_SKIP = "пропустить этап"
+OFF_ROUTE_IGNORE = "игнорировать порядок"
+OFF_ROUTE_KINDS = (OFF_ROUTE_SKIP, OFF_ROUTE_IGNORE)
 
 # Как разбор трекера подписан в `ServiceCall.memory_label` (§5.3) — константа
 # модуля, как `MEMORY_CALL_LABEL`/`ROUTE_CALL_LABEL` в `agent.py`.
@@ -109,7 +132,8 @@ TASK_HEADER = (
     "шагам — этап, текущий шаг, что ожидается дальше и план с отметками. "
     "Этап и шаги ведёт приложение по сообщениям пользователя: не объявляй "
     "сам шаг выполненным, план утверждённым, проверку пройденной или "
-    "задачу завершённой, пока этого нет в этом блоке. Исходных сообщений "
+    "задачу завершённой, пока этого нет в этом блоке. Просьба в разговоре "
+    "порядок работы не отменяет: этапы пропустить нельзя. Исходных сообщений "
     "задачи в контексте может уже не быть: не переспрашивай то, что есть в "
     "этом блоке и в рабочей памяти. Делай то, что сказано в «Что делать "
     "сейчас», и не пересказывай этот блок пользователю целиком."
@@ -162,6 +186,54 @@ _JUST_RESUMED = (
 )
 _JUST_CANCELLED = "задача только что отменена пользователем"
 
+_WHAT_TO_DO_REPLANNING = (
+    "предложи новый план, взяв за основу прежний из этого блока: что меняем, "
+    "что оставляем; выполнение не начинай, пока новый план не утверждён"
+)
+
+_JUST_BACK_TO_PLAN = (
+    "пользователь вернул задачу к планированию: предложи новый план целиком, "
+    "отметки прежних шагов сброшены"
+)
+_JUST_REOPENED = "задача переоткрыта: проверки проходим заново с проверки 1"
+
+# «Сейчас нельзя» (день 15, §2.5) — запреты этапа, которые выводит код рядом с
+# «Что делать сейчас»: прямая запись «нельзя реализацию до утверждённого плана»
+# и «нельзя финал без валидации» в том месте запроса, которое не вытесняется
+# окном контекста. Нейтральные слова: партия, игрок и стол живут в `presets.py`.
+FORBIDDEN_PLANNING = (
+    "вести по шагам и объяснять, как их делать, пока план не утверждён; "
+    "считать план принятым самому — его утверждает пользователь словами"
+)
+FORBIDDEN_EXECUTION = (
+    "переходить к следующему шагу, пока пользователь не сказал, что сделал "
+    "текущий; выдавать оставшиеся шаги списком «чтобы было»; подводить итог "
+    "задачи и объявлять её готовой"
+)
+FORBIDDEN_VALIDATION = (
+    "объявлять задачу завершённой, пока не пройдены все проверки; начинать "
+    "новые шаги"
+)
+FORBIDDEN_PAUSED = (
+    "вести задачу и двигать шаг — что бы пользователь ни сообщил о сделанном"
+)
+FORBIDDEN_FINAL = "продолжать задачу: новая начинается кнопкой"
+FORBIDDEN_ALWAYS = (
+    "этап и шаг меняет приложение; отменить задачу, начать новую или "
+    "переоткрыть завершённую можно только кнопкой — если пользователь просит "
+    "это словами, скажи, какой именно"
+)
+
+# Что делать при сходе с маршрута (день 15, §2.4, §4.5): ассистент не спорит и
+# не выполняет молча.
+OFF_ROUTE_INSTRUCTION = (
+    "не выполняй просьбу в обход этапов: одной-двумя фразами скажи, почему так "
+    "нельзя и чем это грозит, назови, что можно сделать прямо сейчас, и "
+    "продолжай с текущего шага — на планировании это значит показать план "
+    "целиком заново, чтобы пользователю было что утверждать; этап и шаг ты "
+    "не меняешь"
+)
+
 # Указание при ожидании подтверждения (день 14, §5.3): блок просит ассистента
 # не считать переход состоявшимся и сказать, кто его отмечает.
 PENDING_INSTRUCTION = (
@@ -192,6 +264,11 @@ class Transition:
     sources: tuple[str, ...]
     stages: tuple[str, ...]
     paused: bool | None
+    # День 15 (§4.1): этапы, куда переход может привести, — машиночитаемо, для
+    # `_validate_route()` и панели; `target` остаётся строкой для человека.
+    # Строка, у которой `to_stages` совпадает с `stages` (пауза, продолжение),
+    # оставляет задачу на том же этапе.
+    to_stages: tuple[str, ...]
     target: str
     condition: str
     meaning: str
@@ -237,6 +314,17 @@ class Rejection:
 
 
 @dataclass(frozen=True)
+class OffRoute:
+    """Просьба сойти с маршрута — отметка трекера (день 15, §4.1). Ничего в
+    состоянии не меняет. На диск не едет — это диагностика хода."""
+
+    kind: str                  # один из OFF_ROUTE_KINDS
+    why: str                   # одна фраза словами пользователя; "" — не сказано
+    messages: int
+    at: str
+
+
+@dataclass(frozen=True)
 class TransitionGuard:
     """Ограничение перехода (день 14, §5.1): приходит параметром от агента.
     Модуль не знает, чем оно задано, — только формулировку и подпись для лога
@@ -273,6 +361,9 @@ class Outcome:
     # событие трекера упёрлось в ограничение `с подтверждением`. Состояние при
     # этом не менялось, отказа нет.
     pending: Pending | None = None
+    # Поле дня 15 — в конце и с умолчанием: сход с маршрута этого разбора. Он
+    # не отменяет ни перехода, ни отказа — приходит вместе с любым из них.
+    off_route: OffRoute | None = None
 
 
 @dataclass(frozen=True)
@@ -312,6 +403,15 @@ class TaskView:
     # ничего не ждёт.
     pending_event: str = ""
     pending_note: str = ""
+    # Поля дня 15 — тоже в конце и с умолчаниями: строки «Сейчас нельзя» этого
+    # состояния (те же, что уходят в блок запроса), последний сход с маршрута и
+    # счётчики красного пути этой сессии (память процесса).
+    forbidden: list[str] = field(default_factory=list)
+    off_route_kind: str = ""
+    off_route_why: str = ""
+    off_route_at: str = ""
+    rejected_total: int = 0
+    off_route_total: int = 0
 
 
 # --- Таблица переходов (§2.3, §4.3) -----------------------------------------
@@ -322,6 +422,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         sources=(SOURCE_HUMAN,),
         stages=(NO_TASK, STAGE_DONE, STAGE_CANCELLED),
         paused=None,
+        to_stages=(STAGE_PLANNING,),
         target="планирование",
         condition="цель непустая; завершённая задача заменяется новой",
         meaning="пользователь начал задачу кнопкой",
@@ -331,6 +432,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         sources=(SOURCE_TRACKER,),
         stages=(STAGE_PLANNING,),
         paused=False,
+        to_stages=(STAGE_EXECUTION,),
         target="выполнение, шаг 1",
         condition=(
             "в ответе трекера от 1 до предела шагов и от 1 до предела "
@@ -346,6 +448,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         sources=(SOURCE_TRACKER,),
         stages=(STAGE_EXECUTION,),
         paused=False,
+        to_stages=(STAGE_EXECUTION, STAGE_VALIDATION),
         target="следующий шаг; после последнего — проверка, проверка 1",
         condition="",
         meaning="пользователь сообщил, что сделал текущий шаг",
@@ -355,6 +458,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         sources=(SOURCE_TRACKER,),
         stages=(STAGE_VALIDATION,),
         paused=False,
+        to_stages=(STAGE_VALIDATION, STAGE_DONE),
         target="следующая проверка; после последней — готово",
         condition="",
         meaning="пользователь подтвердил, что текущая проверка сходится",
@@ -364,6 +468,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         sources=(SOURCE_TRACKER,),
         stages=(STAGE_EXECUTION, STAGE_VALIDATION),
         paused=False,
+        to_stages=(STAGE_EXECUTION,),
         target="выполнение, шаг N",
         condition=(
             "на выполнении — N меньше текущего; на проверке — любой шаг плана"
@@ -374,10 +479,24 @@ TRANSITIONS: tuple[Transition, ...] = (
         ),
     ),
     Transition(
+        event=EVENT_BACK_TO_PLAN,
+        sources=(SOURCE_TRACKER, SOURCE_HUMAN),
+        stages=(STAGE_EXECUTION, STAGE_VALIDATION),
+        paused=False,
+        to_stages=(STAGE_PLANNING,),
+        target="планирование (отметки и итоги шагов стираются)",
+        condition="",
+        meaning=(
+            "пользователь хочет переделать сам план, а не вернуться к одному "
+            "из его шагов"
+        ),
+    ),
+    Transition(
         event=EVENT_PAUSE,
         sources=(SOURCE_HUMAN, SOURCE_TRACKER),
         stages=(STAGE_PLANNING, STAGE_EXECUTION, STAGE_VALIDATION),
         paused=False,
+        to_stages=(STAGE_PLANNING, STAGE_EXECUTION, STAGE_VALIDATION),
         target="тот же этап и шаг, на паузе",
         condition="",
         meaning="пользователь просит прерваться и продолжить задачу позже",
@@ -387,6 +506,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         sources=(SOURCE_HUMAN, SOURCE_TRACKER),
         stages=(STAGE_PLANNING, STAGE_EXECUTION, STAGE_VALIDATION),
         paused=True,
+        to_stages=(STAGE_PLANNING, STAGE_EXECUTION, STAGE_VALIDATION),
         target="тот же этап и шаг, без паузы",
         condition="",
         meaning="пользователь возвращается к задаче после паузы",
@@ -396,9 +516,20 @@ TRANSITIONS: tuple[Transition, ...] = (
         sources=(SOURCE_HUMAN,),
         stages=(STAGE_PLANNING, STAGE_EXECUTION, STAGE_VALIDATION),
         paused=None,
+        to_stages=(STAGE_CANCELLED,),
         target="отменена",
         condition="",
         meaning="пользователь отменил задачу кнопкой",
+    ),
+    Transition(
+        event=EVENT_REOPEN,
+        sources=(SOURCE_HUMAN,),
+        stages=(STAGE_DONE,),
+        paused=None,
+        to_stages=(STAGE_VALIDATION,),
+        target="проверка, проверка 1",
+        condition="в плане есть проверки",
+        meaning="пользователь вернул завершённую задачу к проверкам кнопкой",
     ),
 )
 
@@ -409,6 +540,7 @@ def _validate_transitions() -> None:
     valid_events = {
         EVENT_START, EVENT_APPROVE_PLAN, EVENT_STEP_DONE, EVENT_CHECK_PASSED,
         EVENT_BACK_TO_STEP, EVENT_PAUSE, EVENT_RESUME, EVENT_CANCEL,
+        EVENT_BACK_TO_PLAN, EVENT_REOPEN,
     }
     valid_stages = {NO_TASK, *MAIN_PATH, STAGE_CANCELLED}
     valid_sources = {SOURCE_HUMAN, SOURCE_TRACKER}
@@ -427,9 +559,96 @@ def _validate_transitions() -> None:
             raise ValueError(
                 f"таблица переходов: у события «{row.event}» некорректные этапы"
             )
+        # День 15 (§4.3): `to_stages` — обязательное поле, и в нём этапы, куда
+        # переход может привести; «нет задачи» — не этап назначения.
+        if (
+            not row.to_stages
+            or any(s not in valid_stages or s == NO_TASK for s in row.to_stages)
+        ):
+            raise ValueError(
+                f"таблица переходов: у события «{row.event}» некорректные "
+                f"этапы назначения (to_stages)"
+            )
+
+
+def _route_edges() -> list[tuple[str, str, str]]:
+    """Рёбра графа маршрута: (событие, откуда, куда). Строка, у которой
+    `to_stages` совпадает с `stages` (пауза, продолжение), оставляет задачу на
+    месте — ребро только в тот же этап, а не «каждый с каждым»."""
+    edges = []
+    for row in TRANSITIONS:
+        stays = set(row.to_stages) == set(row.stages)
+        for src in row.stages:
+            for dst in row.to_stages:
+                if stays and src != dst:
+                    continue
+                edges.append((row.event, src, dst))
+    return edges
+
+
+def _validate_route() -> None:
+    """Свойства маршрута (день 15, §2.7, §4.3): «ассистент не может
+    перепрыгнуть этап» — свойство таблицы, а не обещание. Про таблицу, а не про
+    состояние: выполняется один раз за процесс, сразу за `_validate_transitions()`.
+
+    1. вперёд по основному пути — не больше чем на один этап;
+    2. назад — на любой этап основного пути (ничего не проверяем: откат
+       маршрут не нарушает);
+    3. от этапа, куда ведёт «начать», достижимы все активные этапы и «готово»;
+    4. из каждого активного этапа достижим конечный этап;
+    5. конечные этапы конечны: из «готово» ведут только «начать» и
+       «переоткрыть», из «отменена» — только «начать».
+    """
+    edges = _route_edges()
+    order = {stage: i for i, stage in enumerate(MAIN_PATH)}
+    for event, src, dst in edges:
+        if src in order and dst in order and order[dst] - order[src] > 1:
+            raise ValueError(
+                f"таблица переходов: «{event}» ведёт из «{src}» в «{dst}» — "
+                f"это перепрыгивание этапа"
+            )
+
+    graph: dict[str, set[str]] = {}
+    for _, src, dst in edges:
+        graph.setdefault(src, set()).add(dst)
+
+    def reachable(start: set[str]) -> set[str]:
+        seen, todo = set(start), list(start)
+        while todo:
+            for nxt in graph.get(todo.pop(), ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    todo.append(nxt)
+        return seen
+
+    start_row = next((row for row in TRANSITIONS if row.event == EVENT_START), None)
+    if start_row is None:
+        raise ValueError("таблица переходов: нет строки «начать»")
+    first = reachable(set(start_row.to_stages))
+    for stage in (*ACTIVE_STAGES, STAGE_DONE):
+        if stage not in first:
+            raise ValueError(
+                f"таблица переходов: этап «{stage}» недостижим от «начать»"
+            )
+    for stage in ACTIVE_STAGES:
+        if not reachable({stage}) & set(FINAL_STAGES):
+            raise ValueError(
+                f"таблица переходов: из этапа «{stage}» не дойти до конечного "
+                f"этапа — тупик"
+            )
+    allowed_from = {STAGE_DONE: (EVENT_START, EVENT_REOPEN), STAGE_CANCELLED: (EVENT_START,)}
+    for row in TRANSITIONS:
+        for stage, events in allowed_from.items():
+            if stage in row.stages and row.event not in events:
+                raise ValueError(
+                    f"таблица переходов: «{row.event}» выходит из конечного "
+                    f"этапа «{stage}» — оттуда ведут только "
+                    f"{', '.join('«' + e + '»' for e in events)}"
+                )
 
 
 _validate_transitions()
+_validate_route()
 
 # Все события таблицы — для книги инвариантов и списка в редакторе (день 14, §5.1).
 EVENTS = tuple(row.event for row in TRANSITIONS)
@@ -548,6 +767,9 @@ def _expected_text(state: TaskState) -> str:
 def _what_to_do(state: TaskState) -> str:
     if state.paused:
         return _WHAT_TO_DO_PAUSED
+    if state.stage == STAGE_PLANNING and state.steps:
+        # Планирование с непустым планом — возврат к плану (день 15, §4.2).
+        return _WHAT_TO_DO_REPLANNING
     return {
         STAGE_PLANNING: _WHAT_TO_DO_PLANNING,
         STAGE_EXECUTION: _WHAT_TO_DO_EXECUTION,
@@ -555,6 +777,31 @@ def _what_to_do(state: TaskState) -> str:
         STAGE_DONE: _WHAT_TO_DO_DONE,
         STAGE_CANCELLED: _WHAT_TO_DO_CANCELLED,
     }[state.stage]
+
+
+def _forbidden_lines(state: TaskState) -> list[str]:
+    """«Сейчас нельзя» (день 15, §2.5): текст этапа — или текст паузы, который
+    его перекрывает, — и общая строка. Выводит код из этапа и флага паузы, как
+    «Ожидается» и «Что делать сейчас»; модель его не пишет."""
+    if state.stage in FINAL_STAGES:
+        head = FORBIDDEN_FINAL
+    elif state.paused:
+        head = FORBIDDEN_PAUSED
+    else:
+        head = {
+            STAGE_PLANNING: FORBIDDEN_PLANNING,
+            STAGE_EXECUTION: FORBIDDEN_EXECUTION,
+            STAGE_VALIDATION: FORBIDDEN_VALIDATION,
+        }[state.stage]
+    return [head, FORBIDDEN_ALWAYS]
+
+
+def _off_route_text(off_route: OffRoute) -> str:
+    """Сход словами — для блока запроса: «просит выдать всё сразу» (пропустить
+    этап)»; фразы `чем` нет — только вид."""
+    if off_route.why:
+        return f"«{off_route.why}» ({off_route.kind})"
+    return off_route.kind
 
 
 def _just_happened(record: TransitionRecord) -> str:
@@ -584,6 +831,10 @@ def _just_happened(record: TransitionRecord) -> str:
         return _JUST_RESUMED
     if record.event == EVENT_CANCEL:
         return _JUST_CANCELLED
+    if record.event == EVENT_BACK_TO_PLAN:
+        return _JUST_BACK_TO_PLAN
+    if record.event == EVENT_REOPEN:
+        return _JUST_REOPENED
     return ""
 
 
@@ -614,7 +865,11 @@ def _plan_block(state: TaskState) -> str:
     панель, модель и трекер видят одно и то же представление плана."""
     if not state.steps:
         return "План: ещё не утверждён — его предлагает ассистент, утверждает пользователь."
-    lines = ["План:"]
+    if state.stage == STAGE_PLANNING:
+        # Возврат к плану (день 15, §4.2): прежний план — черновик.
+        lines = ["Прежний план (пересматривается, пока новый не утверждён):"]
+    else:
+        lines = ["План:"]
     for i, step in enumerate(state.steps):
         idx = i + 1
         result = state.results[i] if i < len(state.results) else ""
@@ -663,7 +918,7 @@ def _effective_key(key: str) -> str | None:
     """Ключ ответа трекера после `context.normalize_key`. «шаг N»/«проверка
     N» (с номером) — тот же ключ, что «шаг»/«проверка»: номер в ключе
     игнорируется, порядок пунктов — порядок строк (§4.6)."""
-    if key in (KEY_EVENT, KEY_RESULT, KEY_BACK):
+    if key in (KEY_EVENT, KEY_RESULT, KEY_BACK, KEY_OFF_ROUTE, KEY_WHY):
         return key
     match = _ITEM_KEY_RE.match(key)
     return match.group(1) if match else None
@@ -789,6 +1044,12 @@ class TaskMachine:
         # Ожидание подтверждения (день 14, §5.3) — тоже память процесса: на
         # диск не едет, `load()` его не восстанавливает.
         self._pending: Pending | None = None
+        # День 15 (§2.9): последний сход с маршрута и счётчики красного пути —
+        # память процесса, как последний отказ: на диск не едут, `load()` их не
+        # восстанавливает, `reset()` обнуляет.
+        self._off_route: OffRoute | None = None
+        self._rejected_total = 0
+        self._off_route_total = 0
 
     @property
     def state(self) -> TaskState | None:
@@ -801,6 +1062,18 @@ class TaskMachine:
     @property
     def rejection(self) -> Rejection | None:
         return self._rejection
+
+    @property
+    def off_route(self) -> OffRoute | None:
+        return self._off_route
+
+    @property
+    def rejected_total(self) -> int:
+        return self._rejected_total
+
+    @property
+    def off_route_total(self) -> int:
+        return self._off_route_total
 
     # --- Чистые методы: их зовут на каждый рендер панели -------------------
 
@@ -829,6 +1102,7 @@ class TaskMachine:
                 last_update=self._last_update,
                 block_due=False, tracker_due=due, tracker_note=note,
                 pending_event=pending_event, pending_note=pending_note,
+                forbidden=[], **self._red_path_fields(),
             )
         return TaskView(
             stage=state.stage,
@@ -851,6 +1125,8 @@ class TaskMachine:
             tracker_note=note,
             pending_event=pending_event,
             pending_note=pending_note,
+            forbidden=_forbidden_lines(state),
+            **self._red_path_fields(),
         )
 
     def block(self, history: list[dict]) -> dict | None:
@@ -873,6 +1149,7 @@ class TaskMachine:
             lines.append(f"Текущий шаг: {_step_text(state)}")
             lines.append(f"Ожидается: {_expected_text(state)}")
         lines.append(f"Что делать сейчас: {_what_to_do(state)}")
+        lines.append(f"Сейчас нельзя: {'; '.join(_forbidden_lines(state))}")
         if fresh is not None:
             lines.append(f"Только что: {_just_happened(fresh)}")
         rejection = self._rejection
@@ -890,6 +1167,12 @@ class TaskMachine:
             lines.append(
                 f"Ждёт подтверждения: «{pending.event}» — {pending.reason}. "
                 f"{PENDING_INSTRUCTION}"
+            )
+        off_route = self._off_route
+        if off_route is not None and off_route.messages == len(history):
+            lines.append(
+                f"Сход с маршрута: {_off_route_text(off_route)}. "
+                f"{OFF_ROUTE_INSTRUCTION}"
             )
         lines.append("")
         lines.append(_plan_block(state))
@@ -926,9 +1209,14 @@ class TaskMachine:
         self, event: str, history: list[dict], at: str,
         guards: Sequence[TransitionGuard] = (),
     ) -> Outcome:
-        """Событие человека без данных: пауза, продолжить, отменить.
-        «Начать» через `fire()` не идёт — ему нужна цель, это `start()`."""
-        if event not in (EVENT_PAUSE, EVENT_RESUME, EVENT_CANCEL):
+        """Событие человека без данных: пауза, продолжить, отменить, а с дня 15
+        и откаты — вернуться к плану и переоткрыть. «Начать» через `fire()` не
+        идёт — ему нужна цель, это `start()`; «вернуться к шагу» — ему нужен
+        номер."""
+        if event not in (
+            EVENT_PAUSE, EVENT_RESUME, EVENT_CANCEL, EVENT_BACK_TO_PLAN,
+            EVENT_REOPEN,
+        ):
             return self._reject(
                 event, SOURCE_HUMAN,
                 f"событие «{event}» кнопкой не вызывается", history, at,
@@ -948,19 +1236,28 @@ class TaskMachine:
             return Outcome(False, EVENT_NONE, self._last_update, None), False
 
         event_key = context.normalize_key(_TRAILING_DOT_RE.sub("", raw_event))
-        if event_key == context.normalize_key(EVENT_NONE):
-            self._last_update = "событий нет"
-            return Outcome(False, EVENT_NONE, self._last_update, None), True
-
-        event = _EVENT_KEYS.get(event_key)
-        if event is None:
+        no_event = event_key == context.normalize_key(EVENT_NONE)
+        event = None if no_event else _EVENT_KEYS.get(event_key)
+        if event is None and not no_event:
             self._last_update = "ответ трекера не разобран"
             return Outcome(False, EVENT_NONE, self._last_update, None), False
+
+        # Сход разбирается независимо от события (день 15, §4.4) и только при
+        # разобранном ответе: если разбор не удался, доверия к строкам нет —
+        # до этой точки неразобранные ответы уже вышли.
+        off_route = self._take_off_route(event_pairs, history, at)
+
+        if no_event:
+            self._last_update = "событий нет"
+            return (
+                Outcome(False, EVENT_NONE, self._last_update, None, off_route=off_route),
+                True,
+            )
 
         data = self._extract_data(event, event_pairs)
         outcome = self._attempt(event, SOURCE_TRACKER, history, at, data, guards)
         self._last_update = outcome.note
-        return outcome, True
+        return replace(outcome, off_route=off_route), True
 
     def confirm(
         self, history: list[dict], at: str,
@@ -1051,6 +1348,9 @@ class TaskMachine:
         self._rejection = None
         self._last_update = ""
         self._pending = None
+        self._off_route = None
+        self._rejected_total = 0
+        self._off_route_total = 0
 
     # --- Внутреннее ---------------------------------------------------------
 
@@ -1058,6 +1358,46 @@ class TaskMachine:
         if self._state is None:
             return NO_TASK, False
         return self._state.stage, self._state.paused
+
+    def _red_path_fields(self) -> dict:
+        """Поля красного пути для `TaskView` (день 15, §4.1)."""
+        off_route = self._off_route
+        return {
+            "off_route_kind": off_route.kind if off_route is not None else "",
+            "off_route_why": off_route.why if off_route is not None else "",
+            "off_route_at": _format_dt(off_route.at) if off_route is not None else "",
+            "rejected_total": self._rejected_total,
+            "off_route_total": self._off_route_total,
+        }
+
+    def _take_off_route(
+        self, pairs: list[tuple[str, str | None]], history: list[dict], at: str
+    ) -> OffRoute | None:
+        """Сход из ответа трекера (день 15, §4.4): вид — из закрытого списка,
+        сверяется тем же правилом нормализации, что события; вид вне списка —
+        строка игнорируется молча: сход ничего не меняет, и отклонённый сход —
+        просто его отсутствие. Новый сход заменяет прежний. Ответ без схода
+        стирает только сход на том же месте истории (повтор упавшего хода):
+        сход прежних ходов уже не свежий и сам уходит из блока."""
+        raw = _first_value(pairs, KEY_OFF_ROUTE)
+        kind = None
+        if raw is not None:
+            key = context.normalize_key(_TRAILING_DOT_RE.sub("", raw))
+            kind = next(
+                (k for k in OFF_ROUTE_KINDS if context.normalize_key(k) == key), None
+            )
+        if kind is None:
+            if self._off_route is not None and self._off_route.messages == len(history):
+                self._off_route = None
+            return None
+        why = _first_value(pairs, KEY_WHY) or ""
+        off_route = OffRoute(
+            kind=kind, why=_TRAILING_DOT_RE.sub("", why.strip()),
+            messages=len(history), at=at,
+        )
+        self._off_route = off_route
+        self._off_route_total += 1
+        return off_route
 
     def _fresh_transition(self, history: list[dict]) -> TransitionRecord | None:
         state = self._state
@@ -1111,10 +1451,25 @@ class TaskMachine:
             "",
             _plan_block(state),
             "",
-            "Допустимые события сейчас:",
+            "События задачи:",
         ]
-        for event in self.allowed(SOURCE_TRACKER):
-            lines.append(f"- {event} — {EVENT_MEANINGS[event]}")
+        # День 15 (§3.2): все события трекера в порядке таблицы, с пометкой
+        # «можно сейчас» / «сейчас нельзя (причина)». Пометка — из `allowed()`,
+        # причина — из `_rejection_reason()`, той же функции, что причины
+        # отказов: второго определения допустимости нет.
+        stage, paused = self._stage_paused()
+        can = set(self.allowed(SOURCE_TRACKER))
+        for row in TRANSITIONS:
+            if SOURCE_TRACKER not in row.sources:
+                continue
+            if row.event in can:
+                mark = "МОЖНО СЕЙЧАС"
+            else:
+                reason = self._rejection_reason(
+                    row.event, SOURCE_TRACKER, row, stage, paused
+                )
+                mark = f"сейчас нельзя ({reason})"
+            lines.append(f"- {row.event} — {mark} — {row.meaning}")
         lines.append(f"- {EVENT_NONE} — ничего из перечисленного")
         lines += [
             "",
@@ -1188,6 +1543,8 @@ class TaskMachine:
             )
         if stage == NO_TASK:
             return "задачи нет — её начинают кнопкой «Начать задачу»"
+        if event == EVENT_REOPEN and stage == STAGE_CANCELLED:
+            return "отменённая задача не переоткрывается — начните новую"
         if stage in FINAL_STAGES:
             return f"задача на этапе «{stage}» — события к ней больше не применяются"
         if row is not None and _stage_paused_matches(row, stage, paused) and source not in row.sources:
@@ -1195,12 +1552,16 @@ class TaskMachine:
                 return "это событие делает только человек"
             if row.sources == (SOURCE_TRACKER,):
                 return "это событие делает только трекер"
+        if event == EVENT_REOPEN and stage in ACTIVE_STAGES:
+            return "переоткрывают только завершённую задачу"
         if event == EVENT_PAUSE and paused:
             return "задача уже на паузе"
         if event == EVENT_RESUME and not paused:
             return "задача не на паузе"
         if paused and event not in (EVENT_RESUME, EVENT_CANCEL):
             return "задача на паузе — до продолжения допустимо только «продолжить»"
+        if event == EVENT_BACK_TO_PLAN and stage == STAGE_PLANNING:
+            return "уже на планировании: план переделывают здесь же"
         return f"на этапе «{stage}» перехода «{event}» нет"
 
     def _check_condition(self, event: str, data, stage: str) -> str | None:
@@ -1233,6 +1594,10 @@ class TaskMachine:
                         f"вперёд перескакивать нельзя: сейчас шаг {state.step} "
                         f"— шаги выполняются по порядку"
                     )
+            return None
+        if event == EVENT_REOPEN:
+            if state is None or not state.checks:
+                return "в плане нет проверок — переоткрывать не к чему"
             return None
         return None
 
@@ -1293,6 +1658,20 @@ class TaskMachine:
             )
             record_note = f"к шагу {number}"
             outcome_note = f"возврат → {_full_text(new_state)}"
+        elif event == EVENT_BACK_TO_PLAN:
+            # Откат назад по графу (день 15, §2.6): отметки и итоги шагов
+            # стёрты, шаги и проверки остались черновиком; выполнение потом
+            # начинается с шага 1.
+            new_state = replace(
+                state, stage=STAGE_PLANNING, step=1,
+                results=("",) * len(state.steps),
+            )
+            record_note = "итоги шагов стёрты"
+            outcome_note = f"возврат к плану → {_full_text(new_state)}"
+        elif event == EVENT_REOPEN:
+            new_state = replace(state, stage=STAGE_VALIDATION, step=1, paused=False)
+            record_note = "проверки заново"
+            outcome_note = f"задача переоткрыта → {_full_text(new_state)}"
         elif event == EVENT_PAUSE:
             new_state = replace(state, paused=True)
             record_note = ""
@@ -1335,6 +1714,7 @@ class TaskMachine:
             messages=len(history or []), at=at,
         )
         self._rejection = rejection
+        self._rejected_total += 1
         note = f"отклонено «{event}»: {reason}"
         self._last_update = note
         return Outcome(False, event, note, rejection)

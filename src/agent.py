@@ -337,6 +337,12 @@ class AgentReply:
     guard_call: ServiceCall | None = None
     conflict: str = ""
     conflict_note: str = ""
+    # Поля дня 15 — в конце. `task_rejected` — событие, отклонённое автоматом на
+    # этом ходе (`""` — отказа не было); причину словами несёт `task_note`.
+    # `task_off_route` — вид схода с маршрута, названный трекером (`""` — схода
+    # не было): отметка «просит сойти с маршрута», состояние она не меняет.
+    task_rejected: str = ""
+    task_off_route: str = ""
 
 
 @dataclass(frozen=True)
@@ -409,6 +415,11 @@ class TurnStats:
     guard_tokens: int = 0
     guard_cost_usd: float | None = None
     guard_elapsed: float = 0.0
+    # Поля дня 15 — снова в конце: отказ автомата и сход с маршрута этого хода
+    # (спецификация дня 15, §5). Своих счётчиков расхода у дня нет: новых
+    # вызовов нет, трекер уже считается в `tracker_*`.
+    task_rejected: str = ""
+    task_off_route: str = ""
 
 
 @dataclass(frozen=True)
@@ -1242,6 +1253,18 @@ class Agent:
         # вызова не должно его терять. Сбой трекера ход не отменяет —
         # состояние остаётся прежним, основной вызов идёт с ним.
         task_outcome, task_call = self._run_task_tracker(client, user_message, always)
+        # Красный путь этого хода (день 15, §5): отказ автомата и сход с
+        # маршрута едут в ответ и журнал ходов рядом с событием трекера.
+        task_rejected = (
+            task_outcome.rejection.event
+            if task_outcome is not None and task_outcome.rejection is not None
+            else ""
+        )
+        task_off_route = (
+            task_outcome.off_route.kind
+            if task_outcome is not None and task_outcome.off_route is not None
+            else ""
+        )
 
         # Счёт до запроса (день 8): считаем ровно тот список сообщений, который
         # сейчас уйдёт в API, — и логируем бюджет до вызова, а не после.
@@ -1290,6 +1313,8 @@ class Agent:
                 guard_call=guard_call,
                 conflict=", ".join(conflict.ids) if conflict else "",
                 conflict_note=_conflict_note(conflict),
+                task_rejected=task_rejected,
+                task_off_route=task_off_route,
             )
         elapsed = time.perf_counter() - started
 
@@ -1336,6 +1361,8 @@ class Agent:
             guard_call=guard_call,
             conflict=", ".join(conflict.ids) if conflict else "",
             conflict_note=_conflict_note(conflict),
+            task_rejected=task_rejected,
+            task_off_route=task_off_route,
         )
 
         if self._config.keep_history:
@@ -1792,7 +1819,9 @@ class Agent:
 
     @_locked
     def task_event(self, event: str) -> "task_state.Outcome":
-        """«Пауза», «продолжить» или «отменить» от человека (день 13, §5.4).
+        """«Пауза», «продолжить», «отменить» от человека (день 13, §5.4) и с
+        дня 15 два отката назад по графу — «вернуться к плану» и
+        «переоткрыть» (§5): событий стало пять, а способ их вызвать — один.
         Под замком по той же причине: пауза, нажатая во время хода, встанет
         после перехода, который этот ход уже сделал."""
         if self._task is None:
@@ -1808,7 +1837,7 @@ class Agent:
         outcome = self._task.fire(event, self._messages, _now_iso(), guards)
         if outcome.changed:
             self._persist()
-        logger.info("[%s] задача: %s", self._log_name, outcome.note)
+        self._log_task_outcome(outcome, task_state.SOURCE_HUMAN)
         return outcome
 
     @_locked
@@ -2886,6 +2915,43 @@ class Agent:
             )
         return choice, call
 
+    def _log_task_outcome(self, outcome: "task_state.Outcome", source: str) -> None:
+        """Строка лога про исход события задачи (день 13, день 15 §5): отказ с
+        причиной и источником, откаты назад по графу — своей строкой с путём к
+        файлу, всё остальное — словами исхода. Один код на кнопку человека и
+        на трекер: формулировки в логе не разъезжаются."""
+        state = self._task.state if self._task is not None else None
+        if outcome.rejection is not None:
+            tail = ""
+            if source == task_state.SOURCE_TRACKER and state is not None:
+                tail = (
+                    f"; состояние не изменилось — {state.stage}"
+                    f"{' (на паузе)' if state.paused else ''}"
+                )
+            logger.info(
+                "[%s] задача: отклонено «%s» (%s): %s%s",
+                self._log_name, outcome.rejection.event,
+                outcome.rejection.source, outcome.rejection.reason, tail,
+            )
+            return
+        if not outcome.changed:
+            return
+        where = f"sessions/{self._session_id}.json"
+        if outcome.event == task_state.EVENT_BACK_TO_PLAN and state is not None:
+            logger.info(
+                "[%s] задача: возврат к плану (%s) → %s; итоги шагов стёрты, "
+                "план из %d шагов остался черновиком → %s",
+                self._log_name, source, state.stage, len(state.steps), where,
+            )
+        elif outcome.event == task_state.EVENT_REOPEN and state is not None:
+            logger.info(
+                "[%s] задача: переоткрыта пользователем → проверка %d из %d → %s",
+                self._log_name, state.step, len(state.checks), where,
+            )
+        elif source == task_state.SOURCE_HUMAN:
+            # Переход трекера описывает строка самого трекера ниже.
+            logger.info("[%s] задача: %s", self._log_name, outcome.note)
+
     def _run_task_tracker(
         self, client: OpenAI, question: str, always: list[dict] | None = None
     ) -> tuple["task_state.Outcome | None", ServiceCall | None]:
@@ -3015,11 +3081,27 @@ class Agent:
                 outcome.pending.source_note,
                 self._task.describe(self._messages).step_text,
             )
-        elif outcome.rejection is not None:
+        else:
+            self._log_task_outcome(outcome, task_state.SOURCE_TRACKER)
+        if outcome.off_route is not None:
+            in_request = (
+                "строка уйдёт в блок запроса"
+                if self._task_in_request
+                else "блок в запрос не уходит — переключатель выключен"
+            )
             logger.info(
-                "[%s] задача: отклонено «%s» (%s): %s",
-                self._log_name, outcome.rejection.event,
-                outcome.rejection.source, outcome.rejection.reason,
+                "[%s] задача: сход с маршрута (%s) — «%s»; состояние не "
+                "тронуто, %s",
+                self._log_name, outcome.off_route.kind,
+                outcome.off_route.why or "фраза не названа", in_request,
+            )
+        if outcome.rejection is not None or outcome.off_route is not None:
+            # Раз в ход, когда он был: не каждым ходом (день 15, §5).
+            logger.info(
+                "[%s] задача: красный путь этой сессии — отклонено "
+                "переходов: %d, сходов с маршрута: %d",
+                self._log_name, self._task.rejected_total,
+                self._task.off_route_total,
             )
         if not parsed:
             logger.warning(
@@ -3644,6 +3726,8 @@ class Agent:
         guard_call: ServiceCall | None = None,
         conflict: str = "",
         conflict_note: str = "",
+        task_rejected: str = "",
+        task_off_route: str = "",
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
@@ -3678,6 +3762,8 @@ class Agent:
             guard_call=guard_call,
             conflict=conflict,
             conflict_note=conflict_note,
+            task_rejected=task_rejected,
+            task_off_route=task_off_route,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
@@ -3753,6 +3839,9 @@ class Agent:
                 guard_tokens=(guard_call.total_tokens or 0) if guard_call else 0,
                 guard_cost_usd=guard_call.cost_usd if guard_call else None,
                 guard_elapsed=guard_call.elapsed if guard_call else 0.0,
+                # Отказ автомата и сход с маршрута этого хода (день 15, §5).
+                task_rejected=reply.task_rejected,
+                task_off_route=reply.task_off_route,
             )
         )
         # Экономия копится по ходам и может быть отрицательной: на коротком
