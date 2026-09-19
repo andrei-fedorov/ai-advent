@@ -53,6 +53,13 @@
 # «сейчас нельзя» и называет то, чего просит пользователь, — допустимость, как
 # и раньше, решает код. Сход ничего не меняет в состоянии: это строка в блоке,
 # панели, журнале ходов и логе.
+#
+# Правки по ревью дня 15: `Transition.same_stage` — объявленный, а не выведенный
+# из совпадения множеств признак «строка не меняет этап»; `to_stages` проверяется
+# не только при импорте, но и в момент перехода (`_transition()`), поэтому
+# «состояние не сдвинуть мимо таблицы» — свойство кода, а не двух согласованных
+# между собой мест; отказ и сход на том же месте истории заменяют прежние, а не
+# добавляются к счётчикам красного пути повторно.
 
 import re
 from collections.abc import Sequence
@@ -266,12 +273,19 @@ class Transition:
     paused: bool | None
     # День 15 (§4.1): этапы, куда переход может привести, — машиночитаемо, для
     # `_validate_route()` и панели; `target` остаётся строкой для человека.
-    # Строка, у которой `to_stages` совпадает с `stages` (пауза, продолжение),
-    # оставляет задачу на том же этапе.
     to_stages: tuple[str, ...]
     target: str
     condition: str
     meaning: str
+    # «Строка не меняет этап»: пауза и продолжение оставляют задачу там же,
+    # где она была. Признак объявляется, а не выводится из совпадения
+    # `stages` и `to_stages`: у остальных строк `to_stages` читается как «в
+    # любой из этих этапов» (у «шаг выполнен» — в выполнение или в проверку),
+    # и то же совпадение множеств значило бы у них другое. Вывод по
+    # совпадению, стоявший здесь до ревью дня 15, делал две вещи сразу:
+    # выводил такую строку из-под проверки прыжка целиком и на любой правке,
+    # рассогласующей множества, ронял импорт с неверной причиной.
+    same_stage: bool = False
 
 
 @dataclass(frozen=True)
@@ -405,7 +419,8 @@ class TaskView:
     pending_note: str = ""
     # Поля дня 15 — тоже в конце и с умолчаниями: строки «Сейчас нельзя» этого
     # состояния (те же, что уходят в блок запроса), последний сход с маршрута и
-    # счётчики красного пути этой сессии (память процесса).
+    # счётчики красного пути этой сессии (память процесса). `off_route_at` —
+    # сырое ISO, как `Rejection.at`: форматирует его панель.
     forbidden: list[str] = field(default_factory=list)
     off_route_kind: str = ""
     off_route_why: str = ""
@@ -500,6 +515,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         target="тот же этап и шаг, на паузе",
         condition="",
         meaning="пользователь просит прерваться и продолжить задачу позже",
+        same_stage=True,
     ),
     Transition(
         event=EVENT_RESUME,
@@ -510,6 +526,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         target="тот же этап и шаг, без паузы",
         condition="",
         meaning="пользователь возвращается к задаче после паузы",
+        same_stage=True,
     ),
     Transition(
         event=EVENT_CANCEL,
@@ -569,18 +586,28 @@ def _validate_transitions() -> None:
                 f"таблица переходов: у события «{row.event}» некорректные "
                 f"этапы назначения (to_stages)"
             )
+        # `same_stage` — объявление, а не вывод, поэтому его согласованность
+        # с этапами проверяется здесь: строка, которая не меняет этап, не
+        # может вести туда, откуда не выходит.
+        if row.same_stage and not set(row.to_stages) <= set(row.stages):
+            raise ValueError(
+                f"таблица переходов: у события «{row.event}» стоит "
+                f"same_stage, но есть этап назначения вне исходных этапов"
+            )
 
 
 def _route_edges() -> list[tuple[str, str, str]]:
-    """Рёбра графа маршрута: (событие, откуда, куда). Строка, у которой
-    `to_stages` совпадает с `stages` (пауза, продолжение), оставляет задачу на
-    месте — ребро только в тот же этап, а не «каждый с каждым»."""
+    """Рёбра графа маршрута: (событие, откуда, куда). Строка с `same_stage`
+    (пауза, продолжение) оставляет задачу на месте — ребро только в тот же
+    этап, а не «каждый с каждым»: иначе пара «планирование → проверка» внутри
+    строки паузы ложно считалась бы перепрыгиванием этапа. У остальных строк
+    `to_stages` читается как «в любой из этих этапов», и рёбра — полное
+    произведение."""
     edges = []
     for row in TRANSITIONS:
-        stays = set(row.to_stages) == set(row.stages)
         for src in row.stages:
             for dst in row.to_stages:
-                if stays and src != dst:
+                if row.same_stage and src != dst:
                     continue
                 edges.append((row.event, src, dst))
     return edges
@@ -653,6 +680,15 @@ _validate_route()
 # Все события таблицы — для книги инвариантов и списка в редакторе (день 14, §5.1).
 EVENTS = tuple(row.event for row in TRANSITIONS)
 
+# События, которые делает только человек кнопкой. Ограничение «с
+# подтверждением» на них ничего не меняет: подтверждением там является само
+# нажатие (§5.2 дня 14, `_attempt()` применяет этот режим только к трекеру).
+# Список нужен редактору инвариантов, чтобы сказать это человеку, а не
+# записать правило-пустышку молча (дописано по ревью дня 15).
+HUMAN_ONLY_EVENTS = tuple(
+    row.event for row in TRANSITIONS if row.sources == (SOURCE_HUMAN,)
+)
+
 EVENT_MEANINGS: dict[str, str] = {row.event: row.meaning for row in TRANSITIONS}
 _EVENT_KEYS: dict[str, str] = {context.normalize_key(row.event): row.event for row in TRANSITIONS}
 
@@ -673,6 +709,23 @@ def _with_confirmed(note: str) -> str:
     (подтверждено пользователем) → готово»."""
     head, arrow, tail = note.partition(" → ")
     return f"{head} ({CONFIRMED_NOTE}){arrow}{tail}"
+
+
+def _same_rejection(old: "Rejection | None", new: "Rejection") -> bool:
+    """Тот же отказ, что уже записан: место истории, событие и источник (день
+    15, уточнено по ревью). Время и формулировка причины в счёт не идут —
+    причина у одного события на одном этапе одна."""
+    return (
+        old is not None
+        and old.messages == new.messages
+        and old.event == new.event
+        and old.source == new.source
+    )
+
+
+def _same_off_route(old: "OffRoute | None", new: "OffRoute") -> bool:
+    """Тот же сход, что уже записан: место истории и вид."""
+    return old is not None and old.messages == new.messages and old.kind == new.kind
 
 
 def _pending_note(pending: Pending) -> str:
@@ -797,8 +850,8 @@ def _forbidden_lines(state: TaskState) -> list[str]:
 
 
 def _off_route_text(off_route: OffRoute) -> str:
-    """Сход словами — для блока запроса: «просит выдать всё сразу» (пропустить
-    этап)»; фразы `чем` нет — только вид."""
+    """Сход словами — для блока запроса: «просит выдать всё сразу»
+    (пропустить этап); фразы `чем` нет — только вид."""
     if off_route.why:
         return f"«{off_route.why}» ({off_route.kind})"
     return off_route.kind
@@ -1232,6 +1285,7 @@ class TaskMachine:
         event_pairs = parsed if parsed is not None else []
         raw_event = _first_value(event_pairs, KEY_EVENT)
         if parsed is None or raw_event is None:
+            self._forget_stale_off_route(history)
             self._last_update = "ответ трекера не разобран"
             return Outcome(False, EVENT_NONE, self._last_update, None), False
 
@@ -1239,6 +1293,7 @@ class TaskMachine:
         no_event = event_key == context.normalize_key(EVENT_NONE)
         event = None if no_event else _EVENT_KEYS.get(event_key)
         if event is None and not no_event:
+            self._forget_stale_off_route(history)
             self._last_update = "ответ трекера не разобран"
             return Outcome(False, EVENT_NONE, self._last_update, None), False
 
@@ -1365,10 +1420,22 @@ class TaskMachine:
         return {
             "off_route_kind": off_route.kind if off_route is not None else "",
             "off_route_why": off_route.why if off_route is not None else "",
-            "off_route_at": _format_dt(off_route.at) if off_route is not None else "",
+            # Время — сырым ISO, как у `Rejection.at`: форматирует его панель
+            # (уточнено по ревью дня 15 — соседние строки «Последний отказ» и
+            # «Последний сход» расходились форматом).
+            "off_route_at": off_route.at if off_route is not None else "",
             "rejected_total": self._rejected_total,
             "off_route_total": self._off_route_total,
         }
+
+    def _forget_stale_off_route(self, history: list[dict]) -> None:
+        """Сход на том же месте истории — от прежней попытки этого же хода
+        (уточнено по ревью дня 15). Неразобранный ответ сход не применяет, но
+        и оставлять чужую строку в блоке нельзя: повтор упавшего хода иначе
+        унёс бы в запрос «Сход с маршрута» от попытки, которой пользователь
+        уже не видел. Сход прежних ходов не свежий и сам уходит из блока."""
+        if self._off_route is not None and self._off_route.messages == len(history or []):
+            self._off_route = None
 
     def _take_off_route(
         self, pairs: list[tuple[str, str | None]], history: list[dict], at: str
@@ -1387,16 +1454,19 @@ class TaskMachine:
                 (k for k in OFF_ROUTE_KINDS if context.normalize_key(k) == key), None
             )
         if kind is None:
-            if self._off_route is not None and self._off_route.messages == len(history):
-                self._off_route = None
+            self._forget_stale_off_route(history)
             return None
         why = _first_value(pairs, KEY_WHY) or ""
         off_route = OffRoute(
             kind=kind, why=_TRAILING_DOT_RE.sub("", why.strip()),
             messages=len(history), at=at,
         )
+        # Повтор упавшего хода не должен удваивать счётчик: тот же сход на том
+        # же месте истории заменяет прежний — то же правило свежести, по
+        # которому строка уходит из блока.
+        if not _same_off_route(self._off_route, off_route):
+            self._off_route_total += 1
         self._off_route = off_route
-        self._off_route_total += 1
         return off_route
 
     def _fresh_transition(self, history: list[dict]) -> TransitionRecord | None:
@@ -1531,7 +1601,7 @@ class TaskMachine:
         error = self._check_condition(event, data, stage)
         if error:
             return self._reject(event, source, error, history, at)
-        return self._transition(event, source, data, history, at, confirmed)
+        return self._transition(event, source, data, history, at, row, confirmed)
 
     def _rejection_reason(
         self, event: str, source: str, row: Transition | None, stage: str, paused: bool
@@ -1603,7 +1673,7 @@ class TaskMachine:
 
     def _transition(
         self, event: str, source: str, data, history: list[dict], at: str,
-        confirmed: bool = False,
+        row: Transition, confirmed: bool = False,
     ) -> Outcome:
         state = self._state
         from_stage = state.stage if state else NO_TASK
@@ -1685,6 +1755,24 @@ class TaskMachine:
             record_note = ""
             outcome_note = "отменена"
 
+        # `to_stages` — контракт, а не комментарий (день 15, §4.3; уточнено по
+        # ревью дня 15). Проверка маршрута при импорте видит только таблицу и
+        # верит, что ветки ниже ей следуют; здесь это проверяется на деле:
+        # этап, посчитанный веткой, должен быть среди этапов назначения
+        # строки, а строка с `same_stage` — оставить задачу там же. Разойтись
+        # они могут только по ошибке в коде, и тогда безопаснее не двигать
+        # задачу: отказ виден в логе, панели и блоке, а молчаливый прыжок —
+        # ровно то, чего день не допускает.
+        if new_state.stage not in row.to_stages or (
+            row.same_stage and new_state.stage != from_stage
+        ):
+            return self._reject(
+                event, source,
+                f"переход повёл бы задачу из «{from_stage}» в "
+                f"«{new_state.stage}», а в таблице у «{event}» этого нет",
+                history, at,
+            )
+
         if confirmed:
             record_note = (
                 f"{record_note}, {CONFIRMED_NOTE}" if record_note else CONFIRMED_NOTE
@@ -1713,8 +1801,14 @@ class TaskMachine:
             event=event, source=source, reason=reason,
             messages=len(history or []), at=at,
         )
+        # Как и у схода: повтор упавшего хода (основной вызов не удался,
+        # история не выросла, пользователь отправил то же сообщение) не
+        # удваивает счётчик — тот же отказ на том же месте истории заменяет
+        # прежний. «Тот же» — по месту, событию и источнику: два разных
+        # нажатия кнопок на одном месте истории остаются двумя отказами.
+        if not _same_rejection(self._rejection, rejection):
+            self._rejected_total += 1
         self._rejection = rejection
-        self._rejected_total += 1
         note = f"отклонено «{event}»: {reason}"
         self._last_update = note
         return Outcome(False, event, note, rejection)

@@ -154,7 +154,10 @@ from task_state import (
     EVENT_REOPEN,
     EVENT_RESUME,
     EVENTS,
+    GUARD_CONFIRM,
+    GUARD_FORBIDDEN,
     GUARD_MODES,
+    HUMAN_ONLY_EVENTS,
     MAIN_PATH,
     NO_TASK,
     STAGE_CANCELLED,
@@ -1589,9 +1592,17 @@ def _task_md(state: dict, view: dict) -> str:
         f"{', '.join(task_view['allowed_tracker']) or 'ничего'}"
     )
     # «Сейчас нельзя» (день 15, §7.2) — ровно те строки, что уходят в блок
-    # запроса: панель показывает то, что видит модель.
+    # запроса: панель показывает то, что видит модель. Пометка в скобках
+    # согласована с «В запросе» ниже: блок не уходит (переключатель выключен
+    # или задача завершена) — и в скобках сказано это, а не обратное
+    # (уточнено по ревью дня 15: на Б1 сценария блок как раз выключен).
     if task_view["forbidden"]:
-        lines.append("- **Сейчас нельзя** (то же уходит в блок запроса):")
+        goes = task["in_request"] and task_view["block_due"]
+        where = (
+            "то же уходит в блок запроса" if goes
+            else "в блок запроса сейчас не уходит — см. «В запросе» ниже"
+        )
+        lines.append(f"- **Сейчас нельзя** ({where}):")
         lines += [f"  - {text}" for text in task_view["forbidden"]]
     if task_view["transitions"]:
         last = task_view["transitions"][-1]
@@ -1612,7 +1623,7 @@ def _task_md(state: dict, view: dict) -> str:
         why = f"«{task_view['off_route_why']}» " if task_view["off_route_why"] else ""
         lines.append(
             f"- **Последний сход с маршрута:** {why}({task_view['off_route_kind']}), "
-            f"{task_view['off_route_at']}"
+            f"{_time_of(task_view['off_route_at'])}"
         )
     lines.append(
         f"- **Красный путь этой сессии:** отклонено переходов: "
@@ -3323,10 +3334,22 @@ def on_save_invariant(
         else "Действует со следующего хода этой сессии и её веток, у которых "
         "инварианты в запросе не выключены."
     )
-    logger.info("инварианты (редактор): %s", words)
+    # Ограничение «с подтверждением» на событии, которое делает только
+    # человек, ничего не меняет: подтверждением там является само нажатие
+    # (день 14, §5.2). Инвариант сохраняется — но сказать об этом надо, иначе
+    # человек уносит из редактора правило-пустышку (дописано по ревью дня 15).
+    idle = ""
+    if candidate.mode == GUARD_CONFIRM and candidate.event in HUMAN_ONLY_EVENTS:
+        idle = (
+            f" ⚠️ На переходе «{candidate.event}» этот режим ничего не "
+            f"меняет: событие вызывает только человек кнопкой, и нажатие — "
+            f"это и есть подтверждение. Запретить такой переход можно режимом "
+            f"«{GUARD_FORBIDDEN}»."
+        )
+    logger.info("инварианты (редактор): %s%s", words, " — режим-пустышка" if idle else "")
     return reply(
         f"Инвариант сохранён: {words} → "
-        f"{_where_saved(agent, permanent_changed, session_changed)}. {reach}",
+        f"{_where_saved(agent, permanent_changed, session_changed)}. {reach}{idle}",
         new_id,
     )
 
