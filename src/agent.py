@@ -1,7 +1,8 @@
 # TooManyRules — сущность агента (день 6, неделя 2; день 8 — работа с токенами,
 # день 9 — управление контекстом, день 10 — общий служебный вызов, checkpoint'ы
 # и ветки диалога; день 11 — модель памяти: рабочая и долговременная память;
-# день 12 — профиль пользователя и роутер режима).
+# день 12 — профиль пользователя и роутер режима; день 13 — состояние задачи;
+# день 14 — инварианты).
 #
 # Единственное место в проекте, где происходят вызовы LLM API. Модуль
 # намеренно ничего не знает ни про Gradio, ни про Too Many Bones: внутри
@@ -58,6 +59,24 @@
 # отменяет только человек — кнопками (`start_task()`, `task_event()`); этап и
 # шаг меняет только таблица переходов в `task_state.py`, агент лишь применяет
 # её решения и сохраняет их.
+#
+# День 14 добавляет инварианты — ограничения, которые ассистент не вправе
+# нарушить (`invariants.InvariantBook`, спецификация дня 14): ещё две
+# необязательные зависимости — книга (своя у каждого агента) и хранилище
+# постоянных инвариантов (одно на процесс, `InvariantStore`); без них агент
+# ведёт себя ровно как на дне 13. Страж — пятая служебная работа вокруг
+# `_call_service_model()`: идёт первым после вызова стратегии, только называет
+# конфликт нового сообщения с инвариантами и ход не отменяет. Блок инвариантов
+# встаёт первым из блоков агента — сразу за системным промптом, перед
+# профилем; инварианты над переходами агент превращает в ограничения автомата
+# (`_transition_guards()`) — это единственное место, где книга и автомат
+# встречаются. Инварианты пишет только человек: агент их не создаёт и не
+# правит, только читает и применяет.
+#
+# Фаз подготовки в `ask()` теперь шесть: снимок долговременной памяти,
+# профиля и инвариантов на ход, служебный вызов стратегии, страж, разбор
+# памяти, роутер, трекер — и сборка запроса с блоками инвариантов, профиля,
+# слоёв и задачи (порядок блоков — от устойчивого к изменчивому).
 
 import copy
 import functools
@@ -74,6 +93,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 import context
+import invariants
 import memory
 import task_state
 import tokens
@@ -208,7 +228,9 @@ class AgentConfig:
 @dataclass(frozen=True)
 class ServiceCall:
     """Служебный вызов модели, сделанный до основного запроса: стратегией
-    (день 9) или моделью памяти — разбор памяти (день 11, `kind="memory"`).
+    (день 9), моделью памяти — разбор памяти (день 11, `kind="memory"`),
+    роутером профиля (день 12, `kind="route"`), трекером задачи (день 13,
+    `kind="task"`) или стражем инвариантов (день 14, `kind="invariant"`).
 
     Это настоящий вызов: он считается в счётчиках агента и процесса наравне с
     обычными и логируется так же. Но это не ход — он не пишет в стек
@@ -306,6 +328,15 @@ class AgentReply:
     task_call: ServiceCall | None = None
     task_event: str = ""
     task_note: str = ""
+    # Поля дня 14 — в конце. `guard_call` — вызов стража инвариантов этого
+    # хода; `None` — сверять было нечего (нет книги, пустая книга, все
+    # инварианты выключены, остались только инварианты над переходами, вопрос
+    # пустой). `conflict` — номера затронутых инвариантов через запятую, `""`
+    # — конфликта нет; `conflict_note` — что именно просит пользователь, из
+    # ответа стража (`Conflict.why`), для статуса и лога.
+    guard_call: ServiceCall | None = None
+    conflict: str = ""
+    conflict_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -368,6 +399,16 @@ class TurnStats:
     tracker_tokens: int = 0
     tracker_cost_usd: float | None = None
     tracker_elapsed: float = 0.0
+    # Поля дня 14 — снова в конце: корзина блока инвариантов в оценке запроса
+    # хода, сколько инвариантов действовало, номера конфликта этого хода и
+    # цена стража — своя колонка, а не часть `service_*`/`memory_*`/`route_*`/
+    # `tracker_*` (спецификация дня 14, §6.9).
+    invariant_tokens: int = 0
+    invariants_active: int = 0
+    conflict: str = ""
+    guard_tokens: int = 0
+    guard_cost_usd: float | None = None
+    guard_elapsed: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -420,6 +461,11 @@ class Checkpoint:
     # приёмом, что снимок рабочей памяти. Ветка получает его копию и дальше
     # у родителя и у ветки задача идёт независимо (спецификация дня 13, §5.8).
     task: dict = field(default_factory=dict)
+    # Поле дня 14 — в конце и с умолчанием: снимок сессионных инвариантов
+    # (`InvariantBook.dump()`) на момент сохранения, тем же приёмом. Ветка
+    # получает его копию; постоянные инварианты в снимок не входят — файл у
+    # родителя и у ветки один (спецификация дня 14, §6.8).
+    invariants: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -509,6 +555,21 @@ class ProfileStore(Protocol):
     def current(self) -> dict: ...      # профиль словарём: из файла или по умолчанию, копия
     @property
     def path(self) -> str: ...          # для логов и панели
+
+
+class InvariantStore(Protocol):
+    """Постоянные инварианты (реализация — `storage.JsonInvariantStore`,
+    спецификация дня 14, §6.1). Один на процесс и общий для всех агентов.
+
+    Объявлен здесь, как `HistoryStore`, `LongTermStore` и `ProfileStore`:
+    обмен идёт словарями, и реализация протокол не импортирует. Сессионные
+    инварианты сюда не относятся — они едут в файл сессии через
+    `HistoryStore`.
+    """
+
+    def current(self) -> list[dict]: ...    # копия списка постоянных инвариантов
+    @property
+    def path(self) -> str: ...              # для логов и панели
 
 
 # --- Счётчики процесса и реестр агентов ----------------------------------
@@ -725,6 +786,15 @@ class Agent:
         # Свой у каждого агента (`presets.make_task_machine()`), как модель
         # памяти и роутер: задача относится к конкретной сессии.
         task: "task_state.TaskMachine | None" = None,
+        # Зависимости дня 14 (§6.1) — снова в конце и необязательные:
+        # `invariants=None` — книги нет, агент ведёт себя ровно как на дне 13.
+        # Книга своя у каждого агента (`presets.make_invariants()`), хранилище
+        # постоянных инвариантов одно на процесс и передаётся всем агентам тем
+        # же объектом. Хранилище без книги ничего не значит — читать
+        # постоянные инварианты некому; книга без хранилища — действуют
+        # только сессионные.
+        invariants: "invariants.InvariantBook | None" = None,
+        invariant_store: InvariantStore | None = None,
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -743,6 +813,14 @@ class Agent:
         # состояние задачи читает тот же `_load_context()`, что и рабочая
         # память.
         self._task = task
+        # Книга инвариантов (день 14) — до чтения хранилища и `seed`:
+        # сессионные инварианты читает тот же `_load_context()`.
+        self._invariants = invariants
+        self._invariant_store = invariant_store
+        # Положение переключателя «Инварианты в запросе» — состояние агента,
+        # но не диалога (§6.6): на диск не едет, в checkpoint не входит, у
+        # нового, восстановленного агента и у ветки — включено.
+        self._invariants_in_request: bool = True
         # Положение переключателя «Состояние задачи в запросе» — состояние
         # агента, но не диалога (§5.6): на диск не едет, в checkpoint не
         # входит, у нового, восстановленного агента и у ветки — включено.
@@ -805,6 +883,13 @@ class Agent:
             "tracker_calls": 0,
             "tracker_tokens": 0,
             "tracker_cost_usd": 0.0,
+            # Счётчики дня 14: страж инвариантов. Считается в общих счётчиках
+            # выше, как любой вызов, но не в `service_*`, `memory_*`,
+            # `route_*` и `tracker_*` — у каждой служебной работы своя цена
+            # (спецификация дня 14, §6.9).
+            "guard_calls": 0,
+            "guard_tokens": 0,
+            "guard_cost_usd": 0.0,
         }
         # Журнал ходов (день 8). Ведёт себя как счётчики агента, а не как стек
         # сообщений: `reset()` его не чистит, на диск он не едет, и после
@@ -899,20 +984,21 @@ class Agent:
             logger.info(
                 "[%s] агент создан как ветка от %s · %s: общий префикс %d "
                 "сообщ., стратегия «%s», память стратегий из снимка "
-                "checkpoint'а%s%s%s; живых агентов: %d",
+                "checkpoint'а%s%s%s%s; живых агентов: %d",
                 self._log_name, self._branch.parent, self._branch.checkpoint,
                 self._branch.messages, self._strategy_name, self._layers_note(),
-                self._profile_note(), self._task_note(), process_stats()["agents_alive"],
+                self._profile_note(), self._task_note(), self._invariants_note(),
+                process_stats()["agents_alive"],
             )
         else:
             logger.info(
                 "[%s] агент создан: model=%s thinking=%s стратегия=«%s» "
-                "восстановлено из хранилища=%d сообщ.%s%s%s%s, живых агентов: %d",
+                "восстановлено из хранилища=%d сообщ.%s%s%s%s%s, живых агентов: %d",
                 self._log_name, config.model, _thinking_label(config.thinking),
                 self._strategy_name, self._restored_messages,
                 _memory_note(self.strategy.describe(self._messages)),
                 self._layers_note(), self._profile_note(), self._task_note(),
-                process_stats()["agents_alive"],
+                self._invariants_note(), process_stats()["agents_alive"],
             )
         # Сбой загрузки логируется здесь, а не на месте: до регистрации в
         # реестре у агента ещё нет номера, а без номера строка в логе
@@ -1087,7 +1173,9 @@ class Agent:
         с дня 12 — четыре (спецификация дня 12, §5.2): служебный вызов
         стратегии, разбор памяти, выбор режима роутером, сборка запроса с
         профилем и слоями. Служебные вызовы ходом не являются и через
-        `ask()` не идут.
+        `ask()` не идут. С дня 13 между роутером и сборкой встал трекер
+        задачи, а с дня 14 — страж инвариантов: он идёт первым после вызова
+        стратегии (спецификация дня 14, §6.2).
 
         Исключений не бросает: ошибка API или отсутствующий ключ возвращаются
         как `AgentReply(ok=False, error=...)` — в том числе при сбое
@@ -1110,6 +1198,21 @@ class Agent:
         # потерянного контекста. Специального кода это не требует — достаточно
         # того, что `covered` не сдвинулся.
         service = self._run_context_task(client, user_message)
+
+        # Страж инвариантов (день 14, §6.2) — первый из служебных вызовов
+        # после свёртки стратегии. Порядок на результат не влияет (все читают
+        # одну историю и пишут разное), но фиксирован — чтобы логи ходов
+        # читались одинаково: инварианты — рамка хода, и в логе их строка идёт
+        # раньше того, что агент узнал и куда двинул задачу. Постоянные
+        # инварианты читаются один раз за ход, до стража, тем же приёмом, что
+        # долговременная память и профиль: один снимок уходит и во вход
+        # стража, и в блок запроса, и в ограничения переходов. Конфликт ход не
+        # отменяет: разбор памяти, роутер и трекер идут как обычно, основной
+        # вызов — с блоком, в котором есть строка конфликта. Страж идёт при
+        # любом положении «Инвариантов в запросе»: переключатель меняет
+        # запрос, а не работу.
+        always = self._invariant_snapshot()
+        conflict, guard_call = self._run_invariant_guard(client, user_message, always)
 
         # Разбор памяти (день 11, §5.2) — после служебного вызова стратегии и
         # до сборки: основной запрос должен увидеть рабочую память, обновлённую
@@ -1138,13 +1241,15 @@ class Agent:
         # сохраняется сразу, до основного вызова (§2.6): падение основного
         # вызова не должно его терять. Сбой трекера ход не отменяет —
         # состояние остаётся прежним, основной вызов идёт с ним.
-        task_outcome, task_call = self._run_task_tracker(client, user_message)
+        task_outcome, task_call = self._run_task_tracker(client, user_message, always)
 
         # Счёт до запроса (день 8): считаем ровно тот список сообщений, который
         # сейчас уйдёт в API, — и логируем бюджет до вызова, а не после.
         # Сборка и расчёт идут одним вызовом, чтобы «что отправляем» и «что
         # показываем в панели» не считались двумя путями.
-        messages, view = self._context_view(user_message, long_term, profile, mode_choice)
+        messages, view = self._context_view(
+            user_message, long_term, profile, mode_choice, always
+        )
         request = view.usage.request
         budget = view.usage
         self._log_context(view)
@@ -1182,6 +1287,9 @@ class Agent:
                 task_call=task_call,
                 task_event=task_outcome.event if task_outcome and task_outcome.changed else "",
                 task_note=task_outcome.note if task_outcome is not None else "",
+                guard_call=guard_call,
+                conflict=", ".join(conflict.ids) if conflict else "",
+                conflict_note=_conflict_note(conflict),
             )
         elapsed = time.perf_counter() - started
 
@@ -1225,6 +1333,9 @@ class Agent:
             task_call=task_call,
             task_event=task_outcome.event if task_outcome and task_outcome.changed else "",
             task_note=task_outcome.note if task_outcome is not None else "",
+            guard_call=guard_call,
+            conflict=", ".join(conflict.ids) if conflict else "",
+            conflict_note=_conflict_note(conflict),
         )
 
         if self._config.keep_history:
@@ -1233,7 +1344,10 @@ class Agent:
             self._persist()
 
         self._record(reply)
-        self._record_turn(reply, history_before, view, service, memory_call, route_call, task_call)
+        self._record_turn(
+            reply, history_before, view, service, memory_call, route_call,
+            task_call, guard_call,
+        )
         logger.info(
             "[%s] model=%s thinking=%s finish_reason=%s time=%.2fs "
             "tokens(prompt/completion/total)=%s/%s/%s "
@@ -1277,6 +1391,11 @@ class Agent:
         С дня 13 сброс дополнительно зовёт `task.reset()`: задача пришла из
         этого диалога и уходит вместе с ним. Переключатель «Состояние
         задачи в запросе» сброс не трогает (§5.8).
+
+        С дня 14 сброс дополнительно зовёт `invariants.reset()`: сессионные
+        инварианты относились к этой партии и уходят вместе с диалогом.
+        Постоянные не тронуты — они не здесь, а в хранилище; переключатель
+        «Инварианты в запросе» сброс тоже не трогает (§6.8).
         """
         self._messages = []
         for strategy in self._strategies.values():
@@ -1287,18 +1406,25 @@ class Agent:
             self._router.reset()
         if self._task is not None:
             self._task.reset()
+        if self._invariants is not None:
+            self._invariants.reset()
         self._checkpoints = []
         self._branch = None
         self._persist()
         logger.info(
             "[%s] стек сообщений очищен (reset); память стратегий (%s), "
             "checkpoint'ы и происхождение ветки очищены вместе с ним%s; "
-            "состояние задачи — тоже",
+            "состояние задачи — тоже%s",
             self._log_name, ", ".join(f"«{name}»" for name in self._strategies),
             (
                 f"; рабочая память и кандидаты — тоже, долговременная память "
                 f"не тронута ({self._long_term_count_str()})"
                 if self._memory is not None
+                else ""
+            ),
+            (
+                "; сессионные инварианты — тоже, постоянные не тронуты"
+                if self._invariants is not None
                 else ""
             ),
         )
@@ -1335,7 +1461,14 @@ class Agent:
         task_snapshot = (
             copy.deepcopy(self._task.dump()) if self._task is not None else {}
         )
-        existing = self._unchanged_checkpoint(memory, working, task_snapshot)
+        # Снимок сессионных инвариантов (день 14, §6.8) — тем же приёмом:
+        # правка инвариантов меняет контекст без удлинения истории.
+        invariants_snapshot = (
+            copy.deepcopy(self._invariants.dump()) if self._invariants is not None else []
+        )
+        existing = self._unchanged_checkpoint(
+            memory, working, task_snapshot, invariants_snapshot
+        )
         if existing is not None:
             logger.info(
                 "[%s] checkpoint не сохранён: совпадает с существующим %s",
@@ -1351,12 +1484,13 @@ class Agent:
             created_at=_now_iso(),
             working=working,
             task=task_snapshot,
+            invariants=invariants_snapshot,
         )
         self._checkpoints.append(checkpoint)
         self._persist()
         logger.info(
             "[%s] checkpoint %s: %d сообщ., стратегия «%s», снимок памяти "
-            "стратегий: %s%s%s",
+            "стратегий: %s%s%s%s",
             self._log_name, checkpoint.id, checkpoint.messages,
             checkpoint.strategy, ", ".join(memory) if memory else "нет памяти",
             (
@@ -1368,6 +1502,11 @@ class Agent:
             (
                 f", снимок задачи: {task_snapshot.get('stage')}"
                 if task_snapshot
+                else ""
+            ),
+            (
+                f", снимок сессионных инвариантов: {len(invariants_snapshot)}"
+                if invariants_snapshot
                 else ""
             ),
         )
@@ -1382,6 +1521,7 @@ class Agent:
         memory: "memory.AgentMemory | None" = None,
         router: "user_profile.ModeRouter | None" = None,
         task: "task_state.TaskMachine | None" = None,
+        invariants: "invariants.InvariantBook | None" = None,
     ) -> "Agent | None":
         """Создаёт ветку от одного из checkpoint'ов этой сессии: новый агент
         с новой сессией, в историю которого скопирован префикс до
@@ -1408,6 +1548,12 @@ class Agent:
         ветки задача идёт независимо: пауза, отмена или новый шаг в одной не
         трогают другую. Переключатель «Состояние задачи в запросе» у ветки —
         включён, как у нового агента.
+
+        С дня 14 (§6.8) ветка получает свежую книгу инвариантов
+        (`invariants`) с копией сессионных инвариантов из снимка checkpoint'а
+        и то же хранилище постоянных инвариантов, что у родителя, — тем же
+        объектом: файл один. Дальше правка инвариантов в ветке родителя не
+        трогает. Переключатель «Инварианты в запросе» у ветки — включён.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -1449,6 +1595,9 @@ class Agent:
             # Состояние задачи ветки — копия снимка, тем же приёмом (день 13,
             # §5.8).
             seed["context"]["task"] = copy.deepcopy(checkpoint.task)
+        if checkpoint.invariants:
+            # Сессионные инварианты ветки — копия снимка (день 14, §6.8).
+            seed["context"]["invariants"] = copy.deepcopy(checkpoint.invariants)
         return Agent(
             self._config,
             session_id=session_id,
@@ -1460,6 +1609,8 @@ class Agent:
             profile=self._profile,
             router=router,
             task=task,
+            invariants=invariants,
+            invariant_store=self._invariant_store,
         )
 
     @_locked
@@ -1625,7 +1776,8 @@ class Agent:
                 False, task_state.EVENT_NONE,
                 "у агента без истории задач нет", None,
             )
-        outcome = self._task.start(goal, self._messages, _now_iso())
+        guards = self._transition_guards(self._invariant_snapshot())
+        outcome = self._task.start(goal, self._messages, _now_iso(), guards)
         if outcome.changed:
             self._persist()
             logger.info(
@@ -1652,11 +1804,101 @@ class Agent:
                 False, task_state.EVENT_NONE,
                 "у агента без истории задач нет", None,
             )
-        outcome = self._task.fire(event, self._messages, _now_iso())
+        guards = self._transition_guards(self._invariant_snapshot())
+        outcome = self._task.fire(event, self._messages, _now_iso(), guards)
         if outcome.changed:
             self._persist()
         logger.info("[%s] задача: %s", self._log_name, outcome.note)
         return outcome
+
+    @_locked
+    def confirm_transition(self) -> "task_state.Outcome":
+        """«Подтвердить переход» (день 14, §6.7): человек разрешает переход
+        трекера, который остановил инвариант `с подтверждением`. Подтверждённый
+        переход остаётся переходом трекера, в журнале он помечен «подтверждено
+        пользователем». Ограничение `запрещён` подтверждением не обходится.
+        Нечего подтверждать — отказ с причиной. Под замком агента: кнопка,
+        нажатая во время чужого хода, дождётся его конца, как кнопки задачи
+        дня 13."""
+        if self._task is None:
+            return task_state.Outcome(
+                False, task_state.EVENT_NONE, "у агента нет автомата задачи", None
+            )
+        if not self._config.keep_history:
+            return task_state.Outcome(
+                False, task_state.EVENT_NONE,
+                "у агента без истории задач нет", None,
+            )
+        guards = self._transition_guards(self._invariant_snapshot())
+        outcome = self._task.confirm(self._messages, _now_iso(), guards)
+        if outcome.changed:
+            self._persist()
+            logger.info(
+                "[%s] задача: подтверждено пользователем → %s",
+                self._log_name, outcome.note,
+            )
+        else:
+            logger.info("[%s] задача: %s", self._log_name, outcome.note)
+        return outcome
+
+    @property
+    def invariant_view(self) -> "invariants.InvariantView | None":
+        """Что про инварианты показывают панель и статус (день 14, §6.7);
+        `None` — книги у агента нет. Чистое чтение, без замка."""
+        if self._invariants is None:
+            return None
+        return self._invariants.describe(self._invariant_snapshot(), self._messages)
+
+    @property
+    def invariants_in_request(self) -> bool:
+        """Положение переключателя «Инварианты в запросе» (день 14, §6.6)."""
+        return self._invariants_in_request
+
+    @_locked
+    def set_invariants_in_request(self, enabled: bool) -> bool:
+        """Меняет запрос, а не работу (день 14, §6.6): страж вызывается при
+        любом положении, конфликт пишется, ограничения переходов действуют.
+        Выключенный переключатель убирает из запроса весь блок, включая
+        строку конфликта, — это и есть база сравнения дня. `False` — книги
+        нет или значение не изменилось. Стек, файл сессии, память, задача и
+        инварианты не трогаются, на диск ничего не пишется."""
+        if self._invariants is None or enabled == self._invariants_in_request:
+            return False
+        previous = self._invariants_in_request
+        self._invariants_in_request = enabled
+        logger.info(
+            "[%s] инварианты в запросе: %s → %s; страж продолжает работать, "
+            "ограничения переходов действуют",
+            self._log_name, _on_off(previous), _on_off(enabled),
+        )
+        return True
+
+    @_locked
+    def set_session_invariants(self, items: Sequence[dict]) -> list[str]:
+        """Заменяет сессионные инварианты целиком (день 14, §6.7) — сборка
+        целиком, а не по одному, как файл профиля дня 12. Проверку (лимиты,
+        события, длина) делает интерфейс через `invariants.validate()` до
+        вызова: сюда приходит уже проверенный список. Возвращает замечания
+        разбора. Под замком агента: правка во время чужого хода дождётся его
+        конца."""
+        if self._invariants is None:
+            return []
+        before = len(self._invariants.session_items())
+        notes = self._invariants.set_session(items, _now_iso())
+        after = len(self._invariants.session_items())
+        self._persist()
+        where = (
+            f"sessions/{self._session_id}.json"
+            if self._messages
+            else "файл сессии появится с первым сообщением"
+        )
+        logger.info(
+            "[%s] сессионные инварианты: было %d → стало %d → %s",
+            self._log_name, before, after, where,
+        )
+        for note in notes:
+            logger.warning("[%s] сессионные инварианты: %s", self._log_name, note)
+        return notes
 
     @property
     def task_in_request(self) -> bool:
@@ -1693,7 +1935,10 @@ class Agent:
         # (через `_context_view`), и в ключ `profile` ниже.
         profile = self._profile_snapshot()
         preview = self._preview_mode_choice(profile)
-        view = self._context_view("", long_term, profile, preview)[1]
+        # Снимок постоянных инвариантов на рендер (день 14) — тем же приёмом:
+        # и в бюджет, и в ключ `invariants` ниже.
+        always = self._invariant_snapshot()
+        view = self._context_view("", long_term, profile, preview, always)[1]
         return {
             "number": self._number,
             "config": asdict(self._config),
@@ -1789,6 +2034,22 @@ class Agent:
                 if self._task is not None
                 else None
             ),
+            # Ключ дня 14 — в конце. `None` — книги у агента нет.
+            "invariants": (
+                {
+                    "in_request": self._invariants_in_request,
+                    "view": asdict(
+                        self._invariants.describe(always, self._messages)
+                    ),
+                    "path": (
+                        self._invariant_store.path
+                        if self._invariant_store is not None
+                        else None
+                    ),
+                }
+                if self._invariants is not None
+                else None
+            ),
         }
 
     # --- Внутреннее ------------------------------------------------------
@@ -1799,6 +2060,7 @@ class Agent:
         long_term: dict | None = None,
         profile: "user_profile.UserProfile | None" = None,
         mode_choice: "user_profile.ModeChoice | None" = None,
+        always: list[dict] | None = None,
     ) -> list[dict]:
         """Единственное место, где собирается список сообщений для запроса.
 
@@ -1825,6 +2087,13 @@ class Agent:
         вызывается первым — до слоёв и профиля, — поэтому в итоге он
         оказывается последним из трёх, сразу за рабочей памятью и перед
         памятью стратегии: порядок вызовов обратен порядку блоков.
+
+        День 14 дописывает блок инвариантов (§6.5): `_with_invariants()`
+        вызывается последним — после задачи, слоёв и профиля, — поэтому в
+        итоге он оказывается первым из блоков, сразу за системным промптом:
+        инвариант устойчивее всего остального и старше всего остального.
+        `always` — снимок постоянных инвариантов этого хода; `None` — взять
+        свежий (панель).
         """
         if long_term is None:
             long_term = self._long_term_entries()
@@ -1832,12 +2101,56 @@ class Agent:
             profile = self._profile_snapshot()
         if mode_choice is None:
             mode_choice = self._preview_mode_choice(profile)
+        if always is None:
+            always = self._invariant_snapshot()
         messages = self.strategy.build(
             self._config.system_prompt, self._messages, user_message
         )
         messages = self._with_task(messages)
         messages = self._with_layers(messages, long_term)
-        return self._with_profile(messages, profile, mode_choice)
+        messages = self._with_profile(messages, profile, mode_choice)
+        return self._with_invariants(messages, always)
+
+    def _with_invariants(self, messages: list[dict], always: list[dict]) -> list[dict]:
+        """Блок инвариантов в готовом списке сообщений — единственное место,
+        где он туда попадает (спецификация дня 14, §6.5). Уходит только если
+        блок не `None` (действующих инвариантов нет) и переключатель
+        «Инварианты в запросе» включён — выключенный убирает весь блок,
+        включая строку конфликта. Встаёт сразу после системного промпта;
+        стратегии, модель памяти, профиль и автомат о блоке не знают."""
+        if self._invariants is None or not self._invariants_in_request or not messages:
+            return messages
+        block = self._invariants.block(always, self._messages)
+        if block is None:
+            return messages
+        return messages[:1] + [block] + messages[1:]
+
+    def _invariant_snapshot(self) -> list[dict]:
+        """Снимок постоянных инвариантов на ход (день 14, §6.2) — копия
+        списка из памяти процесса (файл хранилище читает один раз, при
+        создании); `[]` — хранилища или книги нет: без книги читать
+        постоянные инварианты некому."""
+        if self._invariants is None or self._invariant_store is None:
+            return []
+        return self._invariant_store.current()
+
+    def _transition_guards(
+        self, always: list[dict]
+    ) -> tuple["task_state.TransitionGuard", ...]:
+        """Единственное место, где инварианты превращаются в ограничения
+        автомата (день 14, §6.4): книга про автомат не знает, автомат про
+        инварианты не знает — связывает их агент, как на дне 13 он связывает
+        хранилище и модель памяти. Книги нет — пустой кортеж, и автомат
+        ведёт себя как на дне 13."""
+        if self._invariants is None:
+            return ()
+        return tuple(
+            task_state.TransitionGuard(
+                event=inv.event, mode=inv.mode, reason=inv.text,
+                source_note=f"инвариант {inv.id}",
+            )
+            for inv in self._invariants.transition_invariants(always)
+        )
 
     def _with_task(self, messages: list[dict]) -> list[dict]:
         """Блок состояния задачи в готовом списке сообщений — единственное
@@ -1942,6 +2255,7 @@ class Agent:
         long_term: dict | None = None,
         profile: "user_profile.UserProfile | None" = None,
         mode_choice: "user_profile.ModeChoice | None" = None,
+        always: list[dict] | None = None,
     ) -> tuple[list[dict], ContextView]:
         """Сборка запроса и всё, что про неё нужно знать панели и логам, —
         одним проходом.
@@ -1956,7 +2270,8 @@ class Agent:
         снимок этого хода, панель — `None`, и тогда берётся свежий. `profile`
         и `mode_choice` (день 12) — тем же приёмом: `ask()` передаёт снимок и
         решение этого хода, панель — `None`, и тогда берётся превью без
-        вызова роутера.
+        вызова роутера. `always` (день 14) — снимок постоянных инвариантов, тем
+        же приёмом.
         """
         if long_term is None:
             long_term = self._long_term_entries()
@@ -1964,7 +2279,11 @@ class Agent:
             profile = self._profile_snapshot()
         if mode_choice is None:
             mode_choice = self._preview_mode_choice(profile)
-        messages = self._build_messages(question, long_term, profile, mode_choice)
+        if always is None:
+            always = self._invariant_snapshot()
+        messages = self._build_messages(
+            question, long_term, profile, mode_choice, always
+        )
         usage = tokens.context_usage(
             self._count_messages(messages),
             model=self._config.model,
@@ -1977,17 +2296,22 @@ class Agent:
         # с дня 12 — с тем же профилем, с дня 13 — с тем же блоком задачи:
         # экономия говорит только о стратегии, а не о том, что слои, профиль
         # или задача добавили.
+        # С дня 14 — с тем же блоком инвариантов.
         full = self._count_messages(
-            self._with_profile(
-                self._with_layers(
-                    self._with_task(
-                        _FULL_HISTORY.build(
-                            self._config.system_prompt, self._messages, question
-                        )
+            self._with_invariants(
+                self._with_profile(
+                    self._with_layers(
+                        self._with_task(
+                            _FULL_HISTORY.build(
+                                self._config.system_prompt, self._messages,
+                                question,
+                            )
+                        ),
+                        long_term,
                     ),
-                    long_term,
+                    profile, mode_choice,
                 ),
-                profile, mode_choice,
+                always,
             )
         )
         state = self.strategy.describe(self._messages)
@@ -2185,6 +2509,147 @@ class Agent:
                 self._config.model, prompt_tokens, completion_tokens
             ),
             elapsed=elapsed,
+        )
+
+    def _run_invariant_guard(
+        self, client: OpenAI, question: str, always: list[dict]
+    ) -> tuple["invariants.Conflict | None", ServiceCall | None]:
+        """Страж инвариантов перед ответом (спецификация дня 14, §6.3):
+        `prepare()` → `_call_service_model()` → `apply()`.
+
+        Сверять нечего — `(None, None)`: нет книги, нет истории, пустая
+        книга, все инварианты выключены, остались только инварианты над
+        переходами, вопрос пустой (`InvariantBook.prepare()` сам это решает).
+        Страж только называет конфликт нового сообщения с инвариантами: ход не
+        отменяется и ничего не блокируется — отказывает ассистент, а код
+        только показывает конфликт (§2.5).
+
+        Сбой хода не отменяет (правило дня 9 для служебного вызова):
+        исключение API, пустой и неразобранный ответ оставляют последний
+        конфликт как был. **Обрезанный потолком ответ применяется** с
+        предупреждением в логе и пометкой в панели — в отличие от трекера
+        (§2.4 дня 13): вердикт стоит первой строкой и разбирается даже у
+        оборванного ответа, а потерянный номер ограничения лишь сузит строку
+        конфликта. Номера вне списка стража отклоняются и видны в логе.
+        """
+        if self._invariants is None or not self._config.keep_history:
+            return None, None
+        task = self._invariants.prepare(always, self._messages, question)
+        if task is None:
+            return None, None
+
+        started = time.perf_counter()
+        try:
+            result = self._call_service_model(client, task.messages, task.max_tokens)
+        except Exception as exc:
+            logger.exception("[%s] страж инвариантов упал", self._log_name)
+            call = ServiceCall(
+                kind="invariant", label=task.label, ok=False, error=str(exc),
+                elapsed=time.perf_counter() - started,
+                prompt_tokens=None, completion_tokens=None, total_tokens=None,
+                cost_usd=None, covers=0, folded_tokens=0, text="",
+                memory_label=invariants.GUARD_CALL_LABEL,
+            )
+            self._record_guard(call)
+            logger.warning(
+                "[%s] страж инвариантов — %s: не удался (%s); ход не "
+                "отменяется — последний конфликт не тронут, основной вызов "
+                "идёт без проверки этого сообщения",
+                self._log_name, task.label, call.error,
+            )
+            return None, call
+
+        text = result.text
+        if not text:
+            call = ServiceCall(
+                kind="invariant", label=task.label, ok=False,
+                error="модель вернула пустой ответ",
+                elapsed=result.elapsed,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens, cost_usd=result.cost_usd,
+                covers=0, folded_tokens=0, text="",
+                finish_reason=result.finish_reason,
+                memory_label=invariants.GUARD_CALL_LABEL,
+            )
+            self._record_guard(call)
+            logger.warning(
+                "[%s] страж инвариантов — %s: модель вернула пустой ответ "
+                "(finish_reason=%s) — последний конфликт не тронут",
+                self._log_name, task.label, result.finish_reason,
+            )
+            return None, call
+
+        conflict, parsed = self._invariants.apply(
+            task, text, always, self._messages, _now_iso()
+        )
+        truncated = result.finish_reason == "length"
+        if not parsed:
+            error = "ответ стража не разобран"
+        elif truncated:
+            error = "ответ оборван потолком, применён как есть"
+        else:
+            error = None
+        update = self._invariants.last_update
+        call = ServiceCall(
+            kind="invariant",
+            label=task.label,
+            ok=parsed,
+            error=error,
+            elapsed=result.elapsed,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            cost_usd=result.cost_usd,
+            covers=0,
+            folded_tokens=0,
+            text=text,
+            finish_reason=result.finish_reason,
+            memory_label=invariants.GUARD_CALL_LABEL,
+            memory_update=update if parsed else "",
+        )
+        self._record_guard(call)
+        if not parsed:
+            logger.warning(
+                "[%s] страж инвариантов — %s: ответ не разобран (начало: %r) "
+                "— последний конфликт не тронут",
+                self._log_name, task.label, text[:200],
+            )
+            return None, call
+
+        numbers = (
+            f"; книга: {self._book_count_str(always)}" if conflict is None else ""
+        )
+        logger.info(
+            "[%s] страж инвариантов: %s → %s%s; finish_reason=%s %.2fs, "
+            "tokens=%s/%s/%s, cost=%s; ответ: %r",
+            self._log_name, task.label, update, numbers, result.finish_reason,
+            result.elapsed, _num(result.prompt_tokens),
+            _num(result.completion_tokens), _num(result.total_tokens),
+            _cost_str(result.cost_usd), text,
+        )
+        if conflict is not None and conflict.unknown:
+            # `info`, а не `warning`: это решение книги, а не сбой вызова.
+            logger.info(
+                "[%s] страж инвариантов: назван конфликт с «%s» — такого "
+                "инварианта в списке стража нет, эти номера отклонены",
+                self._log_name, "», «".join(conflict.unknown),
+            )
+        if truncated:
+            logger.warning(
+                "[%s] страж инвариантов — %s: ответ упёрся в max_tokens=%s и "
+                "оборван на полуслове — применён как есть; если это "
+                "повторяется, потолок мал (спецификация дня 14, §3.5)",
+                self._log_name, task.label, task.max_tokens,
+            )
+        return conflict, call
+
+    def _book_count_str(self, always: list[dict]) -> str:
+        """«4 инварианта в книге (3 действуют)» — для строки лога стража."""
+        view = self._invariants.describe(always, self._messages)
+        return (
+            f"{len(view.items)} {_invariants_word(len(view.items))} в книге "
+            f"({view.active} действуют)"
         )
 
     def _run_memory_task(
@@ -2422,7 +2887,7 @@ class Agent:
         return choice, call
 
     def _run_task_tracker(
-        self, client: OpenAI, question: str
+        self, client: OpenAI, question: str, always: list[dict] | None = None
     ) -> tuple["task_state.Outcome | None", ServiceCall | None]:
         """Трекер задачи перед ответом (спецификация дня 13, §5.3):
         `prepare()` → `_call_service_model()` → `apply()`.
@@ -2438,6 +2903,12 @@ class Agent:
         сводки, фактов и разбора памяти: оборванный ответ трекера — это
         оборванный план, а утверждённый план с потерянными шагами пользователь
         не заметит до этапа проверки (§2.4).
+
+        С дня 14 (§6.4) автомату уходят ограничения переходов, собранные из
+        инвариантов (`_transition_guards()`): переход трекера под ограничением
+        «с подтверждением» не применяется, а становится ожиданием — состояние
+        не менялось, отказа нет, ждёт кнопки «Подтвердить переход». `always` —
+        снимок постоянных инвариантов этого хода; `None` — взять свежий.
         """
         if self._task is None or not self._config.keep_history:
             return None, None
@@ -2507,7 +2978,12 @@ class Agent:
             )
             return None, call
 
-        outcome, parsed = self._task.apply(task, text, self._messages, _now_iso())
+        if always is None:
+            always = self._invariant_snapshot()
+        outcome, parsed = self._task.apply(
+            task, text, self._messages, _now_iso(),
+            self._transition_guards(always),
+        )
         call = ServiceCall(
             kind="task",
             label=task.label,
@@ -2531,6 +3007,20 @@ class Agent:
         # не меняют — сохранять нечего.
         if outcome.changed:
             self._persist()
+        if outcome.pending is not None:
+            logger.info(
+                "[%s] задача: «%s» ждёт подтверждения пользователя (%s) — "
+                "состояние не изменилось: %s",
+                self._log_name, outcome.pending.event,
+                outcome.pending.source_note,
+                self._task.describe(self._messages).step_text,
+            )
+        elif outcome.rejection is not None:
+            logger.info(
+                "[%s] задача: отклонено «%s» (%s): %s",
+                self._log_name, outcome.rejection.event,
+                outcome.rejection.source, outcome.rejection.reason,
+            )
         if not parsed:
             logger.warning(
                 "[%s] трекер задачи — %s: ответ не разобран (начало: %r) — "
@@ -2591,6 +3081,11 @@ class Agent:
 
         С дня 13 (§5.7) так же отделяется блок состояния задачи: то, что
         начинается с `task_state.TASK_HEADER`, — корзина `task`.
+
+        С дня 14 (§7.2) так же отделяется блок инвариантов: то, что начинается
+        с `invariants.INVARIANT_HEADER`, — корзина `invariants`; корзина
+        `memory` (память стратегии) — то, что не начинается ни с одного из
+        пяти заголовков.
         """
         middle = messages[1:-1]
         system = [
@@ -2599,6 +3094,7 @@ class Agent:
         named = (
             memory.LONG_TERM_HEADER, memory.WORKING_HEADER,
             user_profile.PROFILE_HEADER, task_state.TASK_HEADER,
+            invariants.INVARIANT_HEADER,
         )
         return tokens.count_request(
             system_prompt=messages[0]["content"],
@@ -2616,6 +3112,10 @@ class Agent:
             ),
             task="\n\n".join(
                 text for text in system if text.startswith(task_state.TASK_HEADER)
+            ),
+            invariants="\n\n".join(
+                text for text in system
+                if text.startswith(invariants.INVARIANT_HEADER)
             ),
         )
 
@@ -2639,16 +3139,17 @@ class Agent:
         когда занято больше `WARN_RATIO`: приближение к лимиту должно быть
         видно в терминале, а не только в панели."""
         request = budget.request
-        # Слагаемые — в порядке блоков запроса (день 13, §2.7): профиль,
-        # долговременная и рабочая память, задача стоят между системным
-        # промптом и памятью стратегии.
+        # Слагаемые — в порядке блоков запроса (день 14, §2.7): инварианты,
+        # профиль, долговременная и рабочая память, задача стоят между
+        # системным промптом и памятью стратегии.
         logger.info(
-            "[%s] бюджет: система %s + профиль %s + долговременная %s + "
-            "рабочая %s + задача %s + память стратегии %s + история %s + "
-            "вопрос %s + служебные %s ≈ %s из %s доступных (%s); окно %s, "
-            "резерв под ответ %s",
+            "[%s] бюджет: система %s + инварианты %s + профиль %s + "
+            "долговременная %s + рабочая %s + задача %s + память стратегии "
+            "%s + история %s + вопрос %s + служебные %s ≈ %s из %s "
+            "доступных (%s); окно %s, резерв под ответ %s",
             self._log_name,
-            _num(request.system), _num(request.profile), _num(request.long_term),
+            _num(request.system), _num(request.invariants), _num(request.profile),
+            _num(request.long_term),
             _num(request.working), _num(request.task), _num(request.memory),
             _num(request.history), _num(request.question), _num(request.overhead),
             _num(budget.used), _num(budget.available), _ratio_str(budget.ratio),
@@ -2736,6 +3237,12 @@ class Agent:
         # правилом: только непустое.
         if self._task is not None and (task_dump := self._task.dump()):
             data["task"] = task_dump
+        # Сессионные инварианты (день 14, §6.8) — рядом с рабочей памятью и
+        # задачей и тем же правилом: только непустые. Постоянные лежат в
+        # своём файле, последний конфликт и переключатель — не состояние
+        # диалога.
+        if self._invariants is not None and (invariants_dump := self._invariants.dump()):
+            data["invariants"] = invariants_dump
         if self._checkpoints:
             data["checkpoints"] = [_checkpoint_dump(cp) for cp in self._checkpoints]
         if self._branch is not None:
@@ -2793,6 +3300,8 @@ class Agent:
         # Состояние задачи (день 13) — тем же приёмом и из файла сессии, и из
         # `seed` ветки.
         self._load_task(data.get("task"))
+        # Сессионные инварианты (день 14) — тем же приёмом.
+        self._load_invariants(data.get("invariants"))
         # Checkpoint'ы и происхождение ветки (день 10) — тем же приёмом, что
         # память стратегий: мусор переживается с предупреждением, историю
         # читать это не мешает. `self._messages` здесь уже проставлены — и при
@@ -2848,6 +3357,30 @@ class Agent:
             self._startup_warnings.append(
                 "состояние задачи в файле прочитано не целиком (битые или "
                 "лишние поля) — работаем с тем, что удалось разобрать"
+            )
+
+    def _load_invariants(self, data: object) -> None:
+        """Сессионные инварианты из `context.invariants` (день 14, §6.8).
+        Ключа нет — пусто без предупреждений: это файл дня 13. Не список —
+        пусто с предупреждением. Мусор внутри списка книга переживает молча
+        (логов у `invariants.py` нет), и что прочитано не всё, агент узнаёт
+        сам приёмом дня 9: сравнивает `dump()` с прочитанным.
+
+        У агента без книги сессионные инварианты из файла не читаются — это
+        поведение дня 13, и первая запись перепишет блок `context` без них."""
+        if self._invariants is None or data is None:
+            return
+        if not isinstance(data, list):
+            self._startup_warnings.append(
+                f"сессионные инварианты в файле имеют тип {type(data).__name__} "
+                f"вместо списка — сессионных инвариантов нет"
+            )
+            return
+        self._invariants.load(data)
+        if self._invariants.dump() != data:
+            self._startup_warnings.append(
+                "сессионные инварианты в файле прочитаны не целиком — "
+                "работаем с тем, что удалось разобрать"
             )
 
     def _parse_checkpoints(self, data: object) -> list[Checkpoint]:
@@ -2928,10 +3461,21 @@ class Agent:
                 f"прочитан с пустым снимком"
             )
             task_snapshot = {}
+        # Снимок сессионных инвариантов (день 14, §6.8) — тем же приёмом.
+        invariants_snapshot = item.get("invariants")
+        if invariants_snapshot is None:
+            invariants_snapshot = []
+        elif not isinstance(invariants_snapshot, list):
+            self._startup_warnings.append(
+                f"checkpoint «{checkpoint_id}»: снимок сессионных инвариантов "
+                f"имеет тип {type(invariants_snapshot).__name__} вместо списка "
+                f"— checkpoint прочитан с пустым снимком"
+            )
+            invariants_snapshot = []
         return Checkpoint(
             id=checkpoint_id, messages=messages, strategy=strategy,
             memory=memory, created_at=created_at, working=working,
-            task=task_snapshot,
+            task=task_snapshot, invariants=invariants_snapshot,
         )
 
     def _parse_branch(self, data: object) -> BranchOrigin | None:
@@ -2980,12 +3524,14 @@ class Agent:
         return max(numbers, default=0) + 1
 
     def _unchanged_checkpoint(
-        self, memory: dict, working: dict | None = None, task: dict | None = None
+        self, memory: dict, working: dict | None = None, task: dict | None = None,
+        invariants: list | None = None,
     ) -> Checkpoint | None:
         """Последний checkpoint, если он совпадает с тем, что получился бы
         сейчас, — та же длина истории, та же стратегия, тот же снимок памяти
-        стратегий, (день 11) тот же снимок рабочей памяти и (день 13) тот же
-        снимок задачи. Только последний: более ранний совпадающий checkpoint
+        стратегий, (день 11) тот же снимок рабочей памяти, (день 13) тот же
+        снимок задачи и (день 14) тот же снимок сессионных инвариантов. Только
+        последний: более ранний совпадающий checkpoint
         не должен мешать завести новый в другой точке истории."""
         if not self._checkpoints:
             return None
@@ -2996,6 +3542,7 @@ class Agent:
             and last.memory == memory
             and last.working == (working or {})
             and last.task == (task or {})
+            and last.invariants == (invariants or [])
         ):
             return last
         return None
@@ -3040,6 +3587,20 @@ class Agent:
         pause = ", на паузе" if view.paused else ""
         return f", задача: {view.stage}, {view.step_text}{pause}"
 
+    def _invariants_note(self) -> str:
+        """Кусок строки «агент создан» про инварианты (день 14, §6.10):
+        «инварианты: 3 действуют (2 постоянных, 1 этой сессии)» или, если
+        книги нет, «книги инвариантов нет»."""
+        if self._invariants is None:
+            return ", книги инвариантов нет"
+        view = self._invariants.describe(self._invariant_snapshot(), self._messages)
+        if not view.items:
+            return ", инвариантов нет"
+        return (
+            f", инварианты: {view.active} действуют ({view.always} "
+            f"{_permanent_word(view.always)}, {view.session} этой сессии)"
+        )
+
     def _long_term_count_str(self) -> str:
         """«5 зап. в src/data/memory/long_term.json» — сколько записей
         долговременной памяти использует карта; «не подключена» — хранилища
@@ -3080,13 +3641,17 @@ class Agent:
         task_call: ServiceCall | None = None,
         task_event: str = "",
         task_note: str = "",
+        guard_call: ServiceCall | None = None,
+        conflict: str = "",
+        conflict_note: str = "",
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
         случай, когда оценку хочется видеть. У ошибки без ключа считать нечего.
         Разбор памяти (день 11), роутер профиля (день 12) и трекер задачи
-        (день 13), применённые до упавшего вызова, уже оплачены и сохранены —
-        они едут в ответ, чтобы панель показала и их.
+        (день 13) и страж инвариантов (день 14), применённые до упавшего
+        вызова, уже оплачены и сохранены — они едут в ответ, чтобы панель
+        показала и их.
         """
         reply = AgentReply(
             ok=False,
@@ -3110,6 +3675,9 @@ class Agent:
             task_call=task_call,
             task_event=task_event,
             task_note=task_note,
+            guard_call=guard_call,
+            conflict=conflict,
+            conflict_note=conflict_note,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
@@ -3124,6 +3692,7 @@ class Agent:
         memory_call: ServiceCall | None = None,
         route_call: ServiceCall | None = None,
         task_call: ServiceCall | None = None,
+        guard_call: ServiceCall | None = None,
     ) -> None:
         """Строка журнала ходов — только на успешный вызов и после `_record()`:
         накопительные числа берутся из уже обновлённых счётчиков агента.
@@ -3176,6 +3745,14 @@ class Agent:
                 tracker_tokens=(task_call.total_tokens or 0) if task_call else 0,
                 tracker_cost_usd=task_call.cost_usd if task_call else None,
                 tracker_elapsed=task_call.elapsed if task_call else 0.0,
+                # Корзина инвариантов, сколько их действовало, номера
+                # конфликта этого хода и цена стража (день 14, §6.9).
+                invariant_tokens=view.usage.request.invariants,
+                invariants_active=self._active_invariants(),
+                conflict=reply.conflict,
+                guard_tokens=(guard_call.total_tokens or 0) if guard_call else 0,
+                guard_cost_usd=guard_call.cost_usd if guard_call else None,
+                guard_elapsed=guard_call.elapsed if guard_call else 0.0,
             )
         )
         # Экономия копится по ходам и может быть отрицательной: на коротком
@@ -3229,6 +3806,23 @@ class Agent:
         self._totals["tracker_calls"] += 1
         self._totals["tracker_tokens"] += call.total_tokens or 0
         self._totals["tracker_cost_usd"] += call.cost_usd or 0.0
+
+    def _record_guard(self, call: ServiceCall) -> None:
+        """Учёт стража инвариантов (день 14, §6.9): в общих счётчиках агента
+        и процесса — как любой вызов, и отдельно в своих `guard_*`. Не в
+        `service_*`, `memory_*`, `route_*` и `tracker_*` — у каждой служебной
+        работы своя цена. В калибровку не идёт по той же причине, что
+        остальные служебные вызовы."""
+        self._record_extra_call(call)
+        self._totals["guard_calls"] += 1
+        self._totals["guard_tokens"] += call.total_tokens or 0
+        self._totals["guard_cost_usd"] += call.cost_usd or 0.0
+
+    def _active_invariants(self) -> int:
+        """Сколько инвариантов действует сейчас; 0 — книги нет."""
+        if self._invariants is None:
+            return 0
+        return self._invariants.describe(self._invariant_snapshot(), self._messages).active
 
     def _record_extra_call(self, call: ServiceCall) -> None:
         """Общая часть учёта служебного вызова и разбора памяти: вызов, ошибка,
@@ -3308,8 +3902,9 @@ def _now_iso() -> str:
 
 
 def _checkpoint_dump(checkpoint: Checkpoint) -> dict:
-    """Checkpoint для файла сессии. Пустой снимок рабочей памяти (день 11) и
-    пустой снимок задачи (день 13) не пишутся — тем же правилом, что пустая
+    """Checkpoint для файла сессии. Пустой снимок рабочей памяти (день 11),
+    пустой снимок задачи (день 13) и пустой снимок сессионных инвариантов
+    (день 14) не пишутся — тем же правилом, что пустая
     память стратегий: checkpoint агента без них выглядит на диске ровно как
     checkpoint дня 10."""
     data = asdict(checkpoint)
@@ -3317,6 +3912,8 @@ def _checkpoint_dump(checkpoint: Checkpoint) -> dict:
         data.pop("working", None)
     if not data.get("task"):
         data.pop("task", None)
+    if not data.get("invariants"):
+        data.pop("invariants", None)
     return data
 
 
@@ -3336,6 +3933,36 @@ def _modes_word(count: int) -> str:
             return "режима"
         case _:
             return "режимов"
+
+
+def _permanent_word(count: int) -> str:
+    """«1 постоянный» / «2 постоянных»."""
+    return "постоянный" if count % 10 == 1 and count % 100 != 11 else "постоянных"
+
+
+def _invariants_word(count: int) -> str:
+    """«1 инвариант» / «2 инварианта» / «5 инвариантов»."""
+    if 11 <= count % 100 <= 14:
+        return "инвариантов"
+    match count % 10:
+        case 1:
+            return "инвариант"
+        case 2 | 3 | 4:
+            return "инварианта"
+        case _:
+            return "инвариантов"
+
+
+def _on_off(value: bool) -> str:
+    return "включено" if value else "выключено"
+
+
+def _conflict_note(conflict: "invariants.Conflict | None") -> str:
+    """Что просит пользователь, из ответа стража, — для статуса и лога;
+    `чем` пусто — формулировки затронутых инвариантов; конфликта нет — `""`."""
+    if conflict is None:
+        return ""
+    return conflict.why or "; ".join(conflict.texts)
 
 
 def _quoted(value: str | None) -> str:

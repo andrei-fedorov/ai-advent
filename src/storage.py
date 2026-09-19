@@ -1,6 +1,7 @@
 # TooManyRules — хранилище истории диалогов (день 7, неделя 2; день 9 —
 # формат версии 2, память стратегии рядом с историей; день 11 — долговременная
-# память в отдельном файле; день 12 — профиль пользователя в отдельном файле).
+# память в отдельном файле; день 12 — профиль пользователя в отдельном файле;
+# день 14 — постоянные инварианты в отдельном файле).
 #
 # Реализация протокола `HistoryStore`, объявленного в `agent.py` на дне 6:
 # одна сессия — один JSON-файл в `src/data/sessions/`. День 6 объявил
@@ -35,6 +36,15 @@
 # (его собирает `app.py` из `presets.DEFAULT_PROFILE`) — `storage.py`
 # по-прежнему не импортирует ничего из проекта. Поля профиля и режимы для
 # хранилища непрозрачны — это работа `user_profile.py`.
+#
+# День 14 добавляет четвёртое хранилище — `JsonInvariantStore`, постоянные
+# инварианты (спецификация дня 14, §7.1). Устройство — копия `JsonProfileStore`
+# слово в слово, и это осознанно: у постоянных инвариантов та же задача, что у
+# профиля, — один файл на каталог данных, который пишет человек. Каталог —
+# сосед `sessions/`, `memory/` и `profile/`. Поля инварианта, области и события
+# автомата хранилищу непрозрачны: для него это список словарей, разбирает его
+# `invariants.py`. Сессионные инварианты сюда не относятся — они едут в
+# `context.invariants` файла сессии тем же непрозрачным блоком.
 
 import contextlib
 import copy
@@ -89,6 +99,15 @@ PROFILE_DIR = DATA_DIR.parent / "profile"
 
 # Версия формата файла профиля. Своя, как у долговременной памяти.
 PROFILE_FORMAT_VERSION = 1
+
+# Каталог постоянных инвариантов (день 14, §7.1) — сосед каталогов сессий,
+# долговременной памяти и профиля, тем же правилом: экземпляр с другим
+# `TOOMANYRULES_DATA_DIR` получает свои инварианты и не пишет в инварианты
+# автора.
+INVARIANT_DIR = DATA_DIR.parent / "invariants"
+
+# Версия формата файла инвариантов. Своя, как у профиля.
+INVARIANT_FORMAT_VERSION = 1
 
 
 class StorageError(Exception):
@@ -765,6 +784,157 @@ class JsonProfileStore:
         self._writable = False
         self._error = f"{reason}; действует профиль по умолчанию, запись выключена, файл не тронут"
         logger.warning("профиль: %s", self._error)
+
+
+class JsonInvariantStore:
+    """Постоянные инварианты в одном JSON-файле, общем для всех сессий и
+    агентов процесса (день 14, §7.1). Хранилище не знает ни полей инварианта,
+    ни областей, ни событий автомата: инварианты для него — непрозрачный
+    список словарей.
+
+    Экземпляр в приложении один на процесс, как `JsonProfileStore`. Файл
+    читается один раз при создании, дальше список живёт в памяти процесса.
+    Нет файла — действует список по умолчанию, переданный конструктору:
+    правка инвариантов по умолчанию в коде до сохранённого файла уже не
+    доезжает — это данные пользователя, а не промпт разработчика (§2.6).
+    """
+
+    def __init__(self, default: list[dict], path: Path | None = None) -> None:
+        self._path = Path(path) if path is not None else INVARIANT_DIR / "invariants.json"
+        # Замок нужен по той же причине, что у профиля: две вкладки,
+        # сохраняющие инварианты одновременно, без него записали бы файл в
+        # обратном порядке.
+        self._lock = threading.Lock()
+        self._default = copy.deepcopy(default) if isinstance(default, list) else []
+        self._current: list[dict] = copy.deepcopy(self._default)
+        self._error: str | None = None
+        self._saved = False
+        # Запись выключается ровно в одном случае — файл есть, но не
+        # прочитался: не затираем то, что сегодня не прочиталось (день 7).
+        self._writable = True
+        self._load()
+
+    @property
+    def path(self) -> str:
+        """Путь к файлу для логов и панели — от корня репозитория."""
+        return display_path(self._path)
+
+    @property
+    def error(self) -> str | None:
+        """Почему файл не прочитался или не записался; `None` — всё в порядке."""
+        return self._error
+
+    @property
+    def saved(self) -> bool:
+        """Есть ли сохранённый файл; `False` — действуют инварианты по
+        умолчанию."""
+        return self._saved
+
+    def current(self) -> list[dict]:
+        """Копия текущего списка постоянных инвариантов: из файла или по
+        умолчанию. Без замка, как `JsonProfileStore.current()`: список
+        подменяется целиком после записи."""
+        return copy.deepcopy(self._current)
+
+    def save(self, items: list[dict], changed: str = "") -> list[dict]:
+        """Записывает список целиком, атомарно и под замком хранилища — оно
+        общее для агентов. `changed` — слова для строки лога. Сбой записи или
+        выключенная запись — `StorageError`, кэш остаётся прежним."""
+        with self._lock:
+            if not self._writable:
+                raise StorageError(
+                    f"запись инвариантов выключена: {self._error}"
+                )
+            invariants = copy.deepcopy(items) if isinstance(items, list) else []
+            payload = {
+                "version": INVARIANT_FORMAT_VERSION,
+                "updated_at": _now(),
+                "invariants": invariants,
+            }
+            tmp_path = self._path.with_name(self._path.name + ".tmp")
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp_path, self._path)
+            except OSError as exc:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink(missing_ok=True)
+                self._error = f"не удалось записать {self.path}: {exc}"
+                logger.warning("инварианты: %s", self._error)
+                raise StorageError(self._error) from exc
+
+            self._current = invariants
+            self._saved = True
+            self._error = None
+            logger.info(
+                "инварианты: сохранено%s → %s",
+                f" — {changed}" if changed else "",
+                self.path,
+            )
+            return copy.deepcopy(self._current)
+
+    def read_file(self) -> dict | None:
+        """Сырое содержимое файла для дебаг-панели: `None`, если файла нет
+        или он не читается. Панель перечитывает файл на каждом событии
+        интерфейса, поэтому успешное чтение логируется на уровне `debug`."""
+        if not self._path.exists():
+            return None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "инварианты: файл не показан в панели — %s: %s", self.path, exc,
+            )
+            return None
+        logger.debug("прочитан файл инвариантов (%s)", self.path)
+        return data if isinstance(data, dict) else None
+
+    # --- Внутреннее ------------------------------------------------------
+
+    def _load(self) -> None:
+        """Чтение файла при создании хранилища. Нет файла — действуют
+        инварианты по умолчанию, это нормально. Файл не читается, не JSON, не
+        той формы — действуют инварианты по умолчанию, запись выключена, файл
+        не трогается. Мусор внутри списка здесь не разбирается — это работа
+        `invariants.parse_invariants()`."""
+        if not self._path.exists():
+            logger.info(
+                "инварианты: файла нет, действуют инварианты по умолчанию — %s "
+                "появится с первым сохранением",
+                self.path,
+            )
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._disable(f"файл {self.path} не прочитался: {exc}")
+            return
+        if not isinstance(data, dict) or not isinstance(data.get("invariants"), list):
+            self._disable(
+                f"файл {self.path} — не файл инвариантов: нет списка invariants"
+            )
+            return
+        version = data.get("version")
+        if version is not None and version != INVARIANT_FORMAT_VERSION:
+            self._disable(
+                f"файл {self.path} — формат версии {version!r}, этот код "
+                f"читает версию {INVARIANT_FORMAT_VERSION}"
+            )
+            return
+        self._current = data["invariants"]
+        self._saved = True
+        logger.info("инварианты: загружены ← %s", self.path)
+
+    def _disable(self, reason: str) -> None:
+        self._writable = False
+        self._error = (
+            f"{reason}; действуют инварианты по умолчанию, запись выключена, "
+            f"файл не тронут"
+        )
+        logger.warning("инварианты: %s", self._error)
 
 
 def _str_or_empty(value: object) -> str:

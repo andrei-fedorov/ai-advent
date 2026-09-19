@@ -2,7 +2,7 @@
 # четыре стратегии, checkpoint'ы и ветки диалога; день 11, неделя 3: модель
 # памяти — три слоя, кандидаты в долговременную память и переключатель слоёв
 # в запросе; день 12: профиль пользователя, роутер режима и переключатель
-# «Профиль в запросе»).
+# «Профиль в запросе»; день 13: состояние задачи; день 14: инварианты).
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
@@ -32,6 +32,15 @@
 # смена стратегии затирали бы несохранённую правку. У редактора свои выходы
 # (`PROFILE_EDITOR_OUTPUTS`) и свои обработчики, а профиль в запросе, режим и
 # переключатель по-прежнему приходят из агента и хранилища на каждом событии.
+#
+# День 14 (спецификация дня 14, §8) держит то же правило и то же исключение:
+# книга инвариантов, последний конфликт и ожидание подтверждения перехода
+# приходят из `debug_state()["invariants"]`, постоянные инварианты — из
+# хранилища, таблица переходов — из `task_state.TRANSITIONS`; своей копии у
+# интерфейса нет. Исключение одно, как у профиля: **редактор инвариантов — форма,
+# а не вид** (свои выходы `INVARIANT_EDITOR_OUTPUTS`, свой `demo.load`). Из
+# `invariants.py` интерфейс берёт разбор, проверку и запись инвариантов для
+# редактора и подписи областей: книгу агенту выдаёт `presets.make_invariants()`.
 #
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
@@ -65,7 +74,8 @@
 
 import functools
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from datetime import datetime
 
 import gradio as gr
 import pandas as pd
@@ -80,15 +90,31 @@ from agent import (
     estimate_cost_usd,
     process_stats,
 )
+from invariants import (
+    ID_PREFIX,
+    SCOPE_ALWAYS,
+    SCOPE_LABELS,
+    SCOPE_SESSION,
+    SCOPES,
+    Invariant,
+    dump_invariants,
+    parse_invariants,
+    validate,
+)
 from memory import LAYER_LONG_TERM, LAYER_WORKING, REQUEST_LAYERS, long_term_text
 from presets import (
     BRANCH_QUESTION,
     BRANCH_STEPS,
     COMPARISON_SCENARIO,
     CONTROL_QUESTIONS,
+    DEFAULT_INVARIANTS,
     DEFAULT_PRESET,
     DEFAULT_PROFILE,
     DEFAULT_STRATEGY,
+    INVARIANT_EXAMPLES,
+    INVARIANT_MAX_ITEMS,
+    INVARIANT_SCENARIO,
+    INVARIANT_TEXT_WORDS,
     MEMORY_CONTROL_QUESTIONS,
     MEMORY_MAP,
     MEMORY_SCENARIO,
@@ -99,6 +125,7 @@ from presets import (
     ROUTING_SCENARIO,
     STRATEGIES,
     TASK_SCENARIO,
+    make_invariants,
     make_memory,
     make_router,
     make_strategies,
@@ -106,6 +133,7 @@ from presets import (
 )
 from storage import (
     JsonHistoryStore,
+    JsonInvariantStore,
     JsonLongTermStore,
     JsonProfileStore,
     StorageError,
@@ -115,6 +143,8 @@ from task_state import (
     EVENT_CANCEL,
     EVENT_PAUSE,
     EVENT_RESUME,
+    EVENTS,
+    GUARD_MODES,
     MAIN_PATH,
     NO_TASK,
     STAGE_CANCELLED,
@@ -163,6 +193,26 @@ PROFILE = JsonProfileStore(default=dump_profile(DEFAULT_PROFILE))
 # процесс, а не на каждый ход (§5.1: агент их не логирует).
 for _profile_note in parse_profile(PROFILE.current())[1]:
     logger.warning("профиль при старте: %s", _profile_note)
+
+# Постоянные инварианты (день 14, §8.1) — тем же приёмом: один на процесс,
+# общий для всех агентов, рядом со `STORE`, `LONG_TERM` и `PROFILE`. Список по
+# умолчанию хранилище получает параметром — `storage.py` по-прежнему не
+# импортирует ничего из проекта.
+INVARIANTS = JsonInvariantStore(default=dump_invariants(DEFAULT_INVARIANTS))
+# Путь, число инвариантов и замечания разбора — один раз за процесс, как у
+# долговременной памяти и профиля (§6.10): по строке видно, что экземпляр,
+# поднятый с `TOOMANYRULES_DATA_DIR`, не пишет в инварианты автора.
+_start_invariants, _start_notes = parse_invariants(
+    INVARIANTS.current(), EVENTS, GUARD_MODES, scope=SCOPE_ALWAYS,
+    max_items=INVARIANT_MAX_ITEMS,
+)
+logger.info(
+    "инварианты при старте: %d (%d действуют) ← %s%s",
+    len(_start_invariants), sum(1 for inv in _start_invariants if inv.active),
+    INVARIANTS.path, "" if INVARIANTS.saved else " — файла нет, по умолчанию",
+)
+for _invariant_note in _start_notes:
+    logger.warning("инварианты при старте: %s", _invariant_note)
 
 # Сколько агентов поднялось из файлов при старте процесса — заполняется
 # `_restore_agents()` ниже и показывается в строке статуса при открытии
@@ -244,8 +294,10 @@ def _time_of(iso: str) -> str:
     return iso.split("T", 1)[1] if "T" in iso else iso
 
 
-def _metrics_md(last_call: dict | None) -> str:
-    """Метрики последнего вызова агента."""
+def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) -> str:
+    """Метрики последнего вызова агента. `invariants_state` —
+    `debug_state()["invariants"]` (день 14): нужен только для строки «страж не
+    вызывался»."""
     header = "### Последний вызов"
     if last_call is None:
         return (
@@ -267,6 +319,9 @@ def _metrics_md(last_call: dict | None) -> str:
         # показать её здесь — значит не показать нигде, кроме накопленных
         # счётчиков.
         service = _service_lines(last_call.get("service_call"))
+        # Страж инвариантов (день 14) — тем же правилом, перед разбором
+        # памяти: в порядке служебных работ хода.
+        service += _guard_call_lines(last_call, invariants_state)
         # Разбор памяти (день 11) — тем же правилом: применённый до упавшего
         # вызова разбор оплачен и сохранён, и показать его больше негде.
         service += _memory_call_lines(last_call.get("memory_call"))
@@ -311,10 +366,56 @@ def _metrics_md(last_call: dict | None) -> str:
         f"- **Модель:** `{last_call['model']}`",
     ]
     lines += _service_lines(last_call.get("service_call"))
+    # Страж инвариантов (день 14, §8.6) — перед разбором памяти, в порядке
+    # служебных работ хода.
+    lines += _guard_call_lines(last_call, invariants_state)
     lines += _memory_call_lines(last_call.get("memory_call"))
     lines += _route_call_lines(last_call)
     lines += _task_tracker_lines(last_call)
     return "\n".join(lines)
+
+
+def _guard_call_lines(last_call: dict, invariants_state: dict | None) -> list[str]:
+    """Страж инвариантов этого хода (день 14, §8.6) — строкой следом за
+    служебным вызовом стратегии и перед разбором памяти, по образцу
+    `_service_lines()`. Сбой и неразобранный ответ показываются здесь же и за
+    ошибку ответа не выдаются: ход состоялся, конфликт этого сообщения просто
+    не проверен.
+
+    Страж не вызывался, а инварианты есть, — строка про то, почему: причину
+    знает книга (`guard_note`), панель её не выдумывает."""
+    call = last_call.get("guard_call")
+    if call is None:
+        if not invariants_state:
+            return []
+        view = invariants_state["view"]
+        if not view["active"] or not view["guard_note"]:
+            return []
+        return [
+            f"- **🛡 Инварианты:** {view['active']} действуют — страж не "
+            f"вызывался: {view['guard_note']}"
+        ]
+    if not call["ok"]:
+        line = f"- **🛡 Страж инвариантов не удался — {call['label']}:** {call['error']}"
+        if call["text"]:
+            line += f" (начало ответа: «{call['text'][:120]}»)"
+        line += (
+            f" — ход состоялся, конфликт этого сообщения не проверен. "
+            f"Потрачено {_fmt_int(call['total_tokens'] or 0)} токенов."
+        )
+        return [line]
+    line = (
+        f"- **🛡 Страж инвариантов — {call['label']}:** {call['memory_update']}; "
+        f"ответ ≈{_fmt_int(estimate_tokens(call['text']))} токенов, вызов "
+        f"{_fmt_int(call['total_tokens'])} токенов, "
+        f"{_fmt_cost(call['cost_usd'])}, {call['elapsed']:.2f} s"
+    )
+    if call.get("finish_reason") == "length":
+        line += (
+            " — ⚠️ **ответ упёрся в потолок `max_tokens` и оборван на "
+            "полуслове**, применён как есть"
+        )
+    return [line]
 
 
 def _service_lines(service: dict | None) -> list[str]:
@@ -545,11 +646,12 @@ def _context_md(
         + f", резерв под ответ {_fmt_int(usage['answer_reserve'])}",
         # Память стратегии (день 9: сводка; день 10: факты) — слагаемое
         # наравне с остальными: без неё сумма в строке не сходилась бы с
-        # итогом ровно на размер этой памяти. Профиль (день 12), слои памяти
-        # дня 11 и задача (день 13) — тем же правилом, в порядке блоков
-        # запроса: профиль сразу за системой, дальше долговременная и
-        # рабочая, задача, потом память стратегии.
-        f"- **В запросе:** система {_fmt_int(request['system'])} + профиль "
+        # итогом ровно на размер этой памяти. Инварианты (день 14), профиль
+        # (день 12), слои памяти дня 11 и задача (день 13) — тем же правилом,
+        # в порядке блоков запроса: инварианты сразу за системой, дальше
+        # профиль, долговременная и рабочая, задача, потом память стратегии.
+        f"- **В запросе:** система {_fmt_int(request['system'])} + инварианты "
+        f"{_fmt_int(request['invariants'])} + профиль "
         f"{_fmt_int(request['profile'])} + долговременная "
         f"{_fmt_int(request['long_term'])} + рабочая "
         f"{_fmt_int(request['working'])} + задача {_fmt_int(request['task'])} + "
@@ -558,7 +660,15 @@ def _context_md(
         f"вопрос {_fmt_int(request['question'])} + служебные "
         f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(request['total'])}**",
         # Отдельные корзины, а не история: что это за память/профиль и куда
-        # встаёт.
+        # встаёт. Инварианты (день 14) — первыми из блоков агента.
+        f"- **Инварианты в запросе:** "
+        + (
+            f"≈{_fmt_int(request['invariants'])} токенов — блок сразу за "
+            f"системным промптом, первым из блоков агента"
+            if request["invariants"]
+            else "ничего: инвариантов нет, они выключены или «Инварианты в "
+            "запросе» выключено"
+        ),
         f"- **Профиль в запросе:** "
         + (
             f"≈{_fmt_int(request['profile'])} токенов — блок сразу за "
@@ -649,6 +759,7 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
         # история» собрана с тем же профилем, теми же слоями и тем же
         # блоком задачи.
         f"- **Состав запроса:** система {_fmt_int(request['system'])} + "
+        f"инварианты {_fmt_int(request['invariants'])} + "
         f"профиль {_fmt_int(request['profile'])} + долговременная "
         f"{_fmt_int(request['long_term'])} + рабочая "
         f"{_fmt_int(request['working'])} + задача {_fmt_int(request['task'])} + "
@@ -844,6 +955,14 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             "задача": turn["task_tokens"],
             "трекер": turn["tracker_tokens"],
             "время трекера, s": f"{turn['tracker_elapsed']:.2f}",
+            # Колонки дня 14 — в конце (§6.9, §8.6): корзина инвариантов
+            # (блок уходит первым), номера конфликта этого хода (или
+            # прочерк), цена стража — своя колонка, а не часть «служебных»/
+            # «разбора памяти»/«роутера»/«трекера» — и его время.
+            "инварианты": turn["invariant_tokens"],
+            "конфликт": turn["conflict"] or "—",
+            "страж": turn["guard_tokens"],
+            "время стража, s": f"{turn['guard_elapsed']:.2f}",
         }
         for turn in turns
     ]
@@ -856,7 +975,8 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
                  "долговременная", "рабочая", "разбор памяти",
                  "время разбора, s", "режим", "профиль", "роутер",
                  "время роутера, s", "этап", "переход", "задача", "трекер",
-                 "время трекера, s"],
+                 "время трекера, s", "инварианты", "конфликт", "страж",
+                 "время стража, s"],
     )
 
 
@@ -870,7 +990,8 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"- **Вызовов:** {totals['calls']} (из них с ошибкой: "
         f"{totals['errors']}, служебных: {totals['service_calls']}, "
         f"разборов памяти: {totals['memory_calls']}, роутера профиля: "
-        f"{totals['route_calls']}, трекера задачи: {totals['tracker_calls']})\n"
+        f"{totals['route_calls']}, трекера задачи: {totals['tracker_calls']}, "
+        f"стража инвариантов: {totals['guard_calls']})\n"
         f"- **🔢 Токены:** prompt={totals['prompt_tokens']} / "
         f"completion={totals['completion_tokens']} / "
         f"total={totals['total_tokens']}\n"
@@ -902,6 +1023,13 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"{_fmt_int(totals['tracker_tokens'])} токенов, "
         f"{_fmt_cost(totals['tracker_cost_usd'])} — цена ведения задачи по "
         f"разговору; в экономию стратегии не входит\n"
+        # Строка дня 14 (§6.9, §8.6): страж инвариантов — цена сверки каждого
+        # хода с ограничениями, своя строка и свои счётчики.
+        f"- **🛡 Страж инвариантов:** {totals['guard_calls']} "
+        f"{_calls_word(totals['guard_calls'])}, "
+        f"{_fmt_int(totals['guard_tokens'])} токенов, "
+        f"{_fmt_cost(totals['guard_cost_usd'])} — цена сверки каждого хода с "
+        f"ограничениями; в экономию стратегии не входит\n"
         f"- **💲 Стоимость:** {_fmt_cost(totals['cost_usd'])}"
     )
 
@@ -1520,6 +1648,137 @@ def _task_transitions_table_md() -> str:
     return "\n".join(lines)
 
 
+# --- Инварианты (день 14) ---------------------------------------------------
+# Блок «Инварианты», переключатель «Инварианты в запросе», редактор и файл
+# инвариантов. Панель не знает, какие бывают события и режимы, — рисует то,
+# что вернул `InvariantView` из `debug_state()["invariants"]`.
+
+def _invariant_line(item: dict) -> str:
+    """Один инвариант книги строкой: номер, область, пометка «выключен»,
+    пометка перехода и формулировка (§8.4)."""
+    bits = [f"**{item['id']}**", SCOPE_LABELS.get(item["scope"], item["scope"])]
+    if not item["active"]:
+        bits.append("⏸ выключен")
+    if item["event"]:
+        bits.append(f"переход «{item['event']}»: {item['mode']}")
+    bits.append(item["text"])
+    return " · ".join(bits)
+
+
+def _invariants_status(agent: "Agent | None" = None) -> str:
+    """Фраза про инварианты для статуса при открытии страницы (§8.1): у
+    активного агента — сколько действует и сколько из них постоянных; без
+    агента (страница открыта на пустом реестре) — по хранилищу."""
+    if INVARIANTS.error:
+        return f"Инварианты: ⚠️ {INVARIANTS.error}."
+    view = agent.invariant_view if agent is not None else None
+    if view is not None:
+        return (
+            f"Инварианты: {view.active} действуют ({view.always} постоянных, "
+            f"{view.session} этой сессии) — `{INVARIANTS.path}`."
+        )
+    return f"Инварианты: {len(_start_invariants)} в `{INVARIANTS.path}`."
+
+
+def _invariants_md(state: dict, view: dict) -> str:
+    """Блок «Инварианты» (день 14, §8.4) — сразу под «Последним вызовом» и
+    над блоками профиля и памяти, в порядке блоков запроса: инварианты встают
+    в запрос раньше профиля."""
+    inv = state["invariants"]
+    lines = ["### Инварианты", ""]
+    if inv is None:
+        lines.append("У этого агента нет инвариантов: он ведёт себя как на дне 13.")
+        return "\n".join(lines)
+    iv = inv["view"]
+    if not iv["items"]:
+        lines.append(
+            "Инвариантов нет. Добавить — в редакторе под чатом; страж не "
+            "вызывается, блок в запрос не уходит."
+        )
+        return "\n".join(lines)
+
+    lines += [f"- {_invariant_line(item)}" for item in iv["items"]]
+    lines += [
+        "",
+        f"- **Действуют:** {iv['active']} из {len(iv['items'])} — "
+        f"{iv['always']} постоянных, {iv['session']} сессионных; над "
+        f"переходами автомата — {len(iv['guards'])}",
+    ]
+    conflict = iv["conflict"]
+    if conflict is None:
+        lines.append("- **Последний конфликт:** в этом процессе конфликтов ещё не было")
+    else:
+        why = f" — «{conflict['why']}»" if conflict["why"] else ""
+        lines.append(
+            f"- **Последний конфликт:** {', '.join(conflict['ids'])}{why}, "
+            f"{_time_of(conflict['at'])}"
+        )
+        lines += [
+            f"  - {ident}: {text}"
+            for ident, text in zip(conflict["ids"], conflict["texts"])
+        ]
+        if conflict["unknown"]:
+            lines.append(
+                f"  - **Отклонены — номеров нет в списке стража:** "
+                f"{', '.join(conflict['unknown'])}"
+            )
+    if iv["last_update"]:
+        lines.append(f"- **Последний вызов стража:** {iv['last_update']}")
+
+    if not inv["in_request"]:
+        lines.append(
+            "- **В запросе:** не уходит — «Инварианты в запросе» выключено; "
+            "страж и ограничения переходов при этом работают"
+        )
+    elif not iv["block_due"]:
+        lines.append("- **В запросе:** не уходит — действующих инвариантов нет")
+    else:
+        tokens_now = view["usage"]["request"]["invariants"]
+        lines.append(
+            f"- **В запросе:** блок ≈{_fmt_int(tokens_now)} токенов уйдёт в "
+            f"следующий запрос — первым из блоков, сразу за системным промптом"
+        )
+    if not INVARIANTS.saved:
+        where = (
+            f"файла нет — действуют инварианты по умолчанию из `presets.py`, "
+            f"`{INVARIANTS.path}` появится с первым сохранением"
+        )
+    else:
+        where = f"`{INVARIANTS.path}` — один на процесс, общий для всех агентов"
+    lines.append(
+        f"- **Где лежат:** постоянные — {where}; сессионные — "
+        f"`{display_path(STORE.path_for(state['session_id']))}` → "
+        f"`context.invariants`"
+    )
+    if INVARIANTS.error:
+        lines.append(f"- ⚠️ **Хранилище:** {INVARIANTS.error}")
+    lines.append(
+        "- **Страж на следующем ходе:** будет вызван"
+        if iv["guard_due"]
+        else f"- **Страж на следующем ходе:** не будет вызван — {iv['guard_note']}"
+    )
+    pending = state["task"]["view"]["pending_note"] if state["task"] else ""
+    if pending:
+        lines.append(f"- **Ждёт вашего решения:** {pending} — кнопка «✅ Подтвердить переход»")
+    lines += [
+        "",
+        "_Инварианты пишете вы — модель их не пишет и не предлагает. Над "
+        "переходами автомата их проверяет код; в остальном инвариант держит "
+        "модель, и видно это по её ответам, а не по гарантии._",
+    ]
+    return "\n".join(lines)
+
+
+def _invariants_in_request_update(state: dict) -> dict:
+    """Переключатель «Инварианты в запросе»: значение и активность
+    подтягиваются к агенту; нет книги — переключатель неактивен."""
+    inv = state["invariants"]
+    return gr.update(
+        value=inv["in_request"] if inv is not None else False,
+        interactive=inv is not None,
+    )
+
+
 # --- «Агенты процесса»: расход по журналам всех агентов реестра -----------
 
 def _turn_strategies_label(agent: Agent) -> str:
@@ -1559,6 +1818,10 @@ def _agents_table() -> pd.DataFrame:
         # пометкой, задачи нет — прочерком) и токены трекера. Стоимость и
         # среднее время хода включают и трекер.
         "задача", "токены трекера",
+        # Колонки дня 14 — в конце (§6.9, §8.6): сколько инвариантов
+        # действует у агента и токены стража. Стоимость и среднее время хода
+        # включают и стража.
+        "инварианты", "токены стража",
     ]
     rows = []
     for a in agents():
@@ -1569,12 +1832,12 @@ def _agents_table() -> pd.DataFrame:
             total_cost = sum(
                 (t.cost_usd or 0.0) + (t.service_cost_usd or 0.0)
                 + (t.memory_cost_usd or 0.0) + (t.route_cost_usd or 0.0)
-                + (t.tracker_cost_usd or 0.0)
+                + (t.tracker_cost_usd or 0.0) + (t.guard_cost_usd or 0.0)
                 for t in turns
             )
             cost_str = _fmt_cost(total_cost)
         avg_time = (
-            f"{sum(t.elapsed + t.service_elapsed + t.memory_elapsed + t.route_elapsed + t.tracker_elapsed for t in turns) / len(turns):.2f}"
+            f"{sum(t.elapsed + t.service_elapsed + t.memory_elapsed + t.route_elapsed + t.tracker_elapsed + t.guard_elapsed for t in turns) / len(turns):.2f}"
             if turns else "н/д"
         )
         task_view = a.task_view
@@ -1584,6 +1847,7 @@ def _agents_table() -> pd.DataFrame:
             task_str = f"{task_view.stage}, шаг {task_view.step}"
             if task_view.paused:
                 task_str += " ⏸"
+        invariant_view = a.invariant_view
         rows.append({
             "агент": _agent_title(a),
             "сессия": a.session_id,
@@ -1603,6 +1867,8 @@ def _agents_table() -> pd.DataFrame:
             "токены роутера": sum(t.route_tokens for t in turns),
             "задача": task_str,
             "токены трекера": sum(t.tracker_tokens for t in turns),
+            "инварианты": invariant_view.active if invariant_view else "—",
+            "токены стража": sum(t.guard_tokens for t in turns),
         })
     return pd.DataFrame(rows, columns=columns)
 
@@ -1619,9 +1885,10 @@ def _profile_choice_options(choices: list[str]) -> list[tuple[str, str]]:
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 31 значения
-    (18 — до дня 10, 22 — до дня 11, 26 — до дня 12, 29 — до дня 13),
-    позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
+    """Полный вид на состояние агента — фиксированный кортеж из 34 значений
+    (18 — до дня 10, 22 — до дня 11, 26 — до дня 12, 29 — до дня 13, 31 — до
+    дня 14; день 14 добавляет три), позиционно раскладывающийся в
+    `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
     Значения всех выпадающих списков — тоже часть вида: иначе после
@@ -1660,7 +1927,7 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         ),
         status,                                  # 2. строка статуса
         state["config"],                         # 3. конфиг агента
-        _metrics_md(last_call),                  # 4. метрики последнего вызова
+        _metrics_md(last_call, state["invariants"]),  # 4. метрики последнего вызова
         _totals_md(title, state["totals"], model),  # 5. за время жизни
         _process_md(state["process"]),           # 6. счётчики процесса
         gr.update(visible=bool(reasoning)),      # 7. аккордеон с reasoning
@@ -1760,6 +2027,26 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         _task_in_request_update(state),
         # 31. блок «Состояние задачи»
         _task_md(state, view),
+        # Значения дня 14 — в конце кортежа и в конце VIEW_OUTPUTS (§8.8).
+        # 32. переключатель «Инварианты в запросе» — значение и активность
+        #     подтянуты к агенту; нет книги — неактивен
+        _invariants_in_request_update(state),
+        # 33. блок «Инварианты»
+        _invariants_md(state, view),
+        # 34. сырое содержимое файла инвариантов — рядом с файлами сессии,
+        #     долговременной памяти и профиля: четыре файла рядом и есть
+        #     «хранится отдельно от диалога». Перечитывается на каждом
+        #     событии, как остальные (спецификация называла тридцать три
+        #     значения без него; файл в `_view()`, а не в выходах редактора,
+        #     чтобы правка из соседней вкладки не оставляла его устаревшим).
+        gr.update(
+            value=INVARIANTS.read_file(),
+            label=(
+                f"Файл инвариантов на диске · {INVARIANTS.path}"
+                if INVARIANTS.read_file() is not None
+                else f"Файл инвариантов · {INVARIANTS.path} — файла нет"
+            ),
+        ),
     )
 
 
@@ -1799,6 +2086,10 @@ def _new_agent(preset_name: str) -> Agent:
         router=make_router(),
         # Автомат задачи свой у каждого агента — тем же приёмом (день 13, §7.1).
         task=make_task_machine(),
+        # Книга инвариантов своя у каждого агента (сессионные инварианты —
+        # это сессия), постоянные — одно хранилище на процесс (день 14, §8.1).
+        invariants=make_invariants(),
+        invariant_store=INVARIANTS,
     )
 
 
@@ -1877,6 +2168,10 @@ def _restore_agents() -> int:
             # Автомат задачи свой у восстановленного агента — состояние и
             # журнал из файла, переключатель включён (день 13, §5.8).
             task=make_task_machine(),
+            # Книга своя, сессионные инварианты — из файла сессии,
+            # переключатель включён, последнего конфликта нет (день 14, §6.8).
+            invariants=make_invariants(),
+            invariant_store=INVARIANTS,
         )
         restored += 1
     logger.info(
@@ -1901,7 +2196,8 @@ def on_load(preset_name: str):
     if not registry:
         return _spawn(
             preset_name,
-            f"Страница открыта. {_long_term_status()} {_profile_status()}",
+            f"Страница открыта. {_long_term_status()} {_profile_status()} "
+            f"{_invariants_status()}",
         )
 
     target = registry[-1]
@@ -1931,7 +2227,11 @@ def on_load(preset_name: str):
     return (
         target,
         gr.update(),
-        *_view(target, f"{status} {_long_term_status()} {_profile_status()}"),
+        *_view(
+            target,
+            f"{status} {_long_term_status()} {_profile_status()} "
+            f"{_invariants_status(target)}",
+        ),
     )
 
 
@@ -2101,6 +2401,27 @@ def _reply_status(agent: Agent, reply) -> str:
                 f"состоялся, память стратегии не сдвинулась, в модель ушло "
                 f"всё неучтённое; вызов повторится на следующем ходе."
             )
+        # Страж инвариантов (день 14, §8.6) — одной короткой фразой перед
+        # разбором памяти: конфликт называем прямо, ход при этом не
+        # отменялся, и отказать должен сам ассистент.
+        guard_call = reply.guard_call
+        if reply.conflict:
+            why = f"«{reply.conflict_note}»" if reply.conflict_note else "см. блок «Инварианты»"
+            status += (
+                f" ⛔ Конфликт с инвариантами {reply.conflict}: {why} — "
+                f"ассистент должен отказать и объяснить."
+            )
+            if not agent.invariants_in_request:
+                status += (
+                    " ⚠️ «Инварианты в запросе» выключено: модель об "
+                    "ограничениях не знает — страж их видит, ответ им не "
+                    "следует."
+                )
+        elif guard_call is not None and not guard_call.ok:
+            status += (
+                f" ⚠️ Страж инвариантов не удался ({guard_call.error}) — ход "
+                f"состоялся, конфликт этого сообщения не проверен."
+            )
         # Разбор памяти (день 11, §7.4) — одной короткой фразой после
         # служебного вызова стратегии, словами самого разбора.
         memory_call = reply.memory_call
@@ -2125,6 +2446,13 @@ def _reply_status(agent: Agent, reply) -> str:
         if task_note and task_note != "событий нет":
             if task_note.startswith("отклонено"):
                 status += f" ⚠️ Переход не состоялся: {task_note}."
+            elif task_note.startswith("ждёт подтверждения"):
+                # Переход остановил инвариант `с подтверждением` (день 14,
+                # §8.3): состояние не менялось, решает человек.
+                status += (
+                    f" ⏳ Задача — {task_note}. Отметить переход — кнопкой "
+                    f"«✅ Подтвердить переход»."
+                )
             else:
                 status += f" 📋 Задача — {task_note}."
         elif task_call is not None and not task_call.ok:
@@ -2284,7 +2612,8 @@ def on_reset(agent: Agent | None, preset_name: str):
             f"Диалог агента {_agent_title(agent)} сброшен: стек сообщений пуст, "
             f"{note}, счётчики агента сохранены. Рабочая память и кандидаты "
             f"ушли вместе с диалогом, **долговременная память не тронута** "
-            f"({_long_term_records()}).",
+            f"({_long_term_records()}). Сессионные инварианты — тоже ушли, "
+            f"постоянные не тронуты.",
         ),
     )
 
@@ -2350,9 +2679,12 @@ def on_fork(agent: Agent | None, checkpoint_choice: str | None, preset_name: str
     # хода), хранилище профиля ветка берёт у родителя (день 12, §5.7).
     # Автомат задачи — тоже свежий, с состоянием и журналом из снимка
     # checkpoint'а, переключатель включён (день 13, §5.8).
+    # Книга инвариантов — тоже свежая: сессионные инварианты ветка получает
+    # копией из снимка checkpoint'а, постоянные — те же, файл один; переключатель
+    # «Инварианты в запросе» включён (день 14, §6.8).
     branch = agent.fork(
         checkpoint_id, session_id, make_strategies(), make_memory(),
-        make_router(), make_task_machine(),
+        make_router(), make_task_machine(), make_invariants(),
     )
     if branch is None:
         return (
@@ -2374,7 +2706,10 @@ def on_fork(agent: Agent | None, checkpoint_choice: str | None, preset_name: str
             f"скопированы, стратегия «{branch.strategy.name}», файл уже на "
             f"диске. Рабочая память — копия из снимка ({working} "
             f"{_records_word(working)}), долговременная — та же, кандидатов "
-            f"нет. Исходный диалог не тронут — он в списке «Ветка диалога».",
+            f"нет; сессионные инварианты — копия из снимка "
+            f"({_session_count(branch)}), "
+            f"постоянные — те же. Исходный диалог не тронут — он в списке "
+            f"«Ветка диалога».",
         ),
     )
 
@@ -2576,7 +2911,14 @@ def on_task_event(agent: Agent | None, preset_name: str, *, event: str):
     if not outcome.changed:
         allowed = ", ".join(agent.task_view.allowed_human) if agent.task_view else ""
         status = f"Переход «{event}» не выполнен: {outcome.rejection.reason}."
-        if allowed:
+        if outcome.rejection.reason.startswith("запрещено ограничением"):
+            # Запрет инварианта не обходится ни кнопкой, ни подтверждением
+            # (день 14, §2.4): снять его можно только в редакторе, и это видно.
+            status += (
+                " Кнопка человека запрет не обходит: чтобы разрешить переход, "
+                "выключите этот инвариант флажком «Действует» в редакторе."
+            )
+        elif allowed:
             status += f" Допустимо сейчас: {allowed}."
     elif event == EVENT_PAUSE:
         view = agent.task_view
@@ -2612,6 +2954,352 @@ def on_task_in_request(agent: Agent | None, enabled: bool, preset_name: str):
         f"задачу; стек, память и задача не тронуты."
     )
     return (agent, gr.update(), *_view(agent, status))
+
+
+# --- Инварианты: обработчики (день 14, §8.2-8.3) ---------------------------
+
+def on_invariants_in_request(agent: Agent | None, enabled: bool, preset_name: str):
+    """«Инварианты в запросе» — меняет запрос, а не работу (§6.6): страж
+    вызывается, конфликт пишется и ограничения переходов действуют при любом
+    положении. Нового агента не создаёт и ничего не пишет."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    agent.set_invariants_in_request(bool(enabled))
+    if agent.invariants_in_request:
+        status = (
+            "Инварианты в запросе: включено. Блок уходит в модель первым из "
+            "блоков; страж сверяет, ограничения переходов действуют."
+        )
+    else:
+        status = (
+            "Инварианты в запросе: выключено. Страж продолжает сверять и "
+            "показывать конфликты; ограничения переходов действуют."
+        )
+    return (agent, gr.update(), *_view(agent, status))
+
+
+def on_confirm_transition(agent: Agent | None, preset_name: str):
+    """«✅ Подтвердить переход» (§8.3): человек разрешает переход трекера,
+    который остановил инвариант `с подтверждением`. Активна всегда: нечего
+    подтверждать — отказ, и в статусе видно почему."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    outcome = agent.confirm_transition()
+    if outcome.changed:
+        note = outcome.note.replace("подтверждено пользователем", "подтверждено вами")
+        status = f"📋 Задача: {note}."
+    else:
+        reason = outcome.rejection.reason if outcome.rejection else outcome.note
+        if reason.startswith("подтверждать нечего"):
+            status = (
+                "Подтверждать нечего: переходов, ждущих подтверждения, "
+                "сейчас нет."
+            )
+        else:
+            status = f"Переход не подтверждён: {reason}."
+    return (agent, gr.update(), *_view(agent, status))
+
+
+# --- Редактор инвариантов: обработчики (день 14, §8.5) ---------------------
+# Второе исключение из «интерфейс — вид на состояние агента» после редактора
+# профиля: это форма ввода, а её поля не входят в `_view()`/`VIEW_OUTPUTS` —
+# иначе любое событие затирало бы несохранённую правку. Свои выходы
+# (`INVARIANT_EDITOR_OUTPUTS`, определены при сборке интерфейса). Список
+# «Инвариант для правки» — часть формы: его пункты пересобираются только
+# загрузкой страницы, выбором пункта, сохранением, удалением и фокусом на самом
+# списке (сессионные инварианты у каждого агента свои, а форма агента не знает).
+
+INVARIANT_NEW = "+ новый"
+NO_EVENT = "— (не про переходы)"
+NO_MODE = "— (не выбран)"
+
+
+def _session_count(agent: Agent) -> int:
+    """Сколько сессионных инвариантов в книге агента, включая выключенные."""
+    view = agent.invariant_view
+    return sum(1 for item in view.items if item.scope == SCOPE_SESSION) if view else 0
+
+
+def _invariant_lists(agent: Agent) -> tuple[list[Invariant], list[Invariant]]:
+    """Постоянные и сессионные инварианты книги агента, в порядке номеров."""
+    view = agent.invariant_view
+    items = view.items if view else []
+    return (
+        [inv for inv in items if inv.scope == SCOPE_ALWAYS],
+        [inv for inv in items if inv.scope == SCOPE_SESSION],
+    )
+
+
+def _with_ids(items: list[Invariant], scope: str) -> list[Invariant]:
+    """Номера по порядку в списке одной области — для сообщений проверки."""
+    return [
+        replace(inv, id=f"{ID_PREFIX[scope]}{n}", scope=scope)
+        for n, inv in enumerate(items, start=1)
+    ]
+
+
+def _invariant_choices(agent: Agent | None) -> list[tuple[str, str]]:
+    """Пункты списка «Инвариант для правки»: «+ новый» и книга агента —
+    подпись с номером, областью и началом формулировки, значение — номер."""
+    choices = [(INVARIANT_NEW, INVARIANT_NEW)]
+    view = agent.invariant_view if agent is not None else None
+    for inv in view.items if view else []:
+        off = " · выключен" if not inv.active else ""
+        text = inv.text if len(inv.text) <= 60 else inv.text[:57] + "…"
+        choices.append(
+            (f"{inv.id} · {SCOPE_LABELS.get(inv.scope, inv.scope)}{off} · {text}", inv.id)
+        )
+    return choices
+
+
+def _invariant_pick_update(agent: Agent | None, value: str | None):
+    """Список правки с пересобранными пунктами; значение — прежнее, если оно
+    ещё есть среди пунктов, иначе «+ новый»."""
+    choices = _invariant_choices(agent)
+    known = {choice[1] for choice in choices}
+    return gr.update(choices=choices, value=value if value in known else INVARIANT_NEW)
+
+
+def _empty_invariant_form():
+    """Значения формы для нового инварианта: пустой текст, область «всегда»,
+    без перехода, «Действует»."""
+    return "", SCOPE_ALWAYS, NO_EVENT, NO_MODE, True
+
+
+def _invariant_editor_outputs(agent: Agent | None, pick: str | None, clear_form: bool = False):
+    """Кортеж для `INVARIANT_EDITOR_OUTPUTS`: список правки с пересобранными
+    пунктами и поля формы — прежние (`gr.update()`) или очищенные."""
+    fields = _empty_invariant_form() if clear_form else (gr.update(),) * 5
+    return (_invariant_pick_update(agent, pick), *fields)
+
+
+def _invariant_form(inv: Invariant):
+    return (
+        inv.text, inv.scope, inv.event or NO_EVENT, inv.mode or NO_MODE, inv.active,
+    )
+
+
+def on_invariant_editor_load(agent: Agent | None):
+    """Загрузка формы редактора — отдельный `demo.load` (после `on_load`,
+    чтобы агент вкладки уже был), не событие `_view()`: пункты списка и пустая
+    форма нового инварианта."""
+    return (_invariant_pick_update(agent, INVARIANT_NEW), *_empty_invariant_form())
+
+
+def on_invariant_choices_refresh(agent: Agent | None, pick: str | None):
+    """Фокус на списке «Инвариант для правки» — пункты пересобираются по
+    книге активного агента (у каждого агента свои сессионные инварианты),
+    поля формы не трогаются."""
+    return _invariant_pick_update(agent, pick)
+
+
+def on_pick_invariant(agent: Agent | None, pick: str):
+    """Список «Инвариант для правки» — `select`: поля формы из **сохранённого**
+    инварианта, а не из текущего состояния формы, — несохранённая правка при
+    переключении теряется (об этом говорит `info` списка)."""
+    if pick == INVARIANT_NEW or agent is None:
+        return _empty_invariant_form()
+    view = agent.invariant_view
+    inv = next((i for i in view.items if i.id == pick), None) if view else None
+    if inv is None:
+        return (gr.update(),) * 5
+    return _invariant_form(inv)
+
+
+def _change_words(old: Invariant | None, new: Invariant, new_id: str) -> str:
+    """Что изменилось, словами для статуса и лога (§8.5): «добавлен С1»,
+    «П4 включён», «П3: формулировка, переход автомата»."""
+    if old is None:
+        return f"добавлен {new_id}"
+    bits = []
+    if old.scope != new.scope:
+        bits.append(
+            f"область {SCOPE_LABELS[old.scope]} → {SCOPE_LABELS[new.scope]}, "
+            f"номер {old.id} → {new_id}"
+        )
+    if old.text != new.text:
+        bits.append("формулировка")
+    if (old.event, old.mode) != (new.event, new.mode):
+        bits.append("переход автомата")
+    toggled = old.active != new.active
+    if toggled and not bits:
+        return f"{new_id} {'включён' if new.active else 'выключен'}"
+    if toggled:
+        bits.append("включён" if new.active else "выключен")
+    return f"{new_id}: {', '.join(bits)}"
+
+
+def _where_saved(agent: Agent, permanent: bool, session: bool) -> str:
+    """Куда записалась правка — для статуса: файл постоянных, файл сессии
+    или оба."""
+    places = []
+    if permanent:
+        places.append(INVARIANTS.path)
+    if session:
+        places.append(
+            display_path(STORE.path_for(agent.session_id))
+            if agent.history
+            else "файл сессии появится с первым сообщением"
+        )
+    return " и ".join(places)
+
+
+def on_save_invariant(
+    agent: Agent | None,
+    preset_name: str,
+    pick: str,
+    text: str,
+    scope: str,
+    event: str,
+    mode: str,
+    active: bool,
+):
+    """«Сохранить инвариант» (§8.5): книга собирается целиком, как профиль
+    дня 12, — список меняется в памяти, проверяется `invariants.validate()`, и
+    только потом пишется. Постоянные уходят в `INVARIANTS.save()`, сессионные —
+    в `agent.set_session_invariants()`; смена области переносит инвариант:
+    он удаляется из прежнего места и записывается в новое, номер при этом
+    меняется (буква области)."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    def reply(status: str, pick_value: str | None):
+        return (
+            agent, gr.update(), *_view(agent, status),
+            *_invariant_editor_outputs(agent, pick_value),
+        )
+
+    if agent.invariant_view is None:
+        return reply("У этого агента нет книги инвариантов — сохранять некуда.", pick)
+
+    permanent, session = _invariant_lists(agent)
+    editing = None
+    if pick != INVARIANT_NEW:
+        editing = next((i for i in permanent + session if i.id == pick), None)
+        if editing is None:
+            return reply(
+                f"Инвариант «{pick}» больше не существует (список изменился "
+                f"или это другой агент) — выберите его заново. Ничего не "
+                f"записано.",
+                INVARIANT_NEW,
+            )
+
+    candidate = Invariant(
+        id=editing.id if editing else "",
+        text=" ".join((text or "").split()),
+        scope=scope,
+        active=bool(active),
+        event="" if event in (NO_EVENT, None) else event,
+        mode="" if mode in (NO_MODE, None) else mode,
+        added_at=editing.added_at if editing and editing.added_at
+        else datetime.now().isoformat(timespec="seconds"),
+    )
+
+    new_permanent, new_session = list(permanent), list(session)
+    target = new_permanent if scope == SCOPE_ALWAYS else new_session
+    if editing is None:
+        target.append(candidate)
+    elif editing.scope == scope:
+        target[next(i for i, inv in enumerate(target) if inv.id == editing.id)] = candidate
+    else:
+        source = new_permanent if editing.scope == SCOPE_ALWAYS else new_session
+        source[:] = [inv for inv in source if inv.id != editing.id]
+        target.append(candidate)
+
+    errors = validate(
+        _with_ids(new_permanent, SCOPE_ALWAYS) + _with_ids(new_session, SCOPE_SESSION),
+        INVARIANT_TEXT_WORDS, INVARIANT_MAX_ITEMS, EVENTS, GUARD_MODES,
+    )
+    if errors:
+        return reply(
+            f"Инвариант не сохранён: {'; '.join(errors)}. Действует прежний "
+            f"список.",
+            pick,
+        )
+
+    old_permanent, old_session = dump_invariants(permanent), dump_invariants(session)
+    new_permanent_dump = dump_invariants(new_permanent)
+    new_session_dump = dump_invariants(new_session)
+    permanent_changed = new_permanent_dump != old_permanent
+    session_changed = new_session_dump != old_session
+    if not permanent_changed and not session_changed:
+        return reply("Инвариант не изменился — записывать нечего.", pick)
+
+    position = next(
+        i for i, inv in enumerate(new_permanent if scope == SCOPE_ALWAYS else new_session)
+        if inv is candidate
+    )
+    new_id = f"{ID_PREFIX[scope]}{position + 1}"
+    words = _change_words(editing, candidate, new_id)
+    try:
+        # Постоянные — первыми: сбой записи файла оставляет всё как было.
+        if permanent_changed:
+            INVARIANTS.save(new_permanent_dump, changed=words)
+    except StorageError as exc:
+        return reply(f"Инвариант не сохранён: {exc}. Действует прежний список.", pick)
+    if session_changed:
+        agent.set_session_invariants(new_session_dump)
+
+    reach = (
+        "Действует со следующего хода у всех агентов, у которых инварианты в "
+        "запросе не выключены."
+        if permanent_changed and scope == SCOPE_ALWAYS
+        else "Действует со следующего хода этой сессии и её веток, у которых "
+        "инварианты в запросе не выключены."
+    )
+    logger.info("инварианты (редактор): %s", words)
+    return reply(
+        f"Инвариант сохранён: {words} → "
+        f"{_where_saved(agent, permanent_changed, session_changed)}. {reach}",
+        new_id,
+    )
+
+
+def on_delete_invariant(agent: Agent | None, preset_name: str, pick: str):
+    """«Удалить инвариант» (§8.5): убирает выбранный инвариант из книги.
+    Удаление — не способ снять ограничение на время: выключить его можно
+    флажком «Действует», и это видно."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    def reply(status: str, pick_value: str | None, clear: bool = False):
+        return (
+            agent, gr.update(), *_view(agent, status),
+            *_invariant_editor_outputs(agent, pick_value, clear_form=clear),
+        )
+
+    if agent.invariant_view is None:
+        return reply("У этого агента нет книги инвариантов — удалять нечего.", pick)
+    if pick == INVARIANT_NEW:
+        return reply("Удалять нечего: в списке выбран «+ новый».", pick)
+
+    permanent, session = _invariant_lists(agent)
+    doomed = next((i for i in permanent + session if i.id == pick), None)
+    if doomed is None:
+        return reply(
+            f"Инвариант «{pick}» больше не существует — список обновлён, "
+            f"ничего не удалено.",
+            INVARIANT_NEW,
+        )
+    if doomed.scope == SCOPE_ALWAYS:
+        rest = [inv for inv in permanent if inv.id != doomed.id]
+        try:
+            INVARIANTS.save(dump_invariants(rest), changed=f"удалён {doomed.id}")
+        except StorageError as exc:
+            return reply(f"Инвариант не удалён: {exc}. Действует прежний список.", pick)
+    else:
+        rest = [inv for inv in session if inv.id != doomed.id]
+        agent.set_session_invariants(dump_invariants(rest))
+    logger.info("инварианты (редактор): удалён %s", doomed.id)
+    return reply(
+        f"Инвариант {doomed.id} удалён → "
+        f"{_where_saved(agent, doomed.scope == SCOPE_ALWAYS, doomed.scope == SCOPE_SESSION)}. "
+        f"Остальные номера могли сдвинуться.",
+        INVARIANT_NEW,
+        clear=True,
+    )
 
 
 # --- Редактор профиля: обработчики (день 12, §7.3) ------------------------
@@ -2824,25 +3512,48 @@ _TASK_SCENARIO_LABELS: list[str] = [
     "Д · проверка пройдена (повторять)",
 ]
 
+# --- Сценарий проверки инвариантов: подписи для gr.Examples (день 14, §8.6,
+# §10.1). Тексты живут в `presets.py` (`INVARIANT_SCENARIO`), здесь только
+# подписи и порядок показа под чатом.
+_INVARIANT_SCENARIO_LABELS: list[str] = [
+    "Н1 · обычный ход: Trove Tokens (П1 соблюдён без конфликта)",
+    "К1 · перевод названий (П1)",
+    "К2 · герои из Undertow (П3)",
+    "Д1 · просьба забыть ограничения",
+    "Н2 · вопрос об ограничении — не конфликт",
+    "В1 · посторонний вопрос: длительность партии",
+    "В2 · посторонний вопрос: отличия от ролевых настолок",
+    "В3 · потерялся кубик (разговор об ограничениях вышел из окна)",
+    "К3 · тактика на первый бой (сессионный С1)",
+    "Д2 · просьба отключить ограничение на тактику",
+    "Т1 · подготовка стола — кнопкой «Начать задачу»",
+    "Т2 · план утверждён",
+    "Т3 · шаг выполнен (повторять)",
+    "Т4 · проверка сходится → ожидание подтверждения (повторять)",
+    "К4 · повтор К1 — только в ветке без блока",
+]
+
 
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 13: у агента появилось **состояние задачи** — конечный "
-        "автомат с этапом (планирование → выполнение → проверка → готово), "
-        "текущим шагом, ожидаемым действием и планом с отметками. Пауза — "
-        "не отдельный этап, а флаг на любом активном этапе. Событие для "
-        "перехода называет трекер (служебный вызов перед ответом) по "
-        "разговору или вы сами кнопками под чатом; допустим ли переход, "
-        "решает таблица переходов (аккордеон справа), а не модель. Задачу "
-        "начинает и отменяет только человек. Блок состояния уходит в запрос "
-        "**сразу за рабочей памятью**, поэтому пауза и продолжение не "
-        "зависят от того, что осталось в окне контекста. Это не слой "
-        "памяти и не режим профиля: рабочая память (ниже) помнит, **что** "
-        "известно о партии, состояние задачи — **где мы в работе** и чего "
-        "ждём. Профиль, слои памяти, стратегии, checkpoint'ы и ветки "
-        "работают как раньше. Сценарий проверки состояния задачи — под "
-        "чатом."
+        "День 14: у агента появились **инварианты** — ограничения, которые "
+        "ассистент не вправе нарушить. Их пишете вы, в редакторе под чатом: "
+        "одни действуют всегда (файл рядом с памятью и профилем), другие — "
+        "только в этой сессии; а часть можно повесить на переход автомата "
+        "задачи — «запрещён» или «с подтверждением». Инварианты лежат "
+        "отдельно от диалога и уходят в каждый запрос своим блоком **первым "
+        "из блоков** — их не вытесняет окно контекста. Перед ответом идёт "
+        "**страж** — служебный вызов, который называет конфликт нового "
+        "сообщения с ними; ход при этом не отменяется, отказывает "
+        "ассистент, а код только показывает конфликт. Над переходами "
+        "автомата нарушение ловит сам код, в остальном инвариант держит "
+        "модель — и видно это по её ответам, а не по гарантии. Это не "
+        "профиль (он говорит, **как** отвечать), не память (**что** агент "
+        "знает) и не состояние задачи (**где** мы в работе): инвариант "
+        "говорит, **чего нельзя**. Слои памяти, профиль, задача, стратегии, "
+        "checkpoint'ы и ветки работают как раньше. Сценарий проверки "
+        "инвариантов — под чатом."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -2919,6 +3630,20 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "память (разговор) урезает стратегия контекста."
                 ),
             )
+            # «Инварианты в запросе» (день 14, §8.2) — над «Профилем в
+            # запросе», в порядке блоков запроса: инварианты встают в запрос
+            # раньше профиля. Ещё один переключатель того, что уходит в
+            # модель, и снова не того, что хранится и что делает страж.
+            invariants_in_request_checkbox = gr.Checkbox(
+                value=True,
+                label="Инварианты в запросе",
+                info=(
+                    "Выключенный блок не уходит в модель, но страж продолжает "
+                    "сверять сообщения и показывать конфликты, а ограничения "
+                    "переходов продолжают действовать; выключить сам "
+                    "инвариант можно флажком «Действует» в редакторе ниже."
+                ),
+            )
             # «Профиль в запросе» (день 12, §7.2) — сразу под слоями памяти:
             # ещё один переключатель того, что уходит в модель. Пункты —
             # `debug_state()["profile"]["choices"]`, значение подтягивается к
@@ -2983,6 +3708,11 @@ with gr.Blocks(title="TooManyRules") as demo:
                 )
                 pause_task_btn = gr.Button("⏸ Пауза", scale=1)
                 resume_task_btn = gr.Button("▶ Продолжить", scale=1)
+                # «Подтвердить переход» (день 14, §8.3) — переход трекера,
+                # который остановил инвариант «с подтверждением», отмечает
+                # человек. Активна всегда: нечего подтверждать — отказ, и в
+                # статусе видно почему.
+                confirm_task_btn = gr.Button("✅ Подтвердить переход", scale=1)
                 cancel_task_btn = gr.Button(
                     "Отменить задачу", variant="stop", scale=1
                 )
@@ -3018,6 +3748,93 @@ with gr.Blocks(title="TooManyRules") as demo:
                     )
                     reject_btn = gr.Button("Отклонить")
             status_md = gr.Markdown("")
+
+            # Редактор инвариантов (день 14, §8.5) — форма, а не вид, как
+            # редактор профиля: её поля не входят в `_view()`/`VIEW_OUTPUTS`,
+            # иначе любое событие затирало бы несохранённую правку. Открыт
+            # по умолчанию: это инструмент сегодняшнего дня. Стоит под
+            # строкой статуса и над закрытым редактором профиля.
+            with gr.Accordion(
+                "Инварианты — ограничения, которые задаёте вы",
+                open=True,
+            ):
+                gr.Markdown(
+                    "Инвариант — правило, которое ассистент не вправе "
+                    "нарушить: просьба в разговоре его не отменяет. Пишете "
+                    "его вы; модель инварианты не создаёт и не предлагает. "
+                    "«Всегда» — постоянный (общий файл, все сессии), «сессия» "
+                    "— только этот диалог и его ветки. Инвариант над "
+                    "переходом автомата проверяет код: «запрещён» — переход "
+                    "не состоится, «с подтверждением» — состоится по кнопке "
+                    "«✅ Подтвердить переход»."
+                )
+                invariant_pick_dropdown = gr.Dropdown(
+                    choices=[INVARIANT_NEW],
+                    value=INVARIANT_NEW,
+                    label="Инвариант для правки",
+                    filterable=False,
+                    info=(
+                        "«+ новый» — добавить. Несохранённая правка при "
+                        "переключении теряется; пункты обновляются по книге "
+                        "активного агента."
+                    ),
+                )
+                invariant_text_input = gr.Textbox(
+                    label="Формулировка",
+                    info=f"Не больше {INVARIANT_TEXT_WORDS} слов: правило с исключением в конце.",
+                    lines=2,
+                )
+                with gr.Row():
+                    invariant_scope_dropdown = gr.Dropdown(
+                        choices=list(SCOPES),
+                        value=SCOPE_ALWAYS,
+                        label="Область",
+                        filterable=False,
+                        info="Смена области переносит инвариант; номер при этом меняется.",
+                    )
+                    invariant_event_dropdown = gr.Dropdown(
+                        choices=[NO_EVENT, *EVENTS],
+                        value=NO_EVENT,
+                        label="Переход автомата",
+                        filterable=False,
+                    )
+                    invariant_mode_dropdown = gr.Dropdown(
+                        choices=[NO_MODE, *GUARD_MODES],
+                        value=NO_MODE,
+                        label="Режим перехода",
+                        filterable=False,
+                        info="Событие и режим задаются вместе.",
+                    )
+                invariant_active_checkbox = gr.Checkbox(
+                    value=True,
+                    label="Действует",
+                    info=(
+                        "Выключенный инвариант остаётся в файле, но не уходит "
+                        "ни в блок, ни стражу, ни в автомат — это способ снять "
+                        "ограничение, и он виден."
+                    ),
+                )
+                with gr.Row():
+                    save_invariant_btn = gr.Button("Сохранить инвариант", variant="primary")
+                    delete_invariant_btn = gr.Button("Удалить инвариант", variant="stop")
+                gr.Examples(
+                    examples=[
+                        [
+                            ex["text"], ex["scope"], ex["event"] or NO_EVENT,
+                            ex["mode"] or NO_MODE, ex["active"],
+                        ]
+                        for ex in INVARIANT_EXAMPLES
+                    ],
+                    inputs=[
+                        invariant_text_input,
+                        invariant_scope_dropdown,
+                        invariant_event_dropdown,
+                        invariant_mode_dropdown,
+                        invariant_active_checkbox,
+                    ],
+                    example_labels=[ex["label"] for ex in INVARIANT_EXAMPLES],
+                    label="Заготовки (заполняют форму; сохраняет человек)",
+                )
 
             # Редактор профиля (день 12, §7.3) — форма, а не вид: её поля не
             # входят в `_view()`/`VIEW_OUTPUTS`, иначе отправка вопроса или
@@ -3070,9 +3887,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                     label="Профили для проверки (заполняет общую часть; сохраняет человек)",
                 )
 
-            # Свёрнуто: в кадре дня 13 остаётся только его сценарий,
+            # Свёрнуто: в кадре дня 14 остаётся только его сценарий,
             # остальные — под аккордеоном (правило «на экране — текущий день»).
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-12)", open=False):
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-13)", open=False):
                 gr.Examples(
                     examples=[
                         ["Из каких фаз состоит ход игрока?"],
@@ -3130,19 +3947,36 @@ with gr.Blocks(title="TooManyRules") as demo:
                     label="Сценарий проверки профиля (В1, Р1-Р8 — см. §9 спецификации дня 12)",
                 )
 
-            # Сценарий проверки состояния задачи (день 13, §7.6, §9.1): З1-З9,
-            # В1-В6, Г и Д (Г и Д повторяются — по строке в списке, отправка
-            # несколько раз). Клик кладёт текст в поле ввода; З1 отправляется
-            # кнопкой «Начать задачу с этим сообщением», остальные — «Отправить».
+                # Сценарий проверки состояния задачи (день 13, §7.6, §9.1): З1-З9,
+                # В1-В6, Г и Д (Г и Д повторяются — по строке в списке, отправка
+                # несколько раз). Клик кладёт текст в поле ввода; З1 отправляется
+                # кнопкой «Начать задачу с этим сообщением», остальные — «Отправить».
+                gr.Examples(
+                    examples=[[text] for text in TASK_SCENARIO],
+                    inputs=[question_input],
+                    example_labels=_TASK_SCENARIO_LABELS,
+                    examples_per_page=len(TASK_SCENARIO),
+                    label=(
+                        "Сценарий проверки состояния задачи (З1-З9, В1-В6, Г и Д "
+                        "— см. docs/TooManyRules — День 13 проверка состояния "
+                        "задачи.md)"
+                    ),
+                )
+
+            # Сценарий проверки инвариантов (день 14, §8.6, §10.1): Н1-Н2,
+            # К1-К4, Д1-Д2, В1-В3, Т1-Т4 (Т3 и Т4 повторяются — по строке в
+            # списке, отправка несколько раз). Клик кладёт текст в поле ввода;
+            # Т1 отправляется кнопкой «Начать задачу с этим сообщением», К4 —
+            # только в ветке с выключенным «Инварианты в запросе», остальные —
+            # «Отправить». Развёрнут в кадр.
             gr.Examples(
-                examples=[[text] for text in TASK_SCENARIO],
+                examples=[[text] for text in INVARIANT_SCENARIO],
                 inputs=[question_input],
-                example_labels=_TASK_SCENARIO_LABELS,
-                examples_per_page=len(TASK_SCENARIO),
+                example_labels=_INVARIANT_SCENARIO_LABELS,
+                examples_per_page=len(INVARIANT_SCENARIO),
                 label=(
-                    "Сценарий проверки состояния задачи (З1-З9, В1-В6, Г и Д "
-                    "— см. docs/TooManyRules — День 13 проверка состояния "
-                    "задачи.md)"
+                    "Сценарий проверки инвариантов (Н, К, Д, В, Т — см. "
+                    "docs/TooManyRules — День 14 проверка инвариантов.md)"
                 ),
             )
 
@@ -3158,6 +3992,11 @@ with gr.Blocks(title="TooManyRules") as demo:
                     height=220,
                 )
             metrics_md = gr.Markdown(_metrics_md(None))
+            # «Инварианты» (день 14, §8.4) — сразу под «Последним вызовом» и
+            # над блоками профиля и памяти, в порядке блоков запроса:
+            # инварианты встают в запрос раньше профиля. Развёрнут: это блок
+            # сегодняшнего дня.
+            invariants_md = gr.Markdown("")
             # Свёрнуто: инструменты дней 11-12.
             with gr.Accordion("Профиль и слои памяти (дни 11-12)", open=False):
                 # «Профиль» (день 12, §7.4) — сразу под «Последним вызовом» и над
@@ -3168,14 +4007,16 @@ with gr.Blocks(title="TooManyRules") as demo:
                 # «Контекстом»: сначала что агент знает, потом что из этого
                 # отправляется.
                 layers_md = gr.Markdown("")
-            # «Состояние задачи» (день 13, §7.4) — сразу под «Слоями памяти»,
-            # в порядке блоков запроса: задача встаёт за рабочей памятью.
-            task_md = gr.Markdown("")
-            # Таблица автомата — в аккордеоне, закрыт по умолчанию; собрана
-            # один раз при построении интерфейса, в `_view()` не входит:
-            # таблица статична.
-            with gr.Accordion("Автомат задачи — таблица переходов", open=False):
-                gr.Markdown(_task_transitions_table_md())
+            # Свёрнуто: ко дню 14 состояние задачи — инструмент прошлого дня.
+            # Блок остаётся тем же выходом `_view()`, от сворачивания ничего
+            # не меняется (§8.7). Таблица автомата собрана один раз при
+            # построении интерфейса, в `_view()` не входит: она статична.
+            with gr.Accordion("Состояние задачи (день 13)", open=False):
+                # «Состояние задачи» (день 13, §7.4) — в порядке блоков
+                # запроса: задача встаёт за рабочей памятью.
+                task_md = gr.Markdown("")
+                with gr.Accordion("Автомат задачи — таблица переходов", open=False):
+                    gr.Markdown(_task_transitions_table_md())
             # Сначала «что отправляем» (день 9), потом «сколько это от окна»
             # (день 8): блок контекста стоит над бюджетом, а сводка — сразу
             # под ним, потому что объясняет числа над собой.
@@ -3300,9 +4141,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                 label="Файл сессии на диске",
                 max_height=420,
             )
-            # Свёрнуто: ко дню 13 эти файлы в кадре не нужны.
+            # Свёрнуто: эти файлы в кадре дня 14 открываются одним кликом.
             with gr.Accordion(
-                "Файлы долговременной памяти и профиля (дни 11-12)",
+                "Файлы долговременной памяти, профиля и инвариантов (дни 11-12, 14)",
                 open=False,
             ):
                 # Файл долговременной памяти (день 11, §7.4) — рядом с файлом
@@ -3320,10 +4161,17 @@ with gr.Blocks(title="TooManyRules") as demo:
                     label="Файл профиля на диске",
                     max_height=320,
                 )
+                # Файл инвариантов (день 14, §8.6) — рядом с тремя другими:
+                # четыре файла рядом и есть «инварианты хранятся отдельно от
+                # диалога». Сессионные — в файле сессии (`context.invariants`).
+                invariants_file_json = gr.JSON(
+                    label="Файл инвариантов на диске",
+                    max_height=320,
+                )
 
     # Порядок выходов совпадает с порядком значений в `_view()`. Значения
-    # дня 10, дня 11, дня 12 и дня 13 — в конце списка, как и в кортеже
-    # `_view()` (§7.7).
+    # дня 10, дня 11, дня 12, дня 13 и дня 14 — в конце списка, как и в
+    # кортеже `_view()` (§7.7, §8.8).
     VIEW_OUTPUTS = [
         chatbot,
         status_md,
@@ -3356,6 +4204,9 @@ with gr.Blocks(title="TooManyRules") as demo:
         profile_file_json,
         task_in_request_checkbox,
         task_md,
+        invariants_in_request_checkbox,
+        invariants_md,
+        invariants_file_json,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
     # Выходы формы редактора профиля (день 12, §7.3) — отдельно от
@@ -3373,8 +4224,19 @@ with gr.Blocks(title="TooManyRules") as demo:
         profile_mode_constraints_input,
         profile_steps_input,
     ]
+    # Выходы формы редактора инвариантов (день 14, §8.5) — тем же правилом:
+    # отдельно от `VIEW_OUTPUTS`, это поля ввода, которые `_view()` не
+    # должен трогать.
+    INVARIANT_EDITOR_OUTPUTS = [
+        invariant_pick_dropdown,
+        invariant_text_input,
+        invariant_scope_dropdown,
+        invariant_event_dropdown,
+        invariant_mode_dropdown,
+        invariant_active_checkbox,
+    ]
 
-    demo.load(
+    load_event = demo.load(
         on_load,
         inputs=[preset_dropdown],
         outputs=COMMON_OUTPUTS,
@@ -3520,6 +4382,23 @@ with gr.Blocks(title="TooManyRules") as demo:
         inputs=[agent_state, task_in_request_checkbox, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
+    # «Подтвердить переход» (день 14, §8.3) — как остальные кнопки задачи:
+    # активна всегда, нечего подтверждать — отказ со словами в статусе.
+    confirm_task_btn.click(
+        on_confirm_transition,
+        inputs=[agent_state, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # «Инварианты в запросе» — `input`, тем же правилом, что «Слои памяти в
+    # запросе» и «Состояние задачи в запросе» (`gr.Checkbox` в Gradio 6.26
+    # ведёт себя как `gr.CheckboxGroup`): один запрос на клик, на обновление
+    # значения из `_view()` не приходит. Проверено по сети и по логу — см.
+    # комментарий ниже.
+    invariants_in_request_checkbox.input(
+        on_invariants_in_request,
+        inputs=[agent_state, invariants_in_request_checkbox, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
 
     # Редактор профиля (день 12, §7.3) — форма со своими выходами и своими
     # обработчиками, отдельными от `_view()`/`COMMON_OUTPUTS`.
@@ -3558,6 +4437,58 @@ with gr.Blocks(title="TooManyRules") as demo:
             profile_steps_input,
         ],
         outputs=COMMON_OUTPUTS,
+    )
+
+    # Редактор инвариантов (день 14, §8.5) — форма со своими выходами и своими
+    # обработчиками, отдельными от `_view()`/`COMMON_OUTPUTS`. Загрузка формы —
+    # следом за `on_load`: агент вкладки к этому моменту уже есть, а пункты
+    # списка зависят от его сессионных инвариантов.
+    load_event.then(
+        on_invariant_editor_load,
+        inputs=[agent_state],
+        outputs=INVARIANT_EDITOR_OUTPUTS,
+    )
+    # «Инвариант для правки» — `select`, как «Режим для правки»: список
+    # показывает поля сохранённого инварианта, а не то, что человек ещё не
+    # сохранил.
+    invariant_pick_dropdown.select(
+        on_pick_invariant,
+        inputs=[agent_state, invariant_pick_dropdown],
+        outputs=[
+            invariant_text_input,
+            invariant_scope_dropdown,
+            invariant_event_dropdown,
+            invariant_mode_dropdown,
+            invariant_active_checkbox,
+        ],
+    )
+    # Фокус на списке пересобирает пункты по книге активного агента: агент
+    # мог смениться, а форма о нём не знает. Поля формы не трогаются.
+    invariant_pick_dropdown.focus(
+        on_invariant_choices_refresh,
+        inputs=[agent_state, invariant_pick_dropdown],
+        outputs=[invariant_pick_dropdown],
+    )
+    # Сохранение и удаление возвращают `COMMON_OUTPUTS + INVARIANT_EDITOR_OUTPUTS`:
+    # панель должна перерисоваться, а список инвариантов — обновиться.
+    save_invariant_btn.click(
+        on_save_invariant,
+        inputs=[
+            agent_state,
+            preset_dropdown,
+            invariant_pick_dropdown,
+            invariant_text_input,
+            invariant_scope_dropdown,
+            invariant_event_dropdown,
+            invariant_mode_dropdown,
+            invariant_active_checkbox,
+        ],
+        outputs=COMMON_OUTPUTS + INVARIANT_EDITOR_OUTPUTS,
+    )
+    delete_invariant_btn.click(
+        on_delete_invariant,
+        inputs=[agent_state, preset_dropdown, invariant_pick_dropdown],
+        outputs=COMMON_OUTPUTS + INVARIANT_EDITOR_OUTPUTS,
     )
 
 

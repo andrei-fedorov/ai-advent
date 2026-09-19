@@ -31,8 +31,20 @@
 #
 # Отдельный модуль, а не класс в `memory.py`: состояние задачи — не слой
 # памяти (§2.1).
+#
+# День 14 добавляет ограничения переходов (спецификация дня 14, §5): агент
+# передаёт автомату параметром `guards` список `TransitionGuard` — «этот
+# переход запрещён» или «этот переход только с подтверждением человека». Модуль
+# по-прежнему не знает, откуда ограничение взялось (сегодня — из инвариантов, но
+# про них он не знает): он знает про «ограничение перехода». Ограничение —
+# фильтр поверх таблицы `TRANSITIONS`, а не строка в ней: его включают и
+# выключают на живом агенте, а таблица — код. Переход трекера под ограничением
+# «с подтверждением» не применяется, а становится ожиданием (`Pending`): оно
+# снимается `confirm()`, любым состоявшимся переходом и `reset()`, на диск не
+# едет. Без `guards` поведение — ровно дня 13.
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 import context
@@ -58,9 +70,23 @@ EVENT_PAUSE = "пауза"
 EVENT_RESUME = "продолжить"
 EVENT_CANCEL = "отменить"
 EVENT_NONE = "нет"
+# «Подтвердить переход» — не событие таблицы, а действие человека над
+# ожиданием; под этим словом оно попадает в отказ «подтверждать нечего».
+EVENT_CONFIRM = "подтвердить переход"
 
 SOURCE_HUMAN = "человек"
 SOURCE_TRACKER = "трекер"
+
+# Режимы ограничения перехода (день 14, §5.1). Константы живут здесь, а не в
+# `invariants.py`, чтобы строка режима имела ровно одно определение на проект:
+# книга инвариантов получает их параметром.
+GUARD_FORBIDDEN = "запрещён"
+GUARD_CONFIRM = "с подтверждением"
+GUARD_MODES = (GUARD_FORBIDDEN, GUARD_CONFIRM)
+
+# Пометка подтверждённого перехода в журнале и в заметке исхода (§5.3): по ней
+# же отличаются переходы, применённые после нажатия человека.
+CONFIRMED_NOTE = "подтверждено пользователем"
 
 # Ключи ответа трекера (§3.3, §4.6) — константы модуля: разбор и промпт не
 # должны разъехаться на правке одного из них.
@@ -136,6 +162,14 @@ _JUST_RESUMED = (
 )
 _JUST_CANCELLED = "задача только что отменена пользователем"
 
+# Указание при ожидании подтверждения (день 14, §5.3): блок просит ассистента
+# не считать переход состоявшимся и сказать, кто его отмечает.
+PENDING_INSTRUCTION = (
+    "скажи пользователю, что этот переход отмечает он сам кнопкой "
+    "«Подтвердить переход», и не считай шаг или проверку пройденными, пока "
+    "он этого не сделал"
+)
+
 REJECTION_INSTRUCTION = (
     "не делай вид, что переход состоялся: одной фразой скажи пользователю, "
     "почему этап не сменился, и что для этого нужно"
@@ -203,6 +237,31 @@ class Rejection:
 
 
 @dataclass(frozen=True)
+class TransitionGuard:
+    """Ограничение перехода (день 14, §5.1): приходит параметром от агента.
+    Модуль не знает, чем оно задано, — только формулировку и подпись для лога
+    и панели."""
+
+    event: str
+    mode: str                  # GUARD_FORBIDDEN | GUARD_CONFIRM
+    reason: str                # формулировка — в причину отказа и в блок
+    source_note: str           # чем ограничение задано, для лога и панели: «инвариант П4»
+
+
+@dataclass(frozen=True)
+class Pending:
+    """Переход трекера, который ждёт подтверждения человека (день 14, §5.1).
+    На диск не едет: это вопрос к человеку здесь и сейчас."""
+
+    event: str
+    data: object               # данные события: план, итог, номер шага
+    reason: str
+    source_note: str
+    messages: int
+    at: str
+
+
+@dataclass(frozen=True)
 class Outcome:
     """Чем кончилось событие."""
 
@@ -210,6 +269,10 @@ class Outcome:
     event: str
     note: str
     rejection: Rejection | None
+    # Поле дня 14 — в конце и с умолчанием: ожидание подтверждения, если
+    # событие трекера упёрлось в ограничение `с подтверждением`. Состояние при
+    # этом не менялось, отказа нет.
+    pending: Pending | None = None
 
 
 @dataclass(frozen=True)
@@ -244,6 +307,11 @@ class TaskView:
     block_due: bool
     tracker_due: bool
     tracker_note: str
+    # Поля дня 14 — в конце и с умолчаниями: ожидание подтверждения словами
+    # («ждёт подтверждения: «проверка пройдена» — инвариант П4: …»); `""` —
+    # ничего не ждёт.
+    pending_event: str = ""
+    pending_note: str = ""
 
 
 # --- Таблица переходов (§2.3, §4.3) -----------------------------------------
@@ -363,6 +431,9 @@ def _validate_transitions() -> None:
 
 _validate_transitions()
 
+# Все события таблицы — для книги инвариантов и списка в редакторе (день 14, §5.1).
+EVENTS = tuple(row.event for row in TRANSITIONS)
+
 EVENT_MEANINGS: dict[str, str] = {row.event: row.meaning for row in TRANSITIONS}
 _EVENT_KEYS: dict[str, str] = {context.normalize_key(row.event): row.event for row in TRANSITIONS}
 
@@ -370,6 +441,37 @@ _ROLE_LABELS = {"user": "[пользователь]", "assistant": "[ассис�
 _TRAILING_DOT_RE = re.compile(r"\.\s*$")
 _LEADING_NUM_RE = re.compile(r"^\d+[.)]\s*|^\d+\s*[-—]\s*")
 _ITEM_KEY_RE = re.compile(r"^(шаг|проверка)(?:\s+\d+)?$")
+
+
+def _is_confirmed(record: TransitionRecord) -> bool:
+    """Переход применён после подтверждения человека (день 14, §5.3). Формат
+    журнала не менялся — признак живёт в заметке записи."""
+    return record.note.endswith(CONFIRMED_NOTE)
+
+
+def _with_confirmed(note: str) -> str:
+    """Заметка исхода подтверждённого перехода: «проверка 2 пройдена
+    (подтверждено пользователем) → готово»."""
+    head, arrow, tail = note.partition(" → ")
+    return f"{head} ({CONFIRMED_NOTE}){arrow}{tail}"
+
+
+def _pending_note(pending: Pending) -> str:
+    return (
+        f"ждёт подтверждения: «{pending.event}» — {pending.source_note}: "
+        f"{pending.reason}"
+    )
+
+
+def _strictest_guard(event: str, guards: Sequence[TransitionGuard]) -> TransitionGuard | None:
+    """Несколько ограничений на одном событии: действует самое строгое,
+    `запрещён` старше `с подтверждением` (§5.2). Среди равных — первое."""
+    matching = [g for g in guards or () if g.event == event]
+    for mode in (GUARD_FORBIDDEN, GUARD_CONFIRM):
+        for guard in matching:
+            if guard.mode == mode:
+                return guard
+    return None
 
 
 def _stage_paused_matches(row: Transition, stage: str, paused: bool) -> bool:
@@ -684,10 +786,17 @@ class TaskMachine:
         # (§2.6), перезапуск и `load()` их не восстанавливают.
         self._rejection: Rejection | None = None
         self._last_update: str = ""
+        # Ожидание подтверждения (день 14, §5.3) — тоже память процесса: на
+        # диск не едет, `load()` его не восстанавливает.
+        self._pending: Pending | None = None
 
     @property
     def state(self) -> TaskState | None:
         return self._state
+
+    @property
+    def pending(self) -> Pending | None:
+        return self._pending
 
     @property
     def rejection(self) -> Rejection | None:
@@ -706,6 +815,9 @@ class TaskMachine:
         history = history or []
         state = self._state
         due, note = self._tracker_status(history)
+        pending = self._pending
+        pending_event = pending.event if pending is not None else ""
+        pending_note = _pending_note(pending) if pending is not None else ""
         if state is None:
             return TaskView(
                 stage=NO_TASK, goal="", paused=False, paused_at="",
@@ -716,6 +828,7 @@ class TaskMachine:
                 transitions=[], rejection=self._rejection,
                 last_update=self._last_update,
                 block_due=False, tracker_due=due, tracker_note=note,
+                pending_event=pending_event, pending_note=pending_note,
             )
         return TaskView(
             stage=state.stage,
@@ -736,6 +849,8 @@ class TaskMachine:
             block_due=self.block(history) is not None,
             tracker_due=due,
             tracker_note=note,
+            pending_event=pending_event,
+            pending_note=pending_note,
         )
 
     def block(self, history: list[dict]) -> dict | None:
@@ -770,6 +885,12 @@ class TaskMachine:
                 f"Не состоялось: «{rejection.event}» — {rejection.reason}. "
                 f"{REJECTION_INSTRUCTION}"
             )
+        pending = self._pending
+        if pending is not None:
+            lines.append(
+                f"Ждёт подтверждения: «{pending.event}» — {pending.reason}. "
+                f"{PENDING_INSTRUCTION}"
+            )
         lines.append("")
         lines.append(_plan_block(state))
         return {"role": "system", "content": "\n".join(lines)}
@@ -793,10 +914,18 @@ class TaskMachine:
 
     # --- Меняют состояние: зовёт только агент под своим замком --------------
 
-    def start(self, goal: str, history: list[dict], at: str) -> Outcome:
-        return self._attempt(EVENT_START, SOURCE_HUMAN, history, at, (goal or "").strip())
+    def start(
+        self, goal: str, history: list[dict], at: str,
+        guards: Sequence[TransitionGuard] = (),
+    ) -> Outcome:
+        return self._attempt(
+            EVENT_START, SOURCE_HUMAN, history, at, (goal or "").strip(), guards
+        )
 
-    def fire(self, event: str, history: list[dict], at: str) -> Outcome:
+    def fire(
+        self, event: str, history: list[dict], at: str,
+        guards: Sequence[TransitionGuard] = (),
+    ) -> Outcome:
         """Событие человека без данных: пауза, продолжить, отменить.
         «Начать» через `fire()` не идёт — ему нужна цель, это `start()`."""
         if event not in (EVENT_PAUSE, EVENT_RESUME, EVENT_CANCEL):
@@ -804,10 +933,11 @@ class TaskMachine:
                 event, SOURCE_HUMAN,
                 f"событие «{event}» кнопкой не вызывается", history, at,
             )
-        return self._attempt(event, SOURCE_HUMAN, history, at, None)
+        return self._attempt(event, SOURCE_HUMAN, history, at, None, guards)
 
     def apply(
-        self, task: TrackerTask, text: str, history: list[dict], at: str
+        self, task: TrackerTask, text: str, history: list[dict], at: str,
+        guards: Sequence[TransitionGuard] = (),
     ) -> tuple[Outcome, bool]:
         history = history or []
         parsed = context.parse_changes(text)
@@ -828,9 +958,34 @@ class TaskMachine:
             return Outcome(False, EVENT_NONE, self._last_update, None), False
 
         data = self._extract_data(event, event_pairs)
-        outcome = self._attempt(event, SOURCE_TRACKER, history, at, data)
+        outcome = self._attempt(event, SOURCE_TRACKER, history, at, data, guards)
         self._last_update = outcome.note
         return outcome, True
+
+    def confirm(
+        self, history: list[dict], at: str,
+        guards: Sequence[TransitionGuard] = (),
+    ) -> Outcome:
+        """Подтверждение человеком ожидающего перехода (день 14, §5.3):
+        применяет событие с его исходным источником (трекер) и данными, пройдя
+        ограничение `с подтверждением`, но не `запрещён` — запрет
+        подтверждением не обходится. Ожидания нет — отказ. Ожидание
+        снимается в любом случае, когда попытка была: подтверждение,
+        упёршееся в отказ, не должно оставлять на месте устаревший вопрос."""
+        pending = self._pending
+        if pending is None:
+            return self._reject(
+                EVENT_CONFIRM, SOURCE_HUMAN,
+                "подтверждать нечего: переходов, ждущих подтверждения, сейчас нет",
+                history, at,
+            )
+        self._pending = None
+        outcome = self._attempt(
+            pending.event, SOURCE_TRACKER, history, at, pending.data, guards,
+            confirmed=True,
+        )
+        self._last_update = outcome.note
+        return outcome
 
     def load(self, data: dict) -> None:
         self.reset()
@@ -895,6 +1050,7 @@ class TaskMachine:
         self._state = None
         self._rejection = None
         self._last_update = ""
+        self._pending = None
 
     # --- Внутреннее ---------------------------------------------------------
 
@@ -929,7 +1085,15 @@ class TaskMachine:
         fresh = self._fresh_transition(history)
         if fresh is not None and fresh.event == EVENT_START:
             return False, TRACKER_NOTE_JUST_STARTED
-        if fresh is not None and fresh.source == SOURCE_TRACKER:
+        # Подтверждённый переход трекера ведёт себя как кнопка человека: он
+        # применён нажатием, а не разбором сообщения, и следующее сообщение на
+        # этом месте истории трекер разбирает как обычно (день 14, §5.3) —
+        # иначе после подтверждения первой проверки вторая не отметилась бы.
+        if (
+            fresh is not None
+            and fresh.source == SOURCE_TRACKER
+            and not _is_confirmed(fresh)
+        ):
             return False, TRACKER_NOTE_ALREADY_APPLIED
         return True, ""
 
@@ -977,17 +1141,42 @@ class TaskMachine:
         return None
 
     def _attempt(
-        self, event: str, source: str, history: list[dict], at: str, data
+        self, event: str, source: str, history: list[dict], at: str, data,
+        guards: Sequence[TransitionGuard] = (), confirmed: bool = False,
     ) -> Outcome:
+        """Порядок причин — от самой общей к самой частной (§5.2): таблица,
+        ограничение, условие, переход."""
         stage, paused = self._stage_paused()
         row = _find_row(event)
         if row is None or source not in row.sources or not _stage_paused_matches(row, stage, paused):
             reason = self._rejection_reason(event, source, row, stage, paused)
             return self._reject(event, source, reason, history, at)
+        guard = _strictest_guard(event, guards)
+        if guard is not None:
+            if guard.mode == GUARD_FORBIDDEN:
+                # Запрет касается любого источника, в том числе кнопок
+                # человека, и подтверждением не обходится.
+                return self._reject(
+                    event, source,
+                    f"запрещено ограничением: «{guard.reason}» ({guard.source_note})",
+                    history, at,
+                )
+            if guard.mode == GUARD_CONFIRM and source == SOURCE_TRACKER and not confirmed:
+                # Ни перехода, ни отказа: автомат остаётся где был и ждёт
+                # человека; новое ожидание заменяет прежнее.
+                pending = Pending(
+                    event=event, data=data, reason=guard.reason,
+                    source_note=guard.source_note, messages=len(history or []),
+                    at=at,
+                )
+                self._pending = pending
+                note = _pending_note(pending)
+                self._last_update = note
+                return Outcome(False, event, note, None, pending)
         error = self._check_condition(event, data, stage)
         if error:
             return self._reject(event, source, error, history, at)
-        return self._transition(event, source, data, history, at)
+        return self._transition(event, source, data, history, at, confirmed)
 
     def _rejection_reason(
         self, event: str, source: str, row: Transition | None, stage: str, paused: bool
@@ -1048,7 +1237,8 @@ class TaskMachine:
         return None
 
     def _transition(
-        self, event: str, source: str, data, history: list[dict], at: str
+        self, event: str, source: str, data, history: list[dict], at: str,
+        confirmed: bool = False,
     ) -> Outcome:
         state = self._state
         from_stage = state.stage if state else NO_TASK
@@ -1116,6 +1306,12 @@ class TaskMachine:
             record_note = ""
             outcome_note = "отменена"
 
+        if confirmed:
+            record_note = (
+                f"{record_note}, {CONFIRMED_NOTE}" if record_note else CONFIRMED_NOTE
+            )
+            outcome_note = _with_confirmed(outcome_note)
+
         record = TransitionRecord(
             event=event, source=source, from_stage=from_stage,
             to_stage=new_state.stage, paused=new_state.paused, step=new_state.step,
@@ -1125,6 +1321,9 @@ class TaskMachine:
         new_state = replace(new_state, transitions=prior + (record,))
         self._state = new_state
         self._rejection = None
+        # Любой состоявшийся переход снимает ожидание (§5.3): ждать было
+        # чего-то от состояния, которого больше нет.
+        self._pending = None
         self._last_update = outcome_note
         return Outcome(True, event, outcome_note, None)
 
