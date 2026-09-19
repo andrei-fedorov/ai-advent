@@ -3534,6 +3534,11 @@ _INVARIANT_SCENARIO_LABELS: list[str] = [
 ]
 
 
+# Чат и дебаг-панель — ровно пополам; кнопки компактнее дефолтных.
+APP_CSS = """
+button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8px !important; min-height: 28px !important; }
+"""
+
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
@@ -3689,13 +3694,13 @@ with gr.Blocks(title="TooManyRules") as demo:
                 lines=2,
             )
             with gr.Row():
-                send_btn = gr.Button("Отправить", variant="primary", scale=2)
-                reset_btn = gr.Button("Сбросить диалог", scale=1)
+                send_btn = gr.Button("Отправить", size="sm", variant="primary", scale=2)
+                reset_btn = gr.Button("Сбросить диалог", size="sm", scale=1)
                 # Второй агент с тем же пресетом: сменой пресета такую пару не
                 # получить, а она нагляднее всего показывает раздельные стеки.
-                new_agent_btn = gr.Button("Новый агент", scale=1)
+                new_agent_btn = gr.Button("Новый агент", size="sm", scale=1)
                 delete_agent_btn = gr.Button(
-                    "Удалить агент", variant="stop", scale=1
+                    "Удалить агент", size="sm", variant="stop", scale=1
                 )
             # Ряд кнопок задачи (день 13, §7.2) — сразу под рядом «Отправить
             # / Сбросить диалог / Новый агент / Удалить агент»: старт задачи
@@ -3704,23 +3709,23 @@ with gr.Blocks(title="TooManyRules") as demo:
             # видно почему (это часть проверки, а не недосмотр интерфейса).
             with gr.Row():
                 start_task_btn = gr.Button(
-                    "Начать задачу с этим сообщением", variant="primary", scale=2
+                    "Начать задачу с этим сообщением", size="sm", variant="primary", scale=2
                 )
-                pause_task_btn = gr.Button("⏸ Пауза", scale=1)
-                resume_task_btn = gr.Button("▶ Продолжить", scale=1)
+                pause_task_btn = gr.Button("⏸ Пауза", size="sm", scale=1)
+                resume_task_btn = gr.Button("▶ Продолжить", size="sm", scale=1)
                 # «Подтвердить переход» (день 14, §8.3) — переход трекера,
                 # который остановил инвариант «с подтверждением», отмечает
                 # человек. Активна всегда: нечего подтверждать — отказ, и в
                 # статусе видно почему.
-                confirm_task_btn = gr.Button("✅ Подтвердить переход", scale=1)
+                confirm_task_btn = gr.Button("✅ Подтвердить переход", size="sm", scale=1)
                 cancel_task_btn = gr.Button(
-                    "Отменить задачу", variant="stop", scale=1
+                    "Отменить задачу", size="sm", variant="stop", scale=1
                 )
             # Ряд checkpoint'ов и веток (день 10): своя строка под кнопками
             # чата — жест здесь другой, чем у кнопок выше (они не трогают
             # историю, «Ветка от checkpoint'а» заводит новую сессию).
             with gr.Row():
-                save_checkpoint_btn = gr.Button("Сохранить checkpoint", scale=1)
+                save_checkpoint_btn = gr.Button("Сохранить checkpoint", size="sm", scale=1)
                 checkpoint_dropdown = gr.Dropdown(
                     choices=[],
                     label="Checkpoint",
@@ -3730,7 +3735,7 @@ with gr.Blocks(title="TooManyRules") as demo:
                     # «Ветка от checkpoint'а», и правило «слушать select»
                     # к нему не относится.
                 )
-                fork_btn = gr.Button("Ветка от checkpoint'а", scale=1)
+                fork_btn = gr.Button("Ветка от checkpoint'а", size="sm", scale=1)
             # Ряд кандидатов (день 11, §7.2) — под рядом checkpoint'ов. Своего
             # обработчика у группы нет — это вход кнопок, как список
             # «Checkpoint». По умолчанию не отмечено ничего: в долговременную
@@ -3744,9 +3749,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                 )
                 with gr.Column(scale=1, min_width=160):
                     accept_btn = gr.Button(
-                        "Сохранить в долговременную", variant="primary"
+                        "Сохранить в долговременную", size="sm", variant="primary"
                     )
-                    reject_btn = gr.Button("Отклонить")
+                    reject_btn = gr.Button("Отклонить", size="sm")
             status_md = gr.Markdown("")
 
             # Редактор инвариантов (день 14, §8.5) — форма, а не вид, как
@@ -3815,8 +3820,8 @@ with gr.Blocks(title="TooManyRules") as demo:
                     ),
                 )
                 with gr.Row():
-                    save_invariant_btn = gr.Button("Сохранить инвариант", variant="primary")
-                    delete_invariant_btn = gr.Button("Удалить инвариант", variant="stop")
+                    save_invariant_btn = gr.Button("Сохранить инвариант", size="sm", variant="primary")
+                    delete_invariant_btn = gr.Button("Удалить инвариант", size="sm", variant="stop")
                 gr.Examples(
                     examples=[
                         [
@@ -3871,7 +3876,7 @@ with gr.Blocks(title="TooManyRules") as demo:
                 profile_steps_input = gr.Textbox(
                     label="Порядок ответа — по шагу на строку", lines=4,
                 )
-                save_profile_btn = gr.Button("Сохранить профиль", variant="primary")
+                save_profile_btn = gr.Button("Сохранить профиль", size="sm", variant="primary")
                 gr.Examples(
                     examples=[
                         [v["address"], v["language"], v["level"], v["constraints"]]
@@ -3981,7 +3986,7 @@ with gr.Blocks(title="TooManyRules") as demo:
             )
 
         # --- Справа: дебаг-панель ---
-        with gr.Column(scale=2):
+        with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
             # Свёрнуто: конфиг ко дню 13 не меняется.
             with gr.Accordion("Конфиг агента (AgentConfig)", open=False):
@@ -3991,12 +3996,14 @@ with gr.Blocks(title="TooManyRules") as demo:
                     label="Конфиг агента (AgentConfig)",
                     height=220,
                 )
-            metrics_md = gr.Markdown(_metrics_md(None))
+            with gr.Accordion("Последний вызов", open=False):
+                metrics_md = gr.Markdown(_metrics_md(None))
             # «Инварианты» (день 14, §8.4) — сразу под «Последним вызовом» и
             # над блоками профиля и памяти, в порядке блоков запроса:
             # инварианты встают в запрос раньше профиля. Развёрнут: это блок
             # сегодняшнего дня.
-            invariants_md = gr.Markdown("")
+            with gr.Accordion("Инварианты (день 14)", open=False):
+                invariants_md = gr.Markdown("")
             # Свёрнуто: инструменты дней 11-12.
             with gr.Accordion("Профиль и слои памяти (дни 11-12)", open=False):
                 # «Профиль» (день 12, §7.4) — сразу под «Последним вызовом» и над
@@ -4020,7 +4027,8 @@ with gr.Blocks(title="TooManyRules") as demo:
             # Сначала «что отправляем» (день 9), потом «сколько это от окна»
             # (день 8): блок контекста стоит над бюджетом, а сводка — сразу
             # под ним, потому что объясняет числа над собой.
-            flow_md = gr.Markdown("")
+            with gr.Accordion("Что отправляем в модель (день 9)", open=False):
+                flow_md = gr.Markdown("")
             # Свёрнуто: инструмент дней 9-10.
             with gr.Accordion("Память стратегии (дни 9-10)", open=False):
                 memory_box = gr.Textbox(
@@ -4039,7 +4047,8 @@ with gr.Blocks(title="TooManyRules") as demo:
             # потом «сколько это от окна». С метриками последнего вызова выше
             # это один и тот же запрос с двух сторон: там факт после вызова,
             # здесь оценка до него.
-            context_md = gr.Markdown("")
+            with gr.Accordion("Бюджет контекста (день 8)", open=False):
+                context_md = gr.Markdown("")
             # Свёрнуто: инструмент дня 8.
             with gr.Accordion("Заполнитель контекста (день 8)", open=False):
                 with gr.Row():
@@ -4050,7 +4059,7 @@ with gr.Blocks(title="TooManyRules") as demo:
                         minimum=0,
                         scale=1,
                     )
-                    fill_btn = gr.Button("Набить контекст", scale=1)
+                    fill_btn = gr.Button("Набить контекст", size="sm", scale=1)
                 gr.Markdown(
                     "Кнопка кладёт текст-заполнитель в поле вопроса и ничего не "
                     "отправляет. Заполнитель, который **прошёл** в модель, "
@@ -4106,21 +4115,23 @@ with gr.Blocks(title="TooManyRules") as demo:
             # «Ветки диалога» (день 10, §7.3) — над переключателем агентов и
             # стеком сообщений: ветка — это про то, какая история лежит в
             # стеке, и этот блок готовит к чтению того, что ниже.
-            branches_md = gr.Markdown("")
+            with gr.Accordion("Ветки диалога (день 10)", open=False):
+                branches_md = gr.Markdown("")
             # Переключатель стоит вплотную к стеку сообщений: смысл именно
             # в том, что стек — не «стек приложения», а стек конкретного
             # инстанса, и при переключении он меняется целиком.
-            agent_dropdown = gr.Dropdown(
-                choices=[],
-                label="Агент процесса",
-                filterable=False,   # список служебный, фильтр в нём только мешает
-                info=(
-                    "Агенты, поднятые с момента старта приложения и ещё не "
-                    "удалённые. Выбор делает агента активным: переключаются "
-                    "чат, стек, конфиг и метрики, и следующий вопрос уходит "
-                    "ему."
-                ),
-            )
+            with gr.Accordion("Агент процесса (день 10)", open=False):
+                agent_dropdown = gr.Dropdown(
+                    choices=[],
+                    label="Агент процесса",
+                    filterable=False,   # список служебный, фильтр в нём только мешает
+                    info=(
+                        "Агенты, поднятые с момента старта приложения и ещё не "
+                        "удалённые. Выбор делает агента активным: переключаются "
+                        "чат, стек, конфиг и метрики, и следующий вопрос уходит "
+                        "ему."
+                    ),
+                )
             # Свёрнуто: ко дню 13 в кадре нужен файл сессии (`context.task`),
             # а не стек целиком.
             with gr.Accordion("Стек сообщений агента", open=False):
@@ -4136,11 +4147,12 @@ with gr.Blocks(title="TooManyRules") as demo:
             # Два блока дня 7 стоят сразу под стеком сообщений, чтобы «в
             # памяти» и «на диске» были в кадре рядом: одна и та же переписка,
             # показанная с двух сторон.
-            storage_md = gr.Markdown("")
-            session_file_json = gr.JSON(
-                label="Файл сессии на диске",
-                max_height=420,
-            )
+            with gr.Accordion("Хранилище: сессия на диске (день 7)", open=False):
+                storage_md = gr.Markdown("")
+                session_file_json = gr.JSON(
+                    label="Файл сессии на диске",
+                    max_height=420,
+                )
             # Свёрнуто: эти файлы в кадре дня 14 открываются одним кликом.
             with gr.Accordion(
                 "Файлы долговременной памяти, профиля и инвариантов (дни 11-12, 14)",
@@ -4493,4 +4505,4 @@ with gr.Blocks(title="TooManyRules") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(css=APP_CSS)
