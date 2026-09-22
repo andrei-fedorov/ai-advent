@@ -3,7 +3,8 @@
 # памяти — три слоя, кандидаты в долговременную память и переключатель слоёв
 # в запросе; день 12: профиль пользователя, роутер режима и переключатель
 # «Профиль в запросе»; день 13: состояние задачи; день 14: инварианты; день
-# 15: жёсткий контроль переходов — красный путь).
+# 15: жёсткий контроль переходов — красный путь; день 16, неделя 4:
+# подключение к MCP-серверу BoardGameGeek и список его инструментов).
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
@@ -49,6 +50,18 @@
 # своей копии у интерфейса нет и новых обработчиков тоже: две кнопки отката
 # подписаны на существующий `on_task_event` с новым событием.
 #
+# День 16 (спецификация дня 16, §5) добавляет блок «MCP: сервер BoardGameGeek»
+# наверху дебаг-панели. Подключается `mcp_client.list_tools()`, описание
+# сервера — `presets.BGG_MCP`; SDK `mcp` интерфейс не импортирует. **Блок не
+# входит в `_view()`** — третье осознанное исключение после редакторов профиля
+# и инвариантов, и довод здесь сильнее: блок — вообще не вид на состояние
+# агента. Агент о MCP не знает, результат подключения существует только в этой
+# вкладке, обработчик `on_mcp_list()` не принимает `agent_state` и агента не
+# трогает, а остальные обработчики не трогают блок — панели не с чем
+# разойтись. У блока свои выходы `MCP_OUTPUTS`; `_view()` остаётся на 34
+# значениях. Подключения при старте нет — только строка лога: приложение
+# обязано подниматься и без собранного сервера.
+#
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
 # словами, текст памяти и числа. День 10 добавил в переключатель ещё две
@@ -80,7 +93,9 @@
 # Запуск: ./run.sh (или python app.py из src/ с активированным .venv)
 
 import functools
+import json
 import logging
+import os
 from dataclasses import asdict, replace
 from datetime import datetime
 
@@ -108,8 +123,20 @@ from invariants import (
     parse_invariants,
     validate,
 )
+from mcp_client import (
+    HANDSHAKE_DISCOVER,
+    INHERITED_ENV,
+    SDK_VERSION,
+    STAGE_CONNECT,
+    STAGE_LIST,
+    ToolListing,
+    handshake_text,
+    list_tools,
+    resolve_launch,
+)
 from memory import LAYER_LONG_TERM, LAYER_WORKING, REQUEST_LAYERS, long_term_text
 from presets import (
+    BGG_MCP,
     BRANCH_QUESTION,
     BRANCH_STEPS,
     COMPARISON_SCENARIO,
@@ -122,6 +149,7 @@ from presets import (
     INVARIANT_MAX_ITEMS,
     INVARIANT_SCENARIO,
     INVARIANT_TEXT_WORDS,
+    MCP_TIMEOUT_S,
     MEMORY_CONTROL_QUESTIONS,
     MEMORY_MAP,
     MEMORY_SCENARIO,
@@ -227,6 +255,25 @@ logger.info(
 )
 for _invariant_note in _start_notes:
     logger.warning("инварианты при старте: %s", _invariant_note)
+
+# MCP (день 16, §5.4) — одна строка: чем будет запущен сервер и какие
+# переменные заданы. Подключения при старте нет — приложение обязано
+# подниматься и без собранного сервера; значения переменных не пишутся, только
+# имена.
+# Окружение за время жизни процесса не меняется (§2.7), поэтому то же описание
+# запуска показывает и блок MCP в панели.
+MCP_LAUNCH = resolve_launch(BGG_MCP, os.environ)
+(logger.warning if MCP_LAUNCH.error else logger.info)(
+    "MCP при старте: сервер %s — %s (%s)%s; %s; SDK mcp %s; подключение — "
+    "кнопкой в панели",
+    BGG_MCP.name, MCP_LAUNCH.command_line, MCP_LAUNCH.origin,
+    f" — ⚠️ {MCP_LAUNCH.error}" if MCP_LAUNCH.error else "",
+    ", ".join(
+        [f"{key} — задан" for key in MCP_LAUNCH.env_set]
+        + [f"{key} — не задан" for key in MCP_LAUNCH.env_missing]
+    ) or "переменных для сервера нет",
+    SDK_VERSION,
+)
 
 # Сколько агентов поднялось из файлов при старте процесса — заполняется
 # `_restore_agents()` ниже и показывается в строке статуса при открытии
@@ -3506,6 +3553,169 @@ def on_save_profile(
     return (agent, gr.update(), *_view(agent, status))
 
 
+# --- MCP: сервер BoardGameGeek (день 16, §5) ------------------------------
+# Блок — не вид на состояние агента: ни `_view()`, ни `agent_state`. Всё, что
+# он показывает, — описание сервера (статично) и результат последнего нажатия
+# в этой вкладке (живёт только в выходах `MCP_OUTPUTS`).
+
+MCP_TABLE_COLUMNS = ["№", "инструмент", "описание", "параметры (* — обязательный)"]
+MCP_STATUS_INITIAL = (
+    "Ещё не подключались. Каждое нажатие — новое соединение с сервером."
+)
+
+
+def _mcp_env_line(launch) -> str:
+    keys = [f"{key} — задан" for key in launch.env_set] + [
+        f"{key} — не задан" for key in launch.env_missing
+    ]
+    return " · ".join(keys) if keys else "—"
+
+
+def _mcp_command_md(launch) -> str:
+    return f"`{launch.command_line}` ({launch.origin})"
+
+
+def _mcp_server_md() -> str:
+    """Описание сервера — собирается один раз при построении интерфейса."""
+    source = f" · [исходники]({BGG_MCP.source})" if BGG_MCP.source else ""
+    if MCP_LAUNCH.error:
+        launch_line = (
+            f"- ⚠️ Командная строка не годится: {MCP_LAUNCH.error} — "
+            f"`{MCP_LAUNCH.command_line}` ({MCP_LAUNCH.origin}). Кнопка покажет "
+            f"сбой стадии «запуск»."
+        )
+    else:
+        launch_line = f"- Запуск: {_mcp_command_md(MCP_LAUNCH)}"
+    # Замена действует — показать, что заменено; нет — чем заменить.
+    if MCP_LAUNCH.command_line != BGG_MCP.command:
+        launch_line += f"; по умолчанию — `{BGG_MCP.command}`"
+    elif BGG_MCP.command_env:
+        launch_line += (
+            f"; целиком заменяется переменной {BGG_MCP.command_env} в src/.env"
+        )
+    return (
+        f"**{BGG_MCP.title}**{source} · транспорт stdio · клиент — официальный "
+        f"SDK mcp {SDK_VERSION}\n\n"
+        f"{launch_line}\n"
+        f"- Серверу передаются: {_mcp_env_line(MCP_LAUNCH)} (значения не "
+        f"показываются). Остального окружения приложения, в том числе ключа "
+        f"DeepSeek, сервер не получает: SDK отдаёт процессу только "
+        f"{', '.join(INHERITED_ENV)}.\n"
+        f"- Каждое нажатие — новое соединение: запуск процесса → согласование "
+        f"протокола → tools/list → закрытие. Агент инструментами не пользуется "
+        f"и о сервере не знает."
+    )
+
+
+def _mcp_at(listing: ToolListing) -> str:
+    return datetime.fromisoformat(listing.at).strftime("%d.%m.%Y %H:%M:%S")
+
+
+def _mcp_server_lines(listing: ToolListing) -> list[str]:
+    """Что узнали при соединении — и при успехе, и при сбое на списке."""
+    name = " ".join(
+        part for part in (listing.server_name, listing.server_version) if part
+    ) or "сервер не назвался"
+    if listing.handshake == HANDSHAKE_DISCOVER:
+        protocol = f"протокол {listing.protocol_version} — {handshake_text(listing.handshake)}"
+    else:
+        protocol = (
+            f"протокол {listing.protocol_version} — проба server/discover не "
+            f"принята, рукопожатие initialize"
+        )
+    lines = [
+        f"- Сервер: {name} · {protocol}",
+        f"- Возможности сервера: {', '.join(listing.capabilities) or '—'}",
+    ]
+    if listing.instructions:
+        lines.append(f"- Инструкции сервера: {listing.instructions}")
+    return lines
+
+
+def _mcp_tools_tokens(listing: ToolListing) -> int:
+    """Оценка токенов описаний и схем — то, что отдают модели при вызове
+    инструментов: `name`, `description`, `inputSchema` (аннотации — нет)."""
+    tools = [
+        {key: tool[key] for key in ("name", "description", "inputSchema") if key in tool}
+        for page in listing.pages
+        for tool in page.get("tools", [])
+    ]
+    return estimate_tokens(json.dumps(tools, ensure_ascii=False)) if tools else 0
+
+
+def _mcp_status_md(listing: ToolListing) -> str:
+    command = f"- Запуск: {_mcp_command_md(listing.launch)}"
+    if listing.ok:
+        return "\n".join([
+            f"✅ **Соединение установлено** · {_mcp_at(listing)}",
+            *_mcp_server_lines(listing),
+            f"- Инструментов: {len(listing.tools)} · страниц tools/list: "
+            f"{len(listing.pages)}",
+            f"- Время: соединение {listing.connect_s:.2f} с · tools/list "
+            f"{listing.list_s:.2f} с · всего с закрытием {listing.total_s:.2f} с",
+            f"- Описания и схемы всех инструментов: ≈{_fmt_int(_mcp_tools_tokens(listing))} "
+            f"токенов по оценке — столько добавилось бы к каждому запросу, если "
+            f"отдать их модели; сегодня в запрос не уходит ничего",
+            command,
+        ])
+    lines = [
+        f"❌ **Сбой на стадии «{listing.stage}»** · {_mcp_at(listing)} · через "
+        f"{listing.total_s:.2f} с",
+        f"- {listing.error}",
+    ]
+    if listing.stage == STAGE_CONNECT:
+        # Причину «Connection closed» знает только сервер — она в его stderr,
+        # который идёт в терминал приложения как есть (§4.6).
+        lines.append(
+            "- Сообщение самого сервера — в терминале приложения, над записью "
+            "лога (например, «Invalid mode: …» — сервер не понял флаги "
+            "командной строки)"
+        )
+    if listing.stage == STAGE_LIST:
+        # Соединение было — факты о сервере остаются.
+        lines.extend(_mcp_server_lines(listing))
+    lines.append(command)
+    return "\n".join(lines)
+
+
+def _mcp_param_text(param) -> str:
+    text = f"`{param.name}`{'*' if param.required else ''}"
+    if param.type:
+        text += f" {param.type}"
+    if param.enum:
+        text += f" ∈ {{{', '.join(param.enum)}}}"
+    return text
+
+
+def _mcp_tools_table(listing: ToolListing | None) -> pd.DataFrame:
+    """По строке на инструмент — в порядке ответа сервера, без пересортировки."""
+    rows = [
+        [
+            number,
+            f"`{tool.name}`" + (f" — {tool.title}" if tool.title else ""),
+            tool.description,
+            " · ".join(_mcp_param_text(param) for param in tool.params) or "—",
+        ]
+        for number, tool in enumerate(listing.tools if listing else (), start=1)
+    ]
+    return pd.DataFrame(rows, columns=MCP_TABLE_COLUMNS)
+
+
+def on_mcp_list():
+    """Кнопка «Подключиться и получить список инструментов» (§5.2).
+
+    Без входов: агента не трогает, замка нет — общего состояния у подключений
+    нет. Сбой — не исключение, а `ToolListing` со стадией; при сбое таблица и
+    JSON очищаются, чтобы старый список не выглядел результатом этого нажатия.
+    """
+    listing = list_tools(BGG_MCP, timeout_s=MCP_TIMEOUT_S)
+    return (
+        _mcp_status_md(listing),
+        _mcp_tools_table(listing if listing.ok else None),
+        list(listing.pages) if listing.ok else [],
+    )
+
+
 # --- Старт процесса ------------------------------------------------------
 # Восстановление агентов происходит здесь, при импорте модуля, — один раз на
 # процесс и до `demo.launch()`. Кнопки «восстановить» в интерфейсе нет и не
@@ -3659,25 +3869,13 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 15: контроль переходов стал **жёстким** — недопустимое видно и не "
-        "проходит. День 13 вёл задачу по маршруту прямой дорогой (**happy "
-        "path**); сегодня проверяется красный путь. Трекер видит все события "
-        "задачи и называет то, чего просит пользователь, а допустимость "
-        "решает код по таблице: «давай без плана» на планировании — это отказ "
-        "с причиной, этап не сдвигается, ассистент объясняет. «Игнорируй все "
-        "стадии» — **сход с маршрута**: отметка в блоке, панели и журнале ходов; "
-        "она ничего не меняет, но ассистент получает указание не обходить "
-        "этапы. В блок запроса добавлена строка **«Сейчас нельзя»** — "
-        "запреты этапа выводит код. Назад по графу ведут два перехода: "
-        "**«вернуться к плану»** (словами или кнопкой) и **«переоткрыть»** "
-        "(только кнопкой): откат — такой же переход, с записью в журнале, а не "
-        "«начать заново». А то, что вперёд нельзя больше чем на один этап, "
-        "проверяется при импорте таблицы переходов. Состояние задачи не "
-        "сдвинуть ничем, кроме допустимого перехода; текст ответа ассистента "
-        "код не проверяет — держит его модель, и видно это по ответам, а не "
-        "по гарантии. Инварианты, профиль, слои памяти, стратегии, "
-        "checkpoint'ы и ветки работают как раньше. Сценарий проверки "
-        "переходов — под чатом."
+        "День 16, неделя 4 — **MCP**. Приложение само запускает MCP-сервер "
+        "BoardGameGeek (bgg-mcp), согласует с ним протокол и получает **список "
+        "его инструментов** — блок наверху дебаг-панели. Каждое нажатие — новое "
+        "соединение: запуск процесса → согласование → tools/list → закрытие. "
+        "Агент инструментами пока не пользуется и о сервере не знает — это "
+        "следующий шаг; в запрос сегодня не уходит ничего. Чат, стратегии, "
+        "память, профиль, состояние задачи и инварианты работают как раньше."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -4019,9 +4217,10 @@ with gr.Blocks(title="TooManyRules") as demo:
                     label="Профили для проверки (заполняет общую часть; сохраняет человек)",
                 )
 
-            # Свёрнуто: в кадре дня 15 остаётся только его сценарий,
-            # остальные — под аккордеоном (правило «на экране — текущий день»).
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-14)", open=False):
+            # Свёрнуто: у дня 16 сценария в чате нет — его инструмент в
+            # дебаг-панели, поэтому под аккордеоном все сценарии, включая день
+            # 15 (правило «на экране — текущий день»).
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15)", open=False):
                 gr.Examples(
                     examples=[
                         ["Из каких фаз состоит ход игрока?"],
@@ -4112,26 +4311,53 @@ with gr.Blocks(title="TooManyRules") as demo:
                     ),
                 )
 
-            # Сценарий проверки красного пути (день 15, §7.5, §9.1): Р1-Р3, П1-П7,
-            # О1, Г и Д, Б1 (Г и Д повторяются — по строке в списке, отправка
-            # несколько раз). Клик кладёт текст в поле ввода; Р1 отправляется
-            # кнопкой «Начать задачу с этим сообщением», Б1 — только в ветке с
-            # выключенным «Состоянием задачи в запросе», остальные — «Отправить».
-            # Развёрнут в кадр.
-            gr.Examples(
-                examples=[[text] for text in ROUTE_SCENARIO],
-                inputs=[question_input],
-                example_labels=_ROUTE_SCENARIO_LABELS,
-                examples_per_page=len(ROUTE_SCENARIO),
-                label=(
-                    "Сценарий проверки переходов (Р, П, О, Г, Д, Б — см. "
-                    "docs/TooManyRules — День 15 проверка переходов.md)"
-                ),
-            )
+                # Сценарий проверки красного пути (день 15, §7.5, §9.1): Р1-Р3,
+                # П1-П7, О1, Г и Д, Б1 (Г и Д повторяются — по строке в списке,
+                # отправка несколько раз). Клик кладёт текст в поле ввода; Р1
+                # отправляется кнопкой «Начать задачу с этим сообщением», Б1 —
+                # только в ветке с выключенным «Состоянием задачи в запросе»,
+                # остальные — «Отправить». С дня 16 свёрнут вместе с остальными
+                # прошлыми днями.
+                gr.Examples(
+                    examples=[[text] for text in ROUTE_SCENARIO],
+                    inputs=[question_input],
+                    example_labels=_ROUTE_SCENARIO_LABELS,
+                    examples_per_page=len(ROUTE_SCENARIO),
+                    label=(
+                        "Сценарий проверки переходов (Р, П, О, Г, Д, Б — см. "
+                        "docs/TooManyRules — День 15 проверка переходов.md)"
+                    ),
+                )
+
 
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
+            # MCP (день 16, §5.1) — развёрнут в кадр. Не входит в `_view()`:
+            # свои выходы `MCP_OUTPUTS`, обработчик без `agent_state`.
+            # Описание сервера статично — окружение за время жизни процесса не
+            # меняется.
+            with gr.Accordion("MCP: сервер BoardGameGeek (день 16)", open=True):
+                gr.Markdown(_mcp_server_md())
+                mcp_list_btn = gr.Button(
+                    "🔌 Подключиться и получить список инструментов",
+                    variant="primary",
+                )
+                mcp_status_md = gr.Markdown(MCP_STATUS_INITIAL)
+                mcp_tools_table = gr.Dataframe(
+                    value=_mcp_tools_table(None),
+                    label="Инструменты сервера — в порядке ответа tools/list",
+                    datatype=["number", "markdown", "str", "markdown"],
+                    column_widths=["7%", "20%", "40%", "33%"],
+                    max_height=360,
+                    wrap=True,
+                )
+                with gr.Accordion("Ответ tools/list целиком (JSON)", open=False):
+                    mcp_pages_json = gr.JSON(
+                        value=[],
+                        label="Страницы ответа, как пришли от сервера",
+                        max_height=420,
+                    )
             # Свёрнуто: конфиг ко дню 13 не меняется.
             with gr.Accordion("Конфиг агента (AgentConfig)", open=False):
                 # Фиксированная высота со скроллом: системный промпт длинный,
@@ -4158,11 +4384,10 @@ with gr.Blocks(title="TooManyRules") as demo:
                 # «Контекстом»: сначала что агент знает, потом что из этого
                 # отправляется.
                 layers_md = gr.Markdown("")
-            # Развёрнуто: с дня 15 состояние задачи и маршрут — инструмент
-            # сегодняшнего дня (§7.5). Блок остаётся тем же выходом `_view()`.
-            # Таблица автомата собрана один раз при построении интерфейса, в
-            # `_view()` не входит: она статична.
-            with gr.Accordion("Состояние задачи и маршрут (дни 13, 15)", open=True):
+            # Свёрнуто с дня 16 (правило «на экране — текущий день»); блок
+            # остаётся тем же выходом `_view()`. Таблица автомата собрана один
+            # раз при построении интерфейса, в `_view()` не входит: она статична.
+            with gr.Accordion("Состояние задачи и маршрут (дни 13, 15)", open=False):
                 # «Состояние задачи» (день 13, §7.4) — в порядке блоков
                 # запроса: задача встаёт за рабочей памятью.
                 task_md = gr.Markdown("")
@@ -4391,6 +4616,11 @@ with gr.Blocks(title="TooManyRules") as demo:
         invariant_mode_dropdown,
         invariant_active_checkbox,
     ]
+
+    # Блок MCP (день 16, §5.2) — третье исключение из `_view()`: обработчик
+    # без входов, агента не трогает; остальные обработчики блок не трогают.
+    MCP_OUTPUTS = [mcp_status_md, mcp_tools_table, mcp_pages_json]
+    mcp_list_btn.click(on_mcp_list, inputs=None, outputs=MCP_OUTPUTS)
 
     load_event = demo.load(
         on_load,
