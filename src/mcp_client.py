@@ -1,10 +1,19 @@
-# TooManyRules — MCP-клиент (день 16, неделя 4).
+# TooManyRules — MCP-клиент (день 16, неделя 4; день 17 — вызов инструмента
+# и адаптер для агента).
 #
-# Единственное место в проекте, где импортируется SDK `mcp`, — как `agent.py`
-# единственное место вызова LLM API, а `storage.py` — единственное место
-# работы с диском. Модуль запускает stdio-сервер, согласует с ним протокол,
-# забирает список инструментов по всем страницам, закрывает соединение и
-# отдаёт результат одним значением (`ToolListing`). Каждый шаг пишет в лог.
+# Единственное место в проекте, где импортируется клиентская часть SDK `mcp`,
+# — как `agent.py` единственное место вызова LLM API, а `storage.py` —
+# единственное место работы с диском (серверную часть SDK импортирует только
+# `faq_server.py` — отдельная программа, не модуль приложения). Модуль
+# запускает stdio-сервер, согласует с ним протокол, забирает список
+# инструментов по всем страницам (`list_tools()`) или вызывает один
+# инструмент (`call_tool()`, день 17), закрывает соединение и отдаёт результат
+# одним значением (`ToolListing` / `ToolCall`). Каждый шаг пишет в лог.
+#
+# С дня 17 здесь же адаптер `McpToolBox`: через него агент получает каталог и
+# вызывает инструменты. Агент модуль не импортирует — `McpToolBox` отвечает
+# протоколу `agent.ToolBox` структурно, обмен идёт словарями (тот же приём,
+# что у хранилищ `storage.py`).
 #
 # Лист графа: из проекта не импортирует ничего; ни Gradio, ни Too Many Bones,
 # ни BoardGameGeek, ни LLM. Что запускать — приходит параметром (`McpServer`),
@@ -29,8 +38,10 @@
 # (§2.4).
 #
 # Состояния между вызовами нет: ни кэша, ни соединения, ни глобальных
-# объектов, кроме констант и логгера. Каждый вызов `list_tools()` — новый
-# процесс и новое соединение; две вкладки — два независимых подключения.
+# объектов, кроме констант и логгера. Каждый вызов `list_tools()` и
+# `call_tool()` — новый процесс и новое соединение; две вкладки — два
+# независимых подключения. У `McpToolBox` своего состояния тоже нет, кроме
+# описания сервера и потолка времени.
 #
 # Процесс сервера не наследует окружение приложения: SDK передаёт ему только
 # белый список (`INHERITED_ENV`) и то, что перечислено явно (`env_keys`
@@ -38,11 +49,12 @@
 # не логируются — только имена. Командная строка логируется как есть, поэтому
 # ключей в ней не бывает.
 #
-# Ошибок на ожидаемых сбоях модуль не бросает: любой сбой — `ToolListing` со
-# стадией и текстом (§4.6), чтобы интерфейсу не нужно было знать про типы
-# ошибок SDK.
+# Ошибок на ожидаемых сбоях модуль не бросает: любой сбой — `ToolListing` или
+# `ToolCall` со стадией и текстом (§4.6), чтобы интерфейсу и агенту не нужно
+# было знать про типы ошибок SDK.
 
 import importlib.metadata
+import json
 import logging
 import os
 import shlex
@@ -55,6 +67,7 @@ import anyio
 from dotenv import load_dotenv
 from mcp import Client, ListToolsResult, MCPError, StdioServerParameters
 from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS
+from mcp.types import CallToolResult
 
 # Модуль сам читает окружение (замену командной строки и переменные для
 # сервера), поэтому сам и подхватывает `src/.env` — правило `agent.py`.
@@ -68,6 +81,7 @@ logger = logging.getLogger("toomanyrules.mcp")
 STAGE_LAUNCH = "запуск"                 # процесс не запустился (или нечего запускать)
 STAGE_CONNECT = "соединение"            # процесс есть, согласование не завершилось
 STAGE_LIST = "список инструментов"      # соединение есть, списка нет
+STAGE_CALL = "вызов инструмента"        # соединение есть, результата нет (день 17)
 
 HANDSHAKE_INITIALIZE = "initialize"     # рукопожатие эры до 2026-07-28
 HANDSHAKE_DISCOVER = "server/discover"  # эра 2026-07-28
@@ -113,11 +127,14 @@ class Launch:
 
 @dataclass(frozen=True)
 class McpParam:
-    """Параметр для колонки таблицы. Описания параметров таблица не показывает — они в JSON ответа."""
+    """Параметр для колонки таблицы. Описание таблица дня 16 не показывает (оно в
+    JSON ответа), таблица своего сервера дня 17 — показывает: это «описание
+    входных параметров» из задания."""
     name: str
     type: str                       # «string», «number», «array[number]», «string|null»; "" — у свойства нет type
     required: bool
     enum: tuple[str, ...] = ()
+    description: str = ""           # `description` из JSON Schema свойства (день 17)
 
 
 @dataclass(frozen=True)
@@ -154,6 +171,37 @@ class ToolListing:
     @property
     def ok(self) -> bool:
         return not self.error
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """Результат одного вызова инструмента — и удачного, и нет (день 17, §4.1).
+
+    Две разные неудачи — два поля: `error` — до ответа не дошли (процесс,
+    протокол, таймаут), `is_error` — сервер ответил, что инструмент не
+    справился (`isError: true`, текст ошибки — в `text`).
+    """
+    server: str
+    launch: Launch
+    at: str
+    name: str
+    arguments: dict
+    stage: str = ""             # "" — дошли до конца; иначе запуск / соединение / вызов инструмента
+    error: str = ""             # сбой соединения или протокола; "" — ответ получен
+    is_error: bool = False      # сервер ответил, но с isError: ошибка самого инструмента
+    text: str = ""              # текстовые части content через перевод строки; не текст — «[<type>]»
+    server_name: str = ""
+    server_version: str = ""
+    protocol_version: str = ""
+    handshake: str = ""
+    connect_s: float = 0.0
+    call_s: float = 0.0
+    total_s: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        """Ответ получен, и это не ошибка инструмента."""
+        return not self.error and not self.is_error
 
 
 class _NoToolsError(Exception):
@@ -248,6 +296,7 @@ def tool_params(input_schema: Mapping | None) -> tuple[McpParam, ...]:
             type=_schema_type(schema),
             required=name in required_names,
             enum=tuple(str(item) for item in enum) if isinstance(enum, list) else (),
+            description=str(schema.get("description") or ""),
         ))
     return tuple(params)
 
@@ -266,13 +315,16 @@ def _names(keys: tuple[str, ...]) -> str:
 class _Progress:
     """Что узнали за одно подключение — объект вызова, а не модуля.
 
-    Помнит текущую стадию и всё, что уже известно, чтобы при сбое на списке в
-    результате остались факты соединения. Строки «соединение установлено» и
-    «tools/list» пишет в момент события: при зависании на списке в терминале
-    уже видно, что соединение есть.
+    Помнит текущую стадию и всё, что уже известно, чтобы при сбое на списке
+    или на вызове в результате остались факты соединения. Строки «соединение
+    установлено», «tools/list» и «tools/call» пишет в момент события: при
+    зависании на списке или на вызове в терминале уже видно, что соединение
+    есть. `after_connect` — стадия после соединения: список инструментов у
+    `list_tools()`, вызов инструмента у `call_tool()` (день 17).
     """
     prefix: str
     started: float
+    after_connect: str = STAGE_LIST
     stage: str = STAGE_CONNECT
     server_name: str = ""
     server_version: str = ""
@@ -285,6 +337,11 @@ class _Progress:
     connect_s: float = 0.0
     list_started: float = 0.0
     list_s: float = 0.0
+    # Вызов инструмента (день 17):
+    call_started: float = 0.0
+    call_s: float = 0.0
+    text: str = ""
+    is_error: bool = False
 
     def connected(self, client: Client) -> None:
         self.connect_s = time.perf_counter() - self.started
@@ -302,7 +359,7 @@ class _Progress:
             name for name in type(caps).model_fields if getattr(caps, name) is not None
         )
         self.instructions = client.instructions or ""
-        self.stage = STAGE_LIST
+        self.stage = self.after_connect
         logger.info(
             "%s соединение установлено за %.2f с: %s, протокол %s (%s), возможности: %s",
             self.prefix, self.connect_s, _server_label(self.server_name, self.server_version),
@@ -328,6 +385,33 @@ class _Progress:
             self.prefix, len(self.tools), len(self.pages), self.list_s,
             ", ".join(tool.name for tool in self.tools) or "—",
         )
+
+    def called(self, name: str, arguments: dict, result: CallToolResult) -> None:
+        self.call_s = time.perf_counter() - self.call_started
+        # Текстовые части — через перевод строки; не текст (картинка, ресурс)
+        # — пометкой с типом: модели отдаётся текст, а не байты.
+        self.text = "\n".join(
+            part.text if part.type == "text" else f"[{part.type}]"
+            for part in result.content
+        )
+        self.is_error = bool(result.is_error)
+        self.stage = ""
+        call = f"{self.prefix} tools/call {name} {_arguments_str(arguments)}"
+        # Ошибка инструмента — ответ сервера, а не сбой клиента: INFO здесь,
+        # предупреждение пишет агент, для которого это событие хода.
+        if self.is_error:
+            logger.info(
+                "%s: ошибка инструмента за %.2f с — %s", call, self.call_s, self.text,
+            )
+        else:
+            logger.info(
+                "%s: ответ за %.2f с, %d символов", call, self.call_s, len(self.text),
+            )
+
+
+def _arguments_str(arguments: dict) -> str:
+    """Аргументы для лога: это не секреты, а номер статьи и имя раздела."""
+    return json.dumps(arguments, ensure_ascii=False)
 
 
 def _server_label(name: str, version: str) -> str:
@@ -372,6 +456,22 @@ async def _connect_and_list(
         # завершает процесс сам.
 
 
+async def _connect_and_call(
+    params: StdioServerParameters, progress: _Progress, timeout_s: float,
+    name: str, arguments: dict,
+) -> None:
+    # Тот же путь, что `_connect_and_list()`, но вместо листания — один
+    # `tools/call`. Потолок `fail_after` — на всё подключение, как у списка.
+    with anyio.fail_after(timeout_s):
+        async with Client(params) as client:
+            progress.connected(client)
+            if client.server_capabilities.tools is None:
+                raise _NoToolsError()
+            progress.call_started = time.perf_counter()
+            result = await client.call_tool(name, arguments)
+            progress.called(name, arguments, result)
+
+
 def _first_leaf(exc: BaseException) -> BaseException:
     """Исключения SDK изнутри `async with` приходят обёрнутыми в группу, иногда вложенными."""
     while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
@@ -393,46 +493,45 @@ def _error_text(exc: BaseException, timeout_s: float) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def list_tools(server: McpServer, *, timeout_s: float) -> ToolListing:
-    """Одно полное подключение: запуск → согласование → tools/list → закрытие.
+def _start(server: McpServer) -> tuple[str, str, Launch]:
+    """Общее начало подключения: момент, префикс лога и описание запуска."""
+    return (
+        datetime.now().isoformat(timespec="seconds"),
+        _server_prefix(server),
+        resolve_launch(server, os.environ),
+    )
 
-    Синхронная, исключений на ожидаемых сбоях не бросает — любой сбой
-    возвращается `ToolListing` со стадией и текстом.
-    """
-    at = datetime.now().isoformat(timespec="seconds")
-    prefix = _server_prefix(server)
-    launch = resolve_launch(server, os.environ)
 
-    if launch.error:
-        logger.warning(
-            "%s сбой на стадии «%s» через 0.00 с: %s (%s)",
-            prefix, STAGE_LAUNCH, launch.error, launch.origin,
-        )
-        return ToolListing(
-            server=server.name, launch=launch, at=at,
-            stage=STAGE_LAUNCH, error=launch.error,
-        )
+def _launch_failed(prefix: str, launch: Launch) -> None:
+    logger.warning(
+        "%s сбой на стадии «%s» через 0.00 с: %s (%s)",
+        prefix, STAGE_LAUNCH, launch.error, launch.origin,
+    )
 
+
+def _run(connect, prefix: str, launch: Launch, progress: _Progress,
+         timeout_s: float, *args) -> tuple[str, str, float]:
+    """Одно подключение `connect` под `anyio.run()` — общий хвост
+    `list_tools()` и `call_tool()`: строка «подключение», разбор сбоя по
+    стадиям, строка «соединение закрыто». Возвращает стадию сбоя, текст сбоя
+    (оба "" при успехе) и полное время."""
     logger.info(
         "%s подключение: %s (%s); серверу передаются: %s%s",
         prefix, launch.command_line, launch.origin, _names(launch.env_set) or "—",
         f" (не заданы {_names(launch.env_missing)})" if launch.env_missing else "",
     )
-
     # Значения — только для процесса сервера; дальше этой строки они не идут.
     params = StdioServerParameters(
         command=launch.argv[0],
         args=list(launch.argv[1:]),
         env={key: os.environ[key] for key in launch.env_set},
     )
-    started = time.perf_counter()
-    progress = _Progress(prefix=prefix, started=started)
     stage, error = "", ""
     try:
-        anyio.run(_connect_and_list, params, progress, timeout_s)
+        anyio.run(connect, params, progress, timeout_s, *args)
     except Exception as exc:  # KeyboardInterrupt должен останавливать приложение
         leaf = _first_leaf(exc)
-        stage = progress.stage or STAGE_LIST
+        stage = progress.stage or progress.after_connect
         # Нет файла, нет прав — процесс не запустился, хоть SDK и был уже
         # внутри подключения. `TimeoutError` — тоже `OSError`, но таймаут
         # значит, что процесс запущен и молчит.
@@ -442,7 +541,7 @@ def list_tools(server: McpServer, *, timeout_s: float) -> ToolListing:
         ):
             stage = STAGE_LAUNCH
         error = _error_text(leaf, timeout_s)
-        total_s = time.perf_counter() - started
+        total_s = time.perf_counter() - progress.started
         hint = (
             " — сообщение сервера выше, в его stderr"
             if stage == STAGE_CONNECT and isinstance(leaf, MCPError) else ""
@@ -454,9 +553,27 @@ def list_tools(server: McpServer, *, timeout_s: float) -> ToolListing:
             exc_info=None if isinstance(leaf, _EXPECTED_ERRORS) else exc,
         )
     else:
-        total_s = time.perf_counter() - started
+        total_s = time.perf_counter() - progress.started
         logger.info("%s соединение закрыто, всего %.2f с", prefix, total_s)
+    return stage, error, total_s
 
+
+def list_tools(server: McpServer, *, timeout_s: float) -> ToolListing:
+    """Одно полное подключение: запуск → согласование → tools/list → закрытие.
+
+    Синхронная, исключений на ожидаемых сбоях не бросает — любой сбой
+    возвращается `ToolListing` со стадией и текстом.
+    """
+    at, prefix, launch = _start(server)
+    if launch.error:
+        _launch_failed(prefix, launch)
+        return ToolListing(
+            server=server.name, launch=launch, at=at,
+            stage=STAGE_LAUNCH, error=launch.error,
+        )
+
+    progress = _Progress(prefix=prefix, started=time.perf_counter())
+    stage, error, total_s = _run(_connect_and_list, prefix, launch, progress, timeout_s)
     return ToolListing(
         server=server.name,
         launch=launch,
@@ -475,3 +592,107 @@ def list_tools(server: McpServer, *, timeout_s: float) -> ToolListing:
         list_s=progress.list_s,
         total_s=total_s,
     )
+
+
+def call_tool(
+    server: McpServer, name: str, arguments: dict, *, timeout_s: float,
+) -> ToolCall:
+    """Одно полное подключение: запуск → согласование → tools/call → закрытие
+    (день 17, §4.1).
+
+    Синхронная, исключений на ожидаемых сбоях не бросает — ровно как
+    `list_tools()`. Сбой соединения или протокола — `error` со стадией; ответ
+    сервера с `isError` — `is_error` и текст ошибки в `text`.
+    """
+    at, prefix, launch = _start(server)
+    if launch.error:
+        _launch_failed(prefix, launch)
+        return ToolCall(
+            server=server.name, launch=launch, at=at, name=name,
+            arguments=dict(arguments), stage=STAGE_LAUNCH, error=launch.error,
+        )
+
+    progress = _Progress(
+        prefix=prefix, started=time.perf_counter(), after_connect=STAGE_CALL,
+    )
+    stage, error, total_s = _run(
+        _connect_and_call, prefix, launch, progress, timeout_s, name, arguments,
+    )
+    return ToolCall(
+        server=server.name,
+        launch=launch,
+        at=at,
+        name=name,
+        arguments=dict(arguments),
+        stage=stage,
+        error=error,
+        is_error=progress.is_error if not error else False,
+        text=progress.text if not error else "",
+        server_name=progress.server_name,
+        server_version=progress.server_version,
+        protocol_version=progress.protocol_version,
+        handshake=progress.handshake,
+        connect_s=progress.connect_s,
+        call_s=progress.call_s,
+        total_s=total_s,
+    )
+
+
+# --- Адаптер для агента (день 17, §4.2) ------------------------------------
+
+class McpToolBox:
+    """Инструменты одного MCP-сервера для агента: каталог и вызов, каждый раз
+    новое соединение.
+
+    Отвечает протоколу `agent.ToolBox` структурно и его не импортирует: обмен
+    идёт словарями, как у хранилищ `storage.py`. Один на процесс и общий для
+    всех агентов — состояния у него нет, кроме описания сервера и потолка
+    времени. Исключений на ожидаемых сбоях не бросает, как и функции выше.
+    """
+
+    def __init__(self, server: McpServer, *, timeout_s: float) -> None:
+        self._server = server
+        self._timeout_s = timeout_s
+
+    @property
+    def name(self) -> str:
+        """Короткое имя сервера — для логов агента и строки каталога."""
+        return self._server.name
+
+    def catalog(self) -> dict:
+        """Каталог инструментов: `{"ok", "error", "elapsed", "tools": [{"name",
+        "description", "input_schema"}, …]}`. `input_schema` — `inputSchema`
+        из ответа как пришла (из `pages`, по именам полей протокола)."""
+        listing = list_tools(self._server, timeout_s=self._timeout_s)
+        if not listing.ok:
+            return {
+                "ok": False,
+                "error": f"сбой на стадии «{listing.stage}»: {listing.error}",
+                "elapsed": listing.total_s,
+                "tools": [],
+            }
+        tools = [
+            {
+                "name": tool["name"],
+                "description": tool.get("description", ""),
+                "input_schema": tool.get("inputSchema") or {"type": "object", "properties": {}},
+            }
+            for page in listing.pages
+            for tool in page.get("tools", [])
+        ]
+        return {"ok": True, "error": "", "elapsed": listing.total_s, "tools": tools}
+
+    def call(self, name: str, arguments: dict) -> dict:
+        """Вызов инструмента: `{"ok", "is_error", "error", "stage", "text",
+        "elapsed"}`. `error` и `stage` — сбой соединения или протокола (до
+        ответа не дошли); `is_error` — сервер ответил ошибкой инструмента, её
+        текст — в `text`."""
+        call = call_tool(self._server, name, arguments, timeout_s=self._timeout_s)
+        return {
+            "ok": call.ok,
+            "is_error": call.is_error,
+            "error": call.error,
+            "stage": call.stage,
+            "text": call.text,
+            "elapsed": call.total_s,
+        }

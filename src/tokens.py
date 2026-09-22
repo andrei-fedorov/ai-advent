@@ -1,6 +1,7 @@
 # TooManyRules — счёт токенов (день 8, неделя 2; день 9 — корзина памяти
 # стратегии; день 11 — корзины слоёв памяти; день 12 — корзина профиля;
-# день 13 — корзина состояния задачи; день 14 — корзина инвариантов).
+# день 13 — корзина состояния задачи; день 14 — корзина инвариантов;
+# день 17 — корзина схем инструментов).
 #
 # Модуль знает только про текст и числа: ни Gradio, ни Too Many Bones, ни
 # вызовов API здесь нет и быть не может. Из проекта не импортируется ничего —
@@ -202,6 +203,11 @@ class RequestTokens:
     # запрос первым из блоков агента, сразу за системным промптом и перед
     # профилем (спецификация дня 14, §7.2).
     invariants: int = 0
+    # Корзина дня 17 — в конце и с умолчанием: описания и схемы инструментов
+    # MCP (спецификация дня 17, §5.4, §6). Это не сообщение, а параметр
+    # запроса `tools`, но токены он стоит так же — в каждом раунде хода.
+    # Служебных токенов разметки сообщения за него не начисляется.
+    tools: int = 0
 
 
 def count_request(
@@ -214,6 +220,7 @@ def count_request(
     profile: str = "",
     task: str = "",
     invariants: str = "",
+    tools_json: str = "",
 ) -> RequestTokens:
     """Оценка запроса по частям: системный промпт + инварианты + профиль +
     долговременная и рабочая память + состояние задачи + память стратегии +
@@ -228,6 +235,10 @@ def count_request(
     не считается сообщением и служебных токенов не добавляет; с `memory`
     (день 9), `long_term`/`working` (день 11), `profile` (день 12) и `task`
     (день 13) и `invariants` (день 14) то же правило.
+
+    `tools_json` (день 17) — схемы инструментов строкой JSON, ровно те, что
+    уходят параметром `tools`. Сообщением они не являются, поэтому к
+    `overhead` ничего не добавляют; пустая строка — инструментов нет.
     """
     per_message = [estimate_tokens(_content(message)) for message in history or []]
     system = estimate_tokens(system_prompt)
@@ -239,6 +250,7 @@ def count_request(
     profile_tokens = estimate_tokens(profile)
     task_tokens = estimate_tokens(task)
     invariants_tokens = estimate_tokens(invariants)
+    tools_tokens = estimate_tokens(tools_json)
 
     messages = (
         1 + len(per_message) + (1 if question else 0) + (1 if memory else 0)
@@ -254,7 +266,7 @@ def count_request(
         total=(
             system + history_tokens + question_tokens + memory_tokens
             + long_term_tokens + working_tokens + profile_tokens + task_tokens
-            + invariants_tokens + overhead
+            + invariants_tokens + tools_tokens + overhead
         ),
         per_message=per_message,
         memory=memory_tokens,
@@ -263,6 +275,7 @@ def count_request(
         profile=profile_tokens,
         task=task_tokens,
         invariants=invariants_tokens,
+        tools=tools_tokens,
     )
 
 

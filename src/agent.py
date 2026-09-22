@@ -77,9 +77,22 @@
 # профиля и инвариантов на ход, служебный вызов стратегии, страж, разбор
 # памяти, роутер, трекер — и сборка запроса с блоками инвариантов, профиля,
 # слоёв и задачи (порядок блоков — от устойчивого к изменчивому).
+#
+# День 17 (неделя 4) даёт агенту инструменты — function calling DeepSeek
+# поверх MCP-сервера (спецификация дня 17, §5). Инструменты — ещё одна
+# необязательная зависимость (`ToolBox`, реализация — `mcp_client.McpToolBox`,
+# одна на процесс): без неё агент ведёт себя ровно как на дне 16. Про MCP
+# агент не знает — протокол `ToolBox` отдаёт каталог и вызывает инструмент
+# словарями. После всех служебных работ `ask()` запрашивает каталог, и
+# основной запрос хода становится циклом раундов: модель → вызовы
+# инструментов → модель, пока модель не ответит текстом. Раунды — не
+# служебные работы, а части основного запроса: каждый считается вызовом API,
+# в историю идут только вопрос и финальный ответ. Вызовов LLM API в модуле
+# по-прежнему два места: основной (теперь в цикле) и служебный.
 
 import copy
 import functools
+import json
 import logging
 import os
 import threading
@@ -165,6 +178,18 @@ ROUTE_CALL_LABEL = "Роутер профиля"
 # То же для трекера задачи (день 13) — подпись живёт в `task_state.py`
 # (`TASK_CALL_LABEL`, как `MEMORY_CALL_LABEL`/`ROUTE_CALL_LABEL` здесь): своя
 # цена, не входит ни в `service_*`, ни в `memory_*`, ни в `route_*`.
+
+# Чем закончился вызов инструмента (день 17, §5.7) — для лога, панели и
+# журнала вызовов хода.
+TOOL_STATUS_OK = "ок"
+TOOL_STATUS_TOOL_ERROR = "ошибка инструмента"
+TOOL_STATUS_UNAVAILABLE = "инструмент недоступен"
+TOOL_STATUS_BAD_ARGUMENTS = "аргументы не разобраны"
+TOOL_STATUS_UNKNOWN = "нет такого инструмента"
+
+# `tool_choice` финального раунда после потолка (день 17, §5.5): модель
+# отвечает тем, что уже собрала, без новых вызовов.
+TOOL_CHOICE_NONE = "none"
 
 # Слои в запросе по умолчанию — все переключаемые. Отдельное имя, а не
 # `memory.REQUEST_LAYERS` на месте: в конструкторе и в `fork()` имя `memory`
@@ -266,6 +291,42 @@ class ServiceCall:
 
 
 @dataclass(frozen=True)
+class ModelRound:
+    """Один раунд основного запроса хода (день 17, §5.7) — один вызов API.
+
+    Ход без инструментов — один раунд; ход с вызовами — несколько: модель
+    просит инструменты, приложение их выполняет и отправляет следующий раунд.
+    Раунд не служебная работа, а часть основного запроса, растянутого на
+    несколько вызовов.
+    """
+
+    number: int
+    elapsed: float
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    cost_usd: float | None
+    finish_reason: str | None
+    tool_calls: int                 # сколько вызовов попросила модель в этом раунде
+    tool_choice: str = ""           # "none" — финальный раунд после потолка
+
+
+@dataclass(frozen=True)
+class ToolCallRecord:
+    """Один вызов инструмента за ход (день 17, §5.7): что попросила модель и
+    что ей ушло в ответ сообщением `role: "tool"`."""
+
+    round: int
+    call_id: str
+    name: str
+    arguments: str                  # строка JSON, как прислала модель
+    status: str                     # TOOL_STATUS_*
+    text: str                       # что ушло модели (после обрезки)
+    chars: int                      # длина результата до обрезки
+    truncated: bool
+    elapsed: float                  # с запуском сервера; 0 — на сервер не ходили
+
+
+@dataclass(frozen=True)
 class AgentReply:
     """Результат одного вызова `ask()`. Полный набор метрик на каждый ход —
     это содержимое дебаг-панели (и причина, по которой день 6 обходится без
@@ -343,6 +404,22 @@ class AgentReply:
     # не было): отметка «просит сойти с маршрута», состояние она не меняет.
     task_rejected: str = ""
     task_off_route: str = ""
+    # Поля дня 17 — в конце (§5.7). С ними прежние поля меняют смысл один раз
+    # и аккуратно: `prompt_tokens`, `completion_tokens`, `total_tokens`,
+    # `cost_usd`, `elapsed` и кэш промпта — суммы по раундам хода (`elapsed`
+    # — только время модели), `finish_reason` и `text` — последнего раунда,
+    # `request_tokens` — оценка первого раунда, `reasoning` — рассуждения
+    # всех раундов подряд с разделителями.
+    # `tools_note` — что с каталогом этого хода: «faq: 2 инструмента за
+    # 0.41 с», «выключены», «каталог не получен: …»; `""` — инструментов у
+    # агента нет. `tool_specs_tokens` — оценка корзины схем. `rounds` — все
+    # раунды хода (у хода без инструментов — один), `tool_calls` — все вызовы
+    # по порядку, `tool_elapsed` — каталог и все вызовы вместе.
+    tools_note: str = ""
+    tool_specs_tokens: int = 0
+    rounds: tuple[ModelRound, ...] = ()
+    tool_calls: tuple[ToolCallRecord, ...] = ()
+    tool_elapsed: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -420,6 +497,17 @@ class TurnStats:
     # вызовов нет, трекер уже считается в `tracker_*`.
     task_rejected: str = ""
     task_off_route: str = ""
+    # Поля дня 17 — снова в конце (§5.7): раундов модели и вызовов
+    # инструментов за ход, корзина схем в оценке первого раунда и время
+    # каталога и вызовов. Остальные колонки — по суммам хода: `prompt_tokens`
+    # и стоимость — все раунды. `first_prompt_tokens` — `prompt_tokens`
+    # первого раунда: оценка до запроса есть только для него (§5.4), и
+    # колонка «оценка/факт» сравнивает с ним, а не с суммой.
+    tool_rounds: int = 0
+    tool_calls: int = 0
+    tools_tokens: int = 0
+    tool_elapsed: float = 0.0
+    first_prompt_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -581,6 +669,21 @@ class InvariantStore(Protocol):
     def current(self) -> list[dict]: ...    # копия списка постоянных инвариантов
     @property
     def path(self) -> str: ...              # для логов и панели
+
+
+class ToolBox(Protocol):
+    """Инструменты для function calling (реализация — `mcp_client.McpToolBox`,
+    спецификация дня 17, §4.2). Один на процесс и общий для всех агентов.
+    Обмен словарями: реализация протокол не импортирует, агент не импортирует
+    `mcp_client` — про MCP он не знает. Исключений на ожидаемых сбоях методы
+    не бросают."""
+
+    @property
+    def name(self) -> str: ...
+    # {"ok", "error", "elapsed", "tools": [{"name", "description", "input_schema"}, …]}
+    def catalog(self) -> dict: ...
+    # {"ok", "is_error", "error", "stage", "text", "elapsed"}
+    def call(self, name: str, arguments: dict) -> dict: ...
 
 
 # --- Счётчики процесса и реестр агентов ----------------------------------
@@ -806,6 +909,15 @@ class Agent:
         # только сессионные.
         invariants: "invariants.InvariantBook | None" = None,
         invariant_store: InvariantStore | None = None,
+        # Зависимость дня 17 (§5.1) — снова в конце и необязательная:
+        # `tools=None` — инструментов нет, агент ведёт себя ровно как на дне
+        # 16: ни каталога, ни корзины, ни раундов, ни параметра `tools`.
+        # Один на процесс и передаётся всем агентам тем же объектом, как
+        # хранилища. Лимиты по умолчанию — только чтобы агент без `app.py`
+        # собирался; настоящие передаёт `app.py` из `presets.py`.
+        tools: ToolBox | None = None,
+        tool_max_rounds: int = 4,
+        tool_result_max_chars: int = 12_000,
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -828,6 +940,19 @@ class Agent:
         # сессионные инварианты читает тот же `_load_context()`.
         self._invariants = invariants
         self._invariant_store = invariant_store
+        # Инструменты (день 17): сам `ToolBox`, лимиты цикла раундов и
+        # положение переключателя «Инструменты MCP в запросе» — состояние
+        # агента, но не диалога (§2.7): на диск не едет, в checkpoint не
+        # входит, у нового, восстановленного агента и у ветки — включено,
+        # сброс его не трогает.
+        self._tools = tools
+        self._tool_max_rounds = tool_max_rounds
+        self._tool_result_max_chars = tool_result_max_chars
+        self._tools_in_request: bool = True
+        # Схемы последнего успешно полученного каталога — только для оценки
+        # корзины `tools` в панели до вопроса (§5.4): чистые методы в сеть не
+        # ходят. На ход каталог запрашивается заново; это не кэш каталога.
+        self._last_tool_specs: list[dict] = []
         # Положение переключателя «Инварианты в запросе» — состояние агента,
         # но не диалога (§6.6): на диск не едет, в checkpoint не входит, у
         # нового, восстановленного агента и у ветки — включено.
@@ -995,21 +1120,22 @@ class Agent:
             logger.info(
                 "[%s] агент создан как ветка от %s · %s: общий префикс %d "
                 "сообщ., стратегия «%s», память стратегий из снимка "
-                "checkpoint'а%s%s%s%s; живых агентов: %d",
+                "checkpoint'а%s%s%s%s%s; живых агентов: %d",
                 self._log_name, self._branch.parent, self._branch.checkpoint,
                 self._branch.messages, self._strategy_name, self._layers_note(),
                 self._profile_note(), self._task_note(), self._invariants_note(),
-                process_stats()["agents_alive"],
+                self._tools_note(), process_stats()["agents_alive"],
             )
         else:
             logger.info(
                 "[%s] агент создан: model=%s thinking=%s стратегия=«%s» "
-                "восстановлено из хранилища=%d сообщ.%s%s%s%s%s, живых агентов: %d",
+                "восстановлено из хранилища=%d сообщ.%s%s%s%s%s%s, живых агентов: %d",
                 self._log_name, config.model, _thinking_label(config.thinking),
                 self._strategy_name, self._restored_messages,
                 _memory_note(self.strategy.describe(self._messages)),
                 self._layers_note(), self._profile_note(), self._task_note(),
-                self._invariants_note(), process_stats()["agents_alive"],
+                self._invariants_note(), self._tools_note(),
+                process_stats()["agents_alive"],
             )
         # Сбой загрузки логируется здесь, а не на месте: до регистрации в
         # реестре у агента ещё нет номера, а без номера строка в логе
@@ -1266,15 +1392,32 @@ class Agent:
             else ""
         )
 
+        # Каталог инструментов (день 17, §5.3) — после всех служебных работ
+        # (трекер остаётся последним из них) и до сборки запроса: схемы нужны
+        # оценке токенов. Одно подключение к серверу на ход. Сбой каталога
+        # ход не отменяет: запрос уходит без `tools`, как на дне 16.
+        specs, tools_note, tool_elapsed = self._tool_catalog()
+        known_names = [spec["function"]["name"] for spec in specs]
+        tools_json = json.dumps(specs, ensure_ascii=False) if specs else ""
+
         # Счёт до запроса (день 8): считаем ровно тот список сообщений, который
         # сейчас уйдёт в API, — и логируем бюджет до вызова, а не после.
         # Сборка и расчёт идут одним вызовом, чтобы «что отправляем» и «что
-        # показываем в панели» не считались двумя путями.
+        # показываем в панели» не считались двумя путями. С дня 17 в счёт
+        # идут и схемы инструментов — те же, что параметр `tools`; оценка —
+        # только первого раунда (§5.4): сообщения следующих раундов
+        # появляются по ходу, считать их заранее не из чего.
         messages, view = self._context_view(
-            user_message, long_term, profile, mode_choice, always
+            user_message, long_term, profile, mode_choice, always, tools_json
         )
         request = view.usage.request
         budget = view.usage
+        if specs:
+            logger.info(
+                "[%s] инструменты: %s (%s), схемы ≈%s ток.",
+                self._log_name, tools_note, ", ".join(known_names),
+                _num(request.tools),
+            )
         self._log_context(view)
         self._log_budget(budget)
         # Проверки «а влезет ли» здесь намеренно нет: переполненный запрос
@@ -1284,61 +1427,186 @@ class Agent:
         # вызовом нет.
         history_before = len(self._messages)
 
-        started = time.perf_counter()
-        try:
-            response = client.chat.completions.create(
-                model=self._config.model,
-                messages=messages,
-                extra_body={
-                    "thinking": {
-                        "type": "enabled" if self._config.thinking else "disabled"
-                    }
-                },
-                **self._optional_params(),
+        # Цикл раундов (день 17, §5.5). Без инструментов — ровно один раунд
+        # без параметра `tools`, как на дне 16. С инструментами модель сама
+        # решает, звать ли их: если она ответила вызовами, приложение
+        # выполняет их и отправляет следующий раунд — те же сообщения плюс её
+        # ответ с `tool_calls` и по сообщению `tool` на каждый вызов. Ход
+        # заканчивается, когда модель ответила текстом. После
+        # `tool_max_rounds` раундов с инструментами — ещё один, финальный, с
+        # `tool_choice="none"`: модель отвечает тем, что уже собрала.
+        #
+        # Промежуточные сообщения живут только в `messages` этого хода (§5.6):
+        # в стек, файл сессии, checkpoint'ы и ветки идут только вопрос и
+        # финальный текст.
+        rounds: list[ModelRound] = []
+        calls: list[ToolCallRecord] = []
+        reasonings: list[tuple[int, str]] = []
+        # Кэш промпта — сумма по раундам (§5.7): раунды одного хода — почти
+        # один и тот же префикс, и попадания видно.
+        cache_hit: list[int | None] = []
+        cache_miss: list[int | None] = []
+        model_elapsed = 0.0
+        response = None
+        while True:
+            number = len(rounds) + 1
+            params: dict = {}
+            tool_choice = ""
+            if specs:
+                params["tools"] = specs
+                if number > self._tool_max_rounds:
+                    tool_choice = TOOL_CHOICE_NONE
+                    params["tool_choice"] = tool_choice
+            started = time.perf_counter()
+            try:
+                response = client.chat.completions.create(
+                    model=self._config.model,
+                    messages=messages,
+                    extra_body={
+                        "thinking": {
+                            "type": "enabled" if self._config.thinking else "disabled"
+                        }
+                    },
+                    **self._optional_params(),
+                    **params,
+                )
+            except Exception as exc:
+                model_elapsed += time.perf_counter() - started
+                logger.exception(
+                    "[%s] вызов API упал%s", self._log_name,
+                    f" на раунде {number}" if specs else "",
+                )
+                # Сбой на раунде > 1 — ход неудачен целиком, как сбой
+                # основного вызова: стек не меняется. Уже сделанные раунды и
+                # вызовы инструментов едут в ответ — в панели видно, на чём
+                # оборвалось; их счётчики уже учтены (`_record_round`).
+                return self._failed_reply(
+                    _explain_api_error(exc, budget),
+                    elapsed=model_elapsed,
+                    request=request,
+                    service=service,
+                    memory_call=memory_call,
+                    route_call=route_call,
+                    profile_mode=mode_choice.mode or "",
+                    profile_note=mode_choice.note,
+                    task_call=task_call,
+                    task_event=task_outcome.event if task_outcome and task_outcome.changed else "",
+                    task_note=task_outcome.note if task_outcome is not None else "",
+                    guard_call=guard_call,
+                    conflict=", ".join(conflict.ids) if conflict else "",
+                    conflict_note=_conflict_note(conflict),
+                    task_rejected=task_rejected,
+                    task_off_route=task_off_route,
+                    tools_note=tools_note,
+                    tool_specs_tokens=request.tools,
+                    rounds=tuple(rounds),
+                    tool_calls=tuple(calls),
+                    tool_elapsed=tool_elapsed,
+                )
+            elapsed = time.perf_counter() - started
+            model_elapsed += elapsed
+
+            choice = response.choices[0]
+            message = choice.message
+            usage = response.usage
+            prompt_tokens = getattr(usage, "prompt_tokens", None)
+            completion_tokens = getattr(usage, "completion_tokens", None)
+            requested = list(message.tool_calls or [])
+            model_round = ModelRound(
+                number=number,
+                elapsed=elapsed,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost_usd=estimate_cost_usd(
+                    self._config.model, prompt_tokens, completion_tokens
+                ),
+                finish_reason=choice.finish_reason,
+                tool_calls=len(requested),
+                tool_choice=tool_choice,
             )
-        except Exception as exc:
-            logger.exception("[%s] вызов API упал", self._log_name)
-            return self._failed_reply(
-                _explain_api_error(exc, budget),
-                elapsed=time.perf_counter() - started,
-                request=request,
-                service=service,
-                memory_call=memory_call,
-                route_call=route_call,
-                profile_mode=mode_choice.mode or "",
-                profile_note=mode_choice.note,
-                task_call=task_call,
-                task_event=task_outcome.event if task_outcome and task_outcome.changed else "",
-                task_note=task_outcome.note if task_outcome is not None else "",
-                guard_call=guard_call,
-                conflict=", ".join(conflict.ids) if conflict else "",
-                conflict_note=_conflict_note(conflict),
-                task_rejected=task_rejected,
-                task_off_route=task_off_route,
-            )
-        elapsed = time.perf_counter() - started
+            rounds.append(model_round)
+            cache_hit.append(getattr(usage, "prompt_cache_hit_tokens", None))
+            cache_miss.append(getattr(usage, "prompt_cache_miss_tokens", None))
+            self._record_round(model_round, getattr(usage, "total_tokens", None))
+            reasoning = getattr(message, "reasoning_content", None) or ""
+            if reasoning:
+                reasonings.append((number, reasoning))
+            if specs:
+                logger.info(
+                    "[%s] раунд %d: finish_reason=%s, %.2f с, "
+                    "prompt/completion=%s/%s%s%s",
+                    self._log_name, number, choice.finish_reason, elapsed,
+                    prompt_tokens, completion_tokens,
+                    ", tool_choice=none" if tool_choice else "",
+                    (
+                        " — " + "; ".join(
+                            f"{call.function.name} {call.function.arguments}"
+                            for call in requested
+                        )
+                        if requested
+                        else ""
+                    ),
+                )
+
+            # Ход кончается ответом текстом, в том числе обрезанным
+            # (`finish_reason="length"`) и финальным раундом после потолка —
+            # даже если модель, вопреки `tool_choice="none"`, снова попросила
+            # инструмент: бесконечного цикла здесь быть не может.
+            if (
+                choice.finish_reason != "tool_calls"
+                or not requested
+                or number > self._tool_max_rounds
+            ):
+                break
+
+            messages = messages + [_assistant_with_calls(message)]
+            for tool_call in requested:
+                record, content = self._run_tool_call(number, tool_call, known_names)
+                calls.append(record)
+                tool_elapsed += record.elapsed
+                # Ответ — на каждый `tool_call_id`, даже на отклонённый:
+                # иначе API откажет в следующем раунде.
+                messages.append(
+                    {"role": "tool", "tool_call_id": tool_call.id, "content": content}
+                )
+            if number == self._tool_max_rounds:
+                logger.warning(
+                    "[%s] потолок раундов (%d): ответ без новых вызовов — "
+                    "следующий раунд с tool_choice=none",
+                    self._log_name, self._tool_max_rounds,
+                )
 
         choice = response.choices[0]
         text = choice.message.content or ""
         # reasoning_content отдаём в AgentReply для дебага, но в стек не
-        # кладём: API не принимает рассуждение обратно в контекст.
-        reasoning = getattr(choice.message, "reasoning_content", None) or None
-        # `usage` теоретически может отсутствовать (разные провайдеры ведут
-        # себя по-разному) — getattr от None вернёт дефолт, а не упадёт.
-        usage = response.usage
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
-        cost_usd = estimate_cost_usd(
-            self._config.model, prompt_tokens, completion_tokens
+        # кладём (§5.6). Раундов несколько — рассуждения всех подряд, с
+        # разделителями.
+        if len(rounds) > 1:
+            reasoning = "\n\n".join(
+                f"— раунд {number} —\n{text_}" for number, text_ in reasonings
+            ) or None
+        else:
+            reasoning = reasonings[0][1] if reasonings else None
+        # Цена и время хода — суммы по раундам (§5.7): у хода без
+        # инструментов раунд один, и суммы совпадают с прежними полями.
+        prompt_tokens = _sum_known(r.prompt_tokens for r in rounds)
+        completion_tokens = _sum_known(r.completion_tokens for r in rounds)
+        total_tokens = (
+            None if prompt_tokens is None and completion_tokens is None
+            else (prompt_tokens or 0) + (completion_tokens or 0)
         )
+        cost_usd = _sum_known(r.cost_usd for r in rounds)
+        first_prompt = rounds[0].prompt_tokens
+        # Оценка по тексту ответа сравнивается с `completion_tokens` последнего
+        # раунда: текст — его, а сумма включает и токены вызовов инструментов.
+        last_completion = rounds[-1].completion_tokens
 
         reply = AgentReply(
             ok=True,
             text=text,
             error=None,
             finish_reason=choice.finish_reason,
-            elapsed=elapsed,
+            elapsed=model_elapsed,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
@@ -1348,8 +1616,8 @@ class Agent:
             agent_name=self._config.name,
             request_tokens=request,
             estimated_completion_tokens=tokens.estimate_tokens(text),
-            prompt_cache_hit_tokens=getattr(usage, "prompt_cache_hit_tokens", None),
-            prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
+            prompt_cache_hit_tokens=_sum_known(cache_hit),
+            prompt_cache_miss_tokens=_sum_known(cache_miss),
             service_call=service,
             memory_call=memory_call,
             route_call=route_call,
@@ -1363,6 +1631,11 @@ class Agent:
             conflict_note=_conflict_note(conflict),
             task_rejected=task_rejected,
             task_off_route=task_off_route,
+            tools_note=tools_note,
+            tool_specs_tokens=request.tools,
+            rounds=tuple(rounds),
+            tool_calls=tuple(calls),
+            tool_elapsed=tool_elapsed,
         )
 
         if self._config.keep_history:
@@ -1370,7 +1643,9 @@ class Agent:
             self._messages.append({"role": "assistant", "content": text})
             self._persist()
 
-        self._record(reply)
+        # Раунды уже в счётчиках (`_record_round`), здесь — последний ответ и
+        # калибровка по первому раунду.
+        self._record(reply, counted=True)
         self._record_turn(
             reply, history_before, view, service, memory_call, route_call,
             task_call, guard_call,
@@ -1379,17 +1654,24 @@ class Agent:
             "[%s] model=%s thinking=%s finish_reason=%s time=%.2fs "
             "tokens(prompt/completion/total)=%s/%s/%s "
             "оценка/факт prompt=%s/%s (%s) ответ=%s/%s (%s) cost=%s "
+            "раундов=%d вызовов=%d инструменты %.2f с "
             "стек=%d сообщ., %d символов: %s",
             self._log_name, self._config.model,
             _thinking_label(self._config.thinking),
             reply.finish_reason, reply.elapsed,
             prompt_tokens, completion_tokens, total_tokens,
-            request.total, prompt_tokens,
-            _delta_str(request.total, prompt_tokens),
-            reply.estimated_completion_tokens, completion_tokens,
-            _delta_str(reply.estimated_completion_tokens, completion_tokens),
-            _cost_str(cost_usd), len(self._messages), len(text), text,
+            request.total, first_prompt,
+            _delta_str(request.total, first_prompt),
+            reply.estimated_completion_tokens, last_completion,
+            _delta_str(reply.estimated_completion_tokens, last_completion),
+            _cost_str(cost_usd), len(rounds), len(calls), tool_elapsed,
+            len(self._messages), len(text), text,
         )
+        if reply.finish_reason == "length":
+            logger.warning(
+                "[%s] ответ оборван по max_tokens (finish_reason=length)%s",
+                self._log_name, f" на раунде {len(rounds)}" if specs else "",
+            )
         return reply
 
     @_locked
@@ -1581,6 +1863,11 @@ class Agent:
         и то же хранилище постоянных инвариантов, что у родителя, — тем же
         объектом: файл один. Дальше правка инвариантов в ветке родителя не
         трогает. Переключатель «Инварианты в запросе» у ветки — включён.
+
+        С дня 17 (§5.1) ветка получает тот же `ToolBox` и те же лимиты цикла
+        раундов, что у родителя, — тем же объектом, как хранилище
+        долговременной памяти. Переключатель «Инструменты MCP в запросе» у
+        ветки — включён.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -1638,6 +1925,9 @@ class Agent:
             task=task,
             invariants=invariants,
             invariant_store=self._invariant_store,
+            tools=self._tools,
+            tool_max_rounds=self._tool_max_rounds,
+            tool_result_max_chars=self._tool_result_max_chars,
         )
 
     @_locked
@@ -1930,6 +2220,28 @@ class Agent:
         return notes
 
     @property
+    def tools_in_request(self) -> bool:
+        """Положение переключателя «Инструменты MCP в запросе» (день 17,
+        §5.2)."""
+        return self._tools_in_request
+
+    @_locked
+    def set_tools_in_request(self, enabled: bool) -> bool:
+        """Выключено — запрос как на дне 16 (§5.2): ни каталога, ни корзины,
+        ни параметра `tools`, один раунд. Это база сравнения «без FAQ».
+        `False` — инструментов нет или значение не изменилось. Стек, файл
+        сессии, память и задача не трогаются, на диск ничего не пишется."""
+        if self._tools is None or enabled == self._tools_in_request:
+            return False
+        previous = self._tools_in_request
+        self._tools_in_request = enabled
+        logger.info(
+            "[%s] инструменты MCP в запросе: %s → %s",
+            self._log_name, _on_off_short(previous), _on_off_short(enabled),
+        )
+        return True
+
+    @property
     def task_in_request(self) -> bool:
         """Положение переключателя «Состояние задачи в запросе» (день 13,
         §5.6)."""
@@ -2077,6 +2389,23 @@ class Agent:
                     ),
                 }
                 if self._invariants is not None
+                else None
+            ),
+            # Ключ дня 17 — в конце. `None` — инструментов у агента нет.
+            # Записи последнего хода (раунды, вызовы, заметка о каталоге)
+            # лежат в `last_call` — это поля ответа; здесь — положение
+            # переключателя и инструменты последнего полученного каталога.
+            "tools": (
+                {
+                    "name": self._tools.name,
+                    "in_request": self._tools_in_request,
+                    "catalog": [
+                        spec["function"]["name"] for spec in self._last_tool_specs
+                    ],
+                    "max_rounds": self._tool_max_rounds,
+                    "result_max_chars": self._tool_result_max_chars,
+                }
+                if self._tools is not None
                 else None
             ),
         }
@@ -2285,6 +2614,7 @@ class Agent:
         profile: "user_profile.UserProfile | None" = None,
         mode_choice: "user_profile.ModeChoice | None" = None,
         always: list[dict] | None = None,
+        tools_json: str | None = None,
     ) -> tuple[list[dict], ContextView]:
         """Сборка запроса и всё, что про неё нужно знать панели и логам, —
         одним проходом.
@@ -2300,7 +2630,9 @@ class Agent:
         и `mode_choice` (день 12) — тем же приёмом: `ask()` передаёт снимок и
         решение этого хода, панель — `None`, и тогда берётся превью без
         вызова роутера. `always` (день 14) — снимок постоянных инвариантов, тем
-        же приёмом.
+        же приёмом. `tools_json` (день 17) — схемы инструментов этого хода
+        строкой JSON (`""` — инструментов в запросе нет); `None` — панель, и
+        тогда берутся схемы последнего полученного каталога (§5.4).
         """
         if long_term is None:
             long_term = self._long_term_entries()
@@ -2310,11 +2642,13 @@ class Agent:
             mode_choice = self._preview_mode_choice(profile)
         if always is None:
             always = self._invariant_snapshot()
+        if tools_json is None:
+            tools_json = self._preview_tools_json()
         messages = self._build_messages(
             question, long_term, profile, mode_choice, always
         )
         usage = tokens.context_usage(
-            self._count_messages(messages),
+            self._count_messages(messages, tools_json),
             model=self._config.model,
             max_tokens=self._config.max_tokens,
             calibration=self.calibration,
@@ -2325,7 +2659,8 @@ class Agent:
         # с дня 12 — с тем же профилем, с дня 13 — с тем же блоком задачи:
         # экономия говорит только о стратегии, а не о том, что слои, профиль
         # или задача добавили.
-        # С дня 14 — с тем же блоком инвариантов.
+        # С дня 14 — с тем же блоком инвариантов, с дня 17 — с теми же
+        # схемами инструментов.
         full = self._count_messages(
             self._with_invariants(
                 self._with_profile(
@@ -2341,7 +2676,8 @@ class Agent:
                     profile, mode_choice,
                 ),
                 always,
-            )
+            ),
+            tools_json,
         )
         state = self.strategy.describe(self._messages)
         task = self.strategy.prepare(self._messages, question)
@@ -3135,7 +3471,9 @@ class Agent:
                 self._log_name, choice, user_profile.CHOICE_AUTO,
             )
 
-    def _count_messages(self, messages: list[dict]) -> tokens.RequestTokens:
+    def _count_messages(
+        self, messages: list[dict], tools_json: str = ""
+    ) -> tokens.RequestTokens:
         """Разложение готового списка сообщений на систему / долговременную и
         рабочую память / память стратегии / историю / вопрос.
 
@@ -3168,6 +3506,10 @@ class Agent:
         с `invariants.INVARIANT_HEADER`, — корзина `invariants`; корзина
         `memory` (память стратегии) — то, что не начинается ни с одного из
         пяти заголовков.
+
+        С дня 17 (§5.4) сюда же приходят схемы инструментов строкой JSON —
+        те же, что уходят параметром `tools`: корзина `tools`. Сообщением они
+        не являются, и разбор по ролям их не касается.
         """
         middle = messages[1:-1]
         system = [
@@ -3199,6 +3541,7 @@ class Agent:
                 text for text in system
                 if text.startswith(invariants.INVARIANT_HEADER)
             ),
+            tools_json=tools_json,
         )
 
     def _log_context(self, view: ContextView) -> None:
@@ -3224,16 +3567,19 @@ class Agent:
         # Слагаемые — в порядке блоков запроса (день 14, §2.7): инварианты,
         # профиль, долговременная и рабочая память, задача стоят между
         # системным промптом и памятью стратегии.
+        # Схемы инструментов (день 17) — не сообщение, а параметр запроса:
+        # слагаемым после вопроса.
         logger.info(
             "[%s] бюджет: система %s + инварианты %s + профиль %s + "
             "долговременная %s + рабочая %s + задача %s + память стратегии "
-            "%s + история %s + вопрос %s + служебные %s ≈ %s из %s "
-            "доступных (%s); окно %s, резерв под ответ %s",
+            "%s + история %s + вопрос %s + схемы инструментов %s + служебные "
+            "%s ≈ %s из %s доступных (%s); окно %s, резерв под ответ %s",
             self._log_name,
             _num(request.system), _num(request.invariants), _num(request.profile),
             _num(request.long_term),
             _num(request.working), _num(request.task), _num(request.memory),
-            _num(request.history), _num(request.question), _num(request.overhead),
+            _num(request.history), _num(request.question), _num(request.tools),
+            _num(request.overhead),
             _num(budget.used), _num(budget.available), _ratio_str(budget.ratio),
             _num(budget.limit), _num(budget.answer_reserve),
         )
@@ -3245,6 +3591,130 @@ class Agent:
                 "доходить, а не проверка перед вызовом",
                 self._log_name, _ratio_str(budget.ratio), budget.level,
             )
+
+    def _tool_catalog(self) -> tuple[list[dict], str, float]:
+        """Каталог инструментов на ход (день 17, §5.3): схемы в формате
+        function calling, заметка для ответа и панели и время подключения.
+
+        Инструментов нет — `([], "", 0.0)`; переключатель выключен —
+        `([], "выключены", 0.0)`, к серверу не ходим. Сбой каталога — пустые
+        схемы и заметка с причиной: ход идёт без `tools`, как на дне 16.
+        """
+        if self._tools is None:
+            return [], "", 0.0
+        if not self._tools_in_request:
+            return [], "выключены", 0.0
+        started = time.perf_counter()
+        catalog = self._tools.catalog()
+        elapsed = time.perf_counter() - started
+        if not catalog.get("ok"):
+            note = f"каталог не получен: {catalog.get('error') or 'причина не названа'}"
+            logger.warning(
+                "[%s] инструменты: %s — ход идёт без инструментов",
+                self._log_name, note,
+            )
+            return [], note, elapsed
+        specs = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    # `inputSchema` из tools/list как есть (§2.6).
+                    "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+                },
+            }
+            for tool in catalog.get("tools") or []
+        ]
+        self._last_tool_specs = specs
+        note = (
+            f"{self._tools.name}: {len(specs)} {_tools_word(len(specs))} за "
+            f"{elapsed:.2f} с"
+        )
+        return specs, note, elapsed
+
+    def _preview_tools_json(self) -> str:
+        """Схемы для оценки в панели до вопроса (§5.4): последний полученный
+        каталог этого агента, если переключатель включён; `""` — инструментов
+        нет, они выключены или каталога ещё не было. В сеть не ходит."""
+        if self._tools is None or not self._tools_in_request or not self._last_tool_specs:
+            return ""
+        return json.dumps(self._last_tool_specs, ensure_ascii=False)
+
+    def _run_tool_call(
+        self, round_number: int, tool_call, known_names: list[str]
+    ) -> tuple[ToolCallRecord, str]:
+        """Один вызов инструмента, который попросила модель (день 17, §5.5):
+        запись для журнала хода и текст сообщения `tool`. Исключений не
+        бросает — любой сбой становится текстом для модели.
+
+        Порядок проверок: имя не из каталога хода и неразобранные аргументы
+        на сервер не уходят; ответ сервера — текст, ошибка инструмента или
+        сбой соединения. Результат длиннее `tool_result_max_chars` обрезается
+        с пометкой — её видят модель, панель и лог: чужой сервер не может
+        молча раздуть запрос.
+        """
+        name = tool_call.function.name
+        raw = tool_call.function.arguments or ""
+        elapsed = 0.0
+        if name not in known_names:
+            status = TOOL_STATUS_UNKNOWN
+            content = f"Инструмента {name} нет. Доступны: {', '.join(known_names)}"
+        else:
+            try:
+                arguments = json.loads(raw)
+                if not isinstance(arguments, dict):
+                    raise ValueError(f"ожидался объект JSON, пришёл {type(arguments).__name__}")
+            except ValueError as exc:
+                status = TOOL_STATUS_BAD_ARGUMENTS
+                content = f"Аргументы не разобраны: {exc}. Пришло: {raw}"
+            else:
+                started = time.perf_counter()
+                result = self._tools.call(name, arguments)
+                elapsed = time.perf_counter() - started
+                if result.get("ok"):
+                    status = TOOL_STATUS_OK
+                    content = result.get("text") or ""
+                elif result.get("is_error"):
+                    status = TOOL_STATUS_TOOL_ERROR
+                    content = f"Ошибка инструмента: {result.get('text') or ''}"
+                else:
+                    status = TOOL_STATUS_UNAVAILABLE
+                    content = (
+                        f"Инструмент недоступен: сбой на стадии "
+                        f"«{result.get('stage') or '—'}»: {result.get('error') or ''}"
+                    )
+        chars = len(content)
+        truncated = chars > self._tool_result_max_chars
+        if truncated:
+            content = (
+                content[: self._tool_result_max_chars]
+                + f"\n[обрезано приложением: показано {self._tool_result_max_chars} "
+                f"из {chars} символов]"
+            )
+        record = ToolCallRecord(
+            round=round_number,
+            call_id=tool_call.id,
+            name=name,
+            arguments=raw,
+            status=status,
+            text=content,
+            chars=chars,
+            truncated=truncated,
+            elapsed=elapsed,
+        )
+        warn = status != TOOL_STATUS_OK or truncated
+        (logger.warning if warn else logger.info)(
+            "[%s] инструмент %s: %s, %d символов, %.2f с%s%s",
+            self._log_name, name, status, chars, elapsed,
+            (
+                f" — обрезан до {self._tool_result_max_chars}"
+                if truncated
+                else ""
+            ),
+            f" — {content[:300]}" if status != TOOL_STATUS_OK else "",
+        )
+        return record, content
 
     def _optional_params(self) -> dict:
         """Опциональные параметры запроса. То, что в конфиге `None`, в API
@@ -3683,6 +4153,16 @@ class Agent:
             f"{_permanent_word(view.always)}, {view.session} этой сессии)"
         )
 
+    def _tools_note(self) -> str:
+        """Кусок строки «агент создан» про инструменты (день 17): имя
+        сервера и положение переключателя."""
+        if self._tools is None:
+            return ", инструментов MCP нет"
+        return (
+            f", инструменты MCP: {self._tools.name}, в запросе: "
+            f"{_on_off_short(self._tools_in_request)}"
+        )
+
     def _long_term_count_str(self) -> str:
         """«5 зап. в src/data/memory/long_term.json» — сколько записей
         долговременной памяти использует карта; «не подключена» — хранилища
@@ -3728,6 +4208,11 @@ class Agent:
         conflict_note: str = "",
         task_rejected: str = "",
         task_off_route: str = "",
+        tools_note: str = "",
+        tool_specs_tokens: int = 0,
+        rounds: tuple[ModelRound, ...] = (),
+        tool_calls: tuple[ToolCallRecord, ...] = (),
+        tool_elapsed: float = 0.0,
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
@@ -3735,7 +4220,11 @@ class Agent:
         Разбор памяти (день 11), роутер профиля (день 12) и трекер задачи
         (день 13) и страж инвариантов (день 14), применённые до упавшего
         вызова, уже оплачены и сохранены — они едут в ответ, чтобы панель
-        показала и их.
+        показала и их. С дня 17 так же едут раунды и вызовы инструментов,
+        сделанные до сбоя API на раунде > 1: в панели видно, на чём
+        оборвалось. Токены и деньги в ответе — `None`: в счётчики успешные
+        раунды уже попали (`_record_round()`), а упавший вызов считается
+        здесь одной ошибкой.
         """
         reply = AgentReply(
             ok=False,
@@ -3764,6 +4253,11 @@ class Agent:
             conflict_note=conflict_note,
             task_rejected=task_rejected,
             task_off_route=task_off_route,
+            tools_note=tools_note,
+            tool_specs_tokens=tool_specs_tokens,
+            rounds=rounds,
+            tool_calls=tool_calls,
+            tool_elapsed=tool_elapsed,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
@@ -3790,6 +4284,8 @@ class Agent:
             TurnStats(
                 turn=len(self._turns) + 1,
                 history_before=history_before,
+                # Оценка — только первого раунда (день 17, §5.4); `prompt`
+                # и стоимость ниже — суммы по раундам хода.
                 estimated_prompt_tokens=(
                     reply.request_tokens.total if reply.request_tokens else 0
                 ),
@@ -3842,6 +4338,16 @@ class Agent:
                 # Отказ автомата и сход с маршрута этого хода (день 15, §5).
                 task_rejected=reply.task_rejected,
                 task_off_route=reply.task_off_route,
+                # Раунды, вызовы инструментов, корзина схем и время каталога
+                # и вызовов этого хода (день 17, §5.7).
+                tool_rounds=len(reply.rounds),
+                tool_calls=len(reply.tool_calls),
+                tools_tokens=reply.tool_specs_tokens,
+                tool_elapsed=reply.tool_elapsed,
+                first_prompt_tokens=(
+                    (reply.rounds[0].prompt_tokens or 0) if reply.rounds
+                    else (reply.prompt_tokens or 0)
+                ),
             )
         )
         # Экономия копится по ходам и может быть отрицательной: на коротком
@@ -3938,11 +4444,53 @@ class Agent:
             cost_usd=cost_usd,
         )
 
-    def _record(self, reply: AgentReply) -> None:
+    def _record_round(self, model_round: ModelRound, total_tokens: int | None) -> None:
+        """Учёт одного успешного раунда основного запроса (день 17, §5.5):
+        раунд — настоящий вызов API и считается в счётчиках агента и процесса
+        отдельным вызовом, с токенами и стоимостью, сразу по приходу ответа.
+        Поэтому сбой API на следующем раунде уже потраченного не отменяет.
+        Служебной работой раунд не считается, `_last_reply` и калибровку не
+        трогает — это делает `_record(counted=True)` в конце хода."""
+        prompt_tokens = model_round.prompt_tokens or 0
+        completion_tokens = model_round.completion_tokens or 0
+        total = total_tokens if total_tokens is not None else prompt_tokens + completion_tokens
+        cost_usd = model_round.cost_usd or 0.0
+        self._totals["calls"] += 1
+        self._totals["prompt_tokens"] += prompt_tokens
+        self._totals["completion_tokens"] += completion_tokens
+        self._totals["total_tokens"] += total
+        self._totals["cost_usd"] += cost_usd
+        _bump_process_stats(
+            calls=1,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total,
+            cost_usd=cost_usd,
+        )
+
+    def _record(self, reply: AgentReply, counted: bool = False) -> None:
         """Учёт вызова в счётчиках агента и процесса. Неуспешный вызов тоже
         считается вызовом (и отдельно — ошибкой); токены и деньги при ошибке
-        не начисляются."""
+        не начисляются.
+
+        `counted=True` (день 17) — вызовы хода уже учтены по раундам
+        (`_record_round()`): здесь остаются последний ответ и калибровка."""
         self._last_reply = reply
+
+        # Калибровка (день 8): в неё идут только успешные вызовы, у которых
+        # пришёл `usage`, — и только вместе с оценкой того же самого запроса.
+        # С дня 17 оценка есть только у первого раунда (§5.4), и сравнивается
+        # она с `prompt_tokens` первого раунда, а не с суммой хода.
+        first_prompt = (
+            reply.rounds[0].prompt_tokens if reply.rounds else reply.prompt_tokens
+        )
+        if reply.ok and first_prompt is not None and reply.request_tokens:
+            self._totals["calibration_calls"] += 1
+            self._totals["calibration_fact_tokens"] += first_prompt
+            self._totals["calibration_estimated_tokens"] += reply.request_tokens.total
+
+        if counted:
+            return
         prompt_tokens = reply.prompt_tokens or 0
         completion_tokens = reply.completion_tokens or 0
         total_tokens = reply.total_tokens or 0
@@ -3955,13 +4503,6 @@ class Agent:
         self._totals["completion_tokens"] += completion_tokens
         self._totals["total_tokens"] += total_tokens
         self._totals["cost_usd"] += cost_usd
-
-        # Калибровка (день 8): в неё идут только успешные вызовы, у которых
-        # пришёл `usage`, — и только вместе с оценкой того же самого запроса.
-        if reply.ok and reply.prompt_tokens is not None and reply.request_tokens:
-            self._totals["calibration_calls"] += 1
-            self._totals["calibration_fact_tokens"] += reply.prompt_tokens
-            self._totals["calibration_estimated_tokens"] += reply.request_tokens.total
 
         _bump_process_stats(
             calls=1,
@@ -4044,6 +4585,66 @@ def _invariants_word(count: int) -> str:
 
 def _on_off(value: bool) -> str:
     return "включено" if value else "выключено"
+
+
+def _on_off_short(value: bool) -> str:
+    """«вкл» / «выкл» — для строк лога дня 17 (§5.2)."""
+    return "вкл" if value else "выкл"
+
+
+def _tools_word(count: int) -> str:
+    """«1 инструмент» / «2 инструмента» / «5 инструментов» — без числа."""
+    if 11 <= count % 100 <= 14:
+        return "инструментов"
+    match count % 10:
+        case 1:
+            return "инструмент"
+        case 2 | 3 | 4:
+            return "инструмента"
+        case _:
+            return "инструментов"
+
+
+def _sum_known(values) -> "int | float | None":
+    """Сумма по раундам (день 17, §5.7): `None`, если ни один раунд числа не
+    вернул, иначе сумма известных."""
+    known = [value for value in values if value is not None]
+    return sum(known) if known else None
+
+
+def _assistant_with_calls(message) -> dict:
+    """Ответ модели с `tool_calls` для следующего раунда (день 17, §5.5).
+
+    Правило DeepSeek (документация, режим thinking): если в запросе есть
+    `tools`, `reasoning_content` **всех прошлых ходов** нужно передавать
+    обратно, иначе API ответит 400. История проекта рассуждений не хранит —
+    только текст (формат файла сессии не меняется). Проверено 22.09.2026
+    (спецификация дня 17, §2.6, §2.9): `deepseek-v4-pro` с thinking принимает
+    и историю без `reasoning_content`, и раунд, где у сообщения с
+    `tool_calls` его нет. Внутри хода рассуждение этого раунда всё равно
+    уходит обратно — объект под рукой, по документации так и надо. Если API
+    однажды начнёт отвечать 400 на пресете с thinking, причина — здесь: ход
+    вернётся `AgentReply(ok=False)`, стек не изменится.
+    """
+    data = {
+        "role": "assistant",
+        "content": message.content or "",
+        "tool_calls": [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                },
+            }
+            for call in message.tool_calls
+        ],
+    }
+    reasoning = getattr(message, "reasoning_content", None)
+    if reasoning:
+        data["reasoning_content"] = reasoning
+    return data
 
 
 def _conflict_note(conflict: "invariants.Conflict | None") -> str:

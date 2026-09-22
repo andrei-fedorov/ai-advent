@@ -4,7 +4,8 @@
 # в запросе; день 12: профиль пользователя, роутер режима и переключатель
 # «Профиль в запросе»; день 13: состояние задачи; день 14: инварианты; день
 # 15: жёсткий контроль переходов — красный путь; день 16, неделя 4:
-# подключение к MCP-серверу BoardGameGeek и список его инструментов).
+# подключение к MCP-серверу BoardGameGeek и список его инструментов; день 17:
+# свой MCP-сервер FAQ издателя и function calling агента).
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
@@ -62,6 +63,17 @@
 # значениях. Подключения при старте нет — только строка лога: приложение
 # обязано подниматься и без собранного сервера.
 #
+# День 17 (спецификация дня 17, §8) даёт агенту инструменты своего MCP-сервера
+# FAQ (`src/faq_server.py`): `mcp_client.McpToolBox` — один на процесс, рядом с
+# хранилищами, — передаётся каждому агенту. Интерфейс по-прежнему не видит ни
+# SDK `mcp`, ни вызовов инструментов: переключатель «Инструменты MCP в
+# запросе» зовёт `agent.set_tools_in_request()`, а блок «Инструменты
+# последнего хода» рисуется из `debug_state()` — раунды и вызовы лежат в
+# ответе агента. Поэтому этот блок входит в `_view()`: **37 значений**
+# (переключатель, блок и JSON результатов). Каталог FAQ по кнопке — как у
+# дня 16, вне `_view()`: функции блока дня 16 параметризованы сервером, у
+# блока FAQ свои выходы `FAQ_MCP_OUTPUTS`. Блок дня 16 свёрнут.
+#
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
 # словами, текст памяти и числа. День 10 добавил в переключатель ещё две
@@ -96,8 +108,10 @@ import functools
 import json
 import logging
 import os
+import shlex
 from dataclasses import asdict, replace
 from datetime import datetime
+from pathlib import Path
 
 import gradio as gr
 import pandas as pd
@@ -129,6 +143,8 @@ from mcp_client import (
     SDK_VERSION,
     STAGE_CONNECT,
     STAGE_LIST,
+    McpServer,
+    McpToolBox,
     ToolListing,
     handshake_text,
     list_tools,
@@ -145,6 +161,8 @@ from presets import (
     DEFAULT_PRESET,
     DEFAULT_PROFILE,
     DEFAULT_STRATEGY,
+    FAQ_MCP,
+    FAQ_TIMEOUT_S,
     INVARIANT_EXAMPLES,
     INVARIANT_MAX_ITEMS,
     INVARIANT_SCENARIO,
@@ -161,6 +179,9 @@ from presets import (
     ROUTING_SCENARIO,
     STRATEGIES,
     TASK_SCENARIO,
+    TOOL_MAX_ROUNDS,
+    TOOL_RESULT_MAX_CHARS,
+    TOOLS_SCENARIO,
     make_invariants,
     make_memory,
     make_router,
@@ -272,6 +293,20 @@ MCP_LAUNCH = resolve_launch(BGG_MCP, os.environ)
         [f"{key} — задан" for key in MCP_LAUNCH.env_set]
         + [f"{key} — не задан" for key in MCP_LAUNCH.env_missing]
     ) or "переменных для сервера нет",
+    SDK_VERSION,
+)
+
+# Инструменты агента (день 17, §8.1) — один `ToolBox` на процесс, рядом с
+# хранилищами: каждый агент получает тот же объект. Состояния у него нет —
+# каталог и каждый вызов идут новым подключением к серверу FAQ. Подключения при
+# старте нет, как у BGG: одна строка лога тем же форматом.
+TOOLBOX = McpToolBox(FAQ_MCP, timeout_s=FAQ_TIMEOUT_S)
+FAQ_LAUNCH = resolve_launch(FAQ_MCP, os.environ)
+(logger.warning if FAQ_LAUNCH.error else logger.info)(
+    "MCP при старте: сервер %s — %s (%s)%s; SDK mcp %s; агенту — каталог в "
+    "каждом ходе при включённом переключателе",
+    FAQ_MCP.name, FAQ_LAUNCH.command_line, FAQ_LAUNCH.origin,
+    f" — ⚠️ {FAQ_LAUNCH.error}" if FAQ_LAUNCH.error else "",
     SDK_VERSION,
 )
 
@@ -392,25 +427,46 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
         service += _task_tracker_lines(last_call)
         if service:
             lines += ["", *service]
+        # Раунды и вызовы инструментов до сбоя (день 17, §5.5) — оплачены, и
+        # показать, на чём оборвалось, больше негде.
+        if last_call.get("rounds"):
+            lines += ["", _rounds_line(last_call)]
         return "\n".join(lines)
     request = last_call.get("request_tokens") or {}
     estimated_prompt = request.get("total")
+    # День 17 (§5.7, §8.5): токены, стоимость и время — суммы по раундам,
+    # оценка до запроса — только первого раунда и сравнивается с ним.
+    rounds = last_call.get("rounds") or []
+    several = len(rounds) > 1
+    first_prompt = rounds[0]["prompt_tokens"] if rounds else last_call["prompt_tokens"]
+    last_completion = (
+        rounds[-1]["completion_tokens"] if rounds else last_call["completion_tokens"]
+    )
     lines = [
         header,
         "",
-        f"- **⏱ Время ответа:** {last_call['elapsed']:.2f} s",
-        f"- **🔢 Токены:** prompt={_fmt_tokens(last_call['prompt_tokens'])} / "
+        f"- **⏱ Время ответа:** {last_call['elapsed']:.2f} s"
+        + (
+            f" (модель, {len(rounds)} {_rounds_word(len(rounds))}) + инструменты "
+            f"{last_call['tool_elapsed']:.2f} s"
+            if several or last_call.get("tool_elapsed")
+            else ""
+        ),
+        f"- **🔢 Токены{' (сумма по раундам)' if several else ''}:** "
+        f"prompt={_fmt_tokens(last_call['prompt_tokens'])} / "
         f"completion={_fmt_tokens(last_call['completion_tokens'])} / "
         f"total={_fmt_tokens(last_call['total_tokens'])}",
         # Две строки дня 8: оценка и факт стоят рядом по обе стороны вызова —
         # до запроса точного числа не бывает, и видно, насколько мы промахнулись.
-        f"- **📏 Запрос:** оценка ≈{_fmt_int(estimated_prompt)} против факта "
-        f"{_fmt_int(last_call['prompt_tokens'])} "
-        f"({_fmt_delta(estimated_prompt, last_call['prompt_tokens'])})",
-        f"- **✍️ Ответ модели:** {_fmt_int(last_call['completion_tokens'])} "
-        f"токенов, оценка по тексту "
+        f"- **📏 Запрос{' (первый раунд)' if several else ''}:** оценка "
+        f"≈{_fmt_int(estimated_prompt)} против факта {_fmt_int(first_prompt)} "
+        f"({_fmt_delta(estimated_prompt, first_prompt)})",
+        # Текст ответа — последнего раунда, и сравнивается он с его
+        # `completion` (день 17): сумма по раундам включает вызовы инструментов.
+        f"- **✍️ Ответ модели{' (последний раунд)' if several else ''}:** "
+        f"{_fmt_int(last_completion)} токенов, оценка по тексту "
         f"≈{_fmt_int(last_call['estimated_completion_tokens'])} "
-        f"({_fmt_delta(last_call['estimated_completion_tokens'], last_call['completion_tokens'])})",
+        f"({_fmt_delta(last_call['estimated_completion_tokens'], last_completion)})",
     ]
     # Кэш промпта показывается, только если API его вернул. Стоимость по нему
     # не пересчитывается — `PRICING_PER_M_TOKENS` остаётся off-peak-оценкой.
@@ -422,10 +478,13 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
             f"стоимости кэш не учитывает, поэтому счёт растёт медленнее неё"
         )
     lines += [
-        f"- **💲 Стоимость:** {_fmt_cost(last_call['cost_usd'])}",
+        f"- **💲 Стоимость{' (сумма по раундам)' if several else ''}:** "
+        f"{_fmt_cost(last_call['cost_usd'])}",
         f"- **finish_reason:** `{last_call['finish_reason']}`",
         f"- **Модель:** `{last_call['model']}`",
     ]
+    if rounds:
+        lines.append(_rounds_line(last_call))
     lines += _service_lines(last_call.get("service_call"))
     # Страж инвариантов (день 14, §8.6) — перед разбором памяти, в порядке
     # служебных работ хода.
@@ -434,6 +493,38 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
     lines += _route_call_lines(last_call)
     lines += _task_tracker_lines(last_call)
     return "\n".join(lines)
+
+
+def _rounds_word(count: int) -> str:
+    """«1 раунд» / «3 раунда» / «5 раундов» — без числа (день 17)."""
+    if 11 <= count % 100 <= 14:
+        return "раундов"
+    match count % 10:
+        case 1:
+            return "раунд"
+        case 2 | 3 | 4:
+            return "раунда"
+        case _:
+            return "раундов"
+
+
+def _rounds_line(last_call: dict) -> str:
+    """«Раундов: 3 (tool_calls, tool_calls, stop) · вызовов инструментов: 2»
+    (день 17, §8.5)."""
+    rounds = last_call["rounds"]
+    calls = last_call["tool_calls"]
+    text = (
+        f"- **🔁 Раундов:** {len(rounds)} ("
+        + ", ".join(str(r["finish_reason"]) for r in rounds)
+        + ")"
+    )
+    if calls:
+        text += (
+            f" · вызовов инструментов: {len(calls)} ("
+            + " → ".join(call["name"] for call in calls)
+            + ")"
+        )
+    return text
 
 
 def _guard_call_lines(last_call: dict, invariants_state: dict | None) -> list[str]:
@@ -723,7 +814,8 @@ def _context_md(
         f"{_fmt_int(request['working'])} + задача {_fmt_int(request['task'])} + "
         f"память стратегии {_fmt_int(request['memory'])} + история "
         f"{_fmt_int(request['history'])} ({len(request['per_message'])} сообщ.) + "
-        f"вопрос {_fmt_int(request['question'])} + служебные "
+        f"вопрос {_fmt_int(request['question'])} + схемы инструментов "
+        f"{_fmt_int(request['tools'])} + служебные "
         f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(request['total'])}**",
         # Отдельные корзины, а не история: что это за память/профиль и куда
         # встаёт. Инварианты (день 14) — первыми из блоков агента.
@@ -749,6 +841,17 @@ def _context_md(
             f"не входит"
             if request["memory"]
             else "ничего: у активной стратегии памяти нет или она пуста"
+        ),
+        # Схемы инструментов (день 17, §8.5) — не сообщение, а параметр
+        # `tools`; до вопроса каталога этого хода ещё нет, и оценка идёт по
+        # каталогу прошлого хода (чистый расчёт в сеть не ходит).
+        f"- **Схемы инструментов в запросе:** "
+        + (
+            f"≈{_fmt_int(request['tools'])} токенов по каталогу прошлого хода — "
+            f"параметр `tools`, уходит в каждый раунд"
+            if request["tools"]
+            else "ничего: инструменты выключены, их нет у агента или каталога "
+            "ещё не было"
         ),
     ]
     if question:
@@ -831,7 +934,8 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
         f"{_fmt_int(request['working'])} + задача {_fmt_int(request['task'])} + "
         f"{memory_name} {_fmt_int(request['memory'])} + "
         f"{view['sent_messages']} сообщ. истории {_fmt_int(request['history'])} + "
-        f"вопрос {_fmt_int(request['question'])} + служебные "
+        f"вопрос {_fmt_int(request['question'])} + схемы инструментов "
+        f"{_fmt_int(request['tools'])} (по каталогу прошлого хода) + служебные "
         f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(estimated)}**",
     ]
 
@@ -969,8 +1073,11 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             "prompt": turn["prompt_tokens"],
             "completion": turn["completion_tokens"],
             "total": turn["total_tokens"],
+            # С дня 17 оценка есть только у первого раунда, и сравнивается
+            # она с его `prompt`, а не с суммой по раундам.
             "оценка/факт": _fmt_delta(
-                turn["estimated_prompt_tokens"], turn["prompt_tokens"]
+                turn["estimated_prompt_tokens"],
+                turn["first_prompt_tokens"] or turn["prompt_tokens"],
             ),
             "стоимость": _fmt_cost(turn["cost_usd"]),
             "накопительно": _fmt_cost(turn["cumulative_cost_usd"]),
@@ -1033,6 +1140,14 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             # на этом ходе, и вид схода с маршрута (или прочерк).
             "отказ": turn["task_rejected"] or "—",
             "сход": turn["task_off_route"] or "—",
+            # Колонки дня 17 — в конце (§8.5): раунды модели и вызовы
+            # инструментов за ход, корзина схем в оценке первого раунда и
+            # время каталога и вызовов. `prompt` и стоимость выше — суммы по
+            # раундам.
+            "раунды": turn["tool_rounds"],
+            "вызовы инстр.": turn["tool_calls"],
+            "схемы ток.": turn["tools_tokens"],
+            "инстр. с": f"{turn['tool_elapsed']:.2f}",
         }
         for turn in turns
     ]
@@ -1046,7 +1161,8 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
                  "время разбора, s", "режим", "профиль", "роутер",
                  "время роутера, s", "этап", "переход", "задача", "трекер",
                  "время трекера, s", "инварианты", "конфликт", "страж",
-                 "время стража, s", "отказ", "сход"],
+                 "время стража, s", "отказ", "сход", "раунды",
+                 "вызовы инстр.", "схемы ток.", "инстр. с"],
     )
 
 
@@ -1889,6 +2005,140 @@ def _invariants_in_request_update(state: dict) -> dict:
     )
 
 
+def _tools_in_request_update(state: dict) -> dict:
+    """Переключатель «Инструменты MCP в запросе» (день 17, §8.2): значение и
+    активность подтягиваются к агенту; нет `ToolBox` — неактивен."""
+    tools = state["tools"]
+    return gr.update(
+        value=tools["in_request"] if tools is not None else False,
+        interactive=tools is not None,
+    )
+
+
+def _md_cell(text: str) -> str:
+    """Текст для ячейки таблицы Markdown: без переводов строк и с
+    экранированной чертой."""
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
+def _tools_md(state: dict) -> str:
+    """Блок «Инструменты последнего хода» (день 17, §8.3): каталог хода,
+    вызовы, раунды и предупреждения — из ответа агента (`last_call`)."""
+    tools = state["tools"]
+    if tools is None:
+        return "У агента нет инструментов MCP — запрос как на дне 16."
+    lines: list[str] = []
+    if not tools["in_request"]:
+        lines.append(
+            "**Инструменты MCP выключены:** запрос без каталога и схем — как на "
+            "дне 16, один раунд на ход."
+        )
+    last = state["last_call"]
+    if last is None:
+        lines.append(
+            "Ходов ещё не было. Каталог запрашивается в начале каждого хода; "
+            "вызывать ли инструменты, решает модель."
+        )
+        return "\n\n".join(lines)
+
+    turn = f"Ход {len(state['turns'])}" if last["ok"] else "Последний ход (не состоялся)"
+    note = last["tools_note"]
+    rounds = last["rounds"]
+    calls = last["tool_calls"]
+    if not note:
+        return "\n\n".join(lines + [f"{turn} · инструментов у агента не было."])
+    if note == "выключены":
+        lines.append(
+            f"{turn} · инструменты были выключены: запрос без каталога и схем, "
+            f"раундов: {len(rounds) or 1}."
+        )
+    else:
+        head = f"{turn} · каталог: {note}"
+        if last["tool_specs_tokens"]:
+            head += f" · схемы ≈{_fmt_int(last['tool_specs_tokens'])} ток."
+        head += f" · раундов: {len(rounds)}"
+        if calls:
+            head += (
+                f" · вызовов: {len(calls)} · инструменты "
+                f"{last['tool_elapsed']:.2f} с"
+            )
+        else:
+            head += " · модель ответила без инструментов"
+        lines.append(head)
+
+    if calls:
+        table = [
+            "| № | раунд | инструмент | аргументы | результат | время |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for number, call in enumerate(calls, start=1):
+            result = (
+                f"{call['status']} · {_fmt_int(call['chars'])} симв. "
+                f"≈{_fmt_int(estimate_tokens(call['text']))} ток."
+            )
+            if call["truncated"]:
+                result += " · ✂️ обрезан"
+            table.append(
+                f"| {number} | {call['round']} | `{call['name']}` | "
+                f"`{_md_cell(call['arguments']) or '—'}` | {_md_cell(result)} | "
+                f"{call['elapsed']:.2f} с |"
+            )
+        lines.append("\n".join(table))
+    if rounds:
+        lines.append(
+            "Раунды: " + " · ".join(
+                f"{r['number']} — {r['finish_reason']}"
+                + (" (tool_choice=none)" if r["tool_choice"] else "")
+                + f", prompt {_fmt_int(r['prompt_tokens'])}"
+                for r in rounds
+            )
+        )
+
+    warnings: list[str] = []
+    if note.startswith("каталог не получен"):
+        warnings.append(
+            f"⚠️ {note} — ход прошёл без инструментов, как на дне 16."
+        )
+    for call in calls:
+        if call["status"] != "ок":
+            warnings.append(
+                f"⚠️ `{call['name']}` (раунд {call['round']}): {call['status']} — "
+                f"модели ушло: «{_md_cell(call['text'][:200])}»"
+            )
+        if call["truncated"]:
+            warnings.append(
+                f"⚠️ Результат `{call['name']}` обрезан приложением: "
+                f"{_fmt_int(call['chars'])} символов больше потолка "
+                f"{_fmt_int(tools['result_max_chars'])}."
+            )
+    if any(r["tool_choice"] for r in rounds):
+        warnings.append(
+            f"⚠️ Потолок раундов ({tools['max_rounds']}): последний раунд — с "
+            f"tool_choice=none, модель ответила тем, что уже собрала."
+        )
+    if not last["ok"]:
+        warnings.append(f"⚠️ Ход оборвался: {last['error']}")
+    lines.extend(warnings)
+    return "\n\n".join(lines)
+
+
+def _tools_json(state: dict) -> list[dict]:
+    """Результаты инструментов последнего хода (день 17, §8.3) — ровно то,
+    что ушло модели сообщениями `tool`."""
+    last = state["last_call"]
+    if last is None:
+        return []
+    return [
+        {
+            "name": call["name"],
+            "arguments": call["arguments"],
+            "status": call["status"],
+            "text": call["text"],
+        }
+        for call in last["tool_calls"]
+    ]
+
+
 # --- «Агенты процесса»: расход по журналам всех агентов реестра -----------
 
 def _turn_strategies_label(agent: Agent) -> str:
@@ -1995,10 +2245,10 @@ def _profile_choice_options(choices: list[str]) -> list[tuple[str, str]]:
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 34 значений
+    """Полный вид на состояние агента — фиксированный кортеж из 37 значений
     (18 — до дня 10, 22 — до дня 11, 26 — до дня 12, 29 — до дня 13, 31 — до
-    дня 14; день 14 добавляет три), позиционно раскладывающийся в
-    `VIEW_OUTPUTS`. Порядок — часть контракта
+    дня 14, 34 — до дня 17; дни 14 и 17 добавляют по три), позиционно
+    раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
     Значения всех выпадающих списков — тоже часть вида: иначе после
@@ -2157,6 +2407,14 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
                 else f"Файл инвариантов · {INVARIANTS.path} — файла нет"
             ),
         ),
+        # Значения дня 17 — в конце кортежа и в конце VIEW_OUTPUTS (§8.4).
+        # 35. переключатель «Инструменты MCP в запросе» — значение и
+        #     активность подтянуты к агенту; нет `ToolBox` — неактивен
+        _tools_in_request_update(state),
+        # 36. «Инструменты последнего хода»
+        _tools_md(state),
+        # 37. результаты инструментов последнего хода — что ушло модели
+        _tools_json(state),
     )
 
 
@@ -2200,6 +2458,11 @@ def _new_agent(preset_name: str) -> Agent:
         # это сессия), постоянные — одно хранилище на процесс (день 14, §8.1).
         invariants=make_invariants(),
         invariant_store=INVARIANTS,
+        # Инструменты — один `ToolBox` на процесс, лимиты цикла раундов — из
+        # `presets.py` (день 17, §8.1). Ветку `fork()` собирает с теми же.
+        tools=TOOLBOX,
+        tool_max_rounds=TOOL_MAX_ROUNDS,
+        tool_result_max_chars=TOOL_RESULT_MAX_CHARS,
     )
 
 
@@ -2282,6 +2545,11 @@ def _restore_agents() -> int:
             # переключатель включён, последнего конфликта нет (день 14, §6.8).
             invariants=make_invariants(),
             invariant_store=INVARIANTS,
+            # Инструменты — тот же `ToolBox`, переключатель включён (день 17,
+            # §5.2).
+            tools=TOOLBOX,
+            tool_max_rounds=TOOL_MAX_ROUNDS,
+            tool_result_max_chars=TOOL_RESULT_MAX_CHARS,
         )
         restored += 1
     logger.info(
@@ -2583,6 +2851,9 @@ def _reply_status(agent: Agent, reply) -> str:
                 f" 🚧 Сход с маршрута ({reply.task_off_route}): состояние "
                 f"задачи не тронуто, {where}."
             )
+        # Инструменты (день 17, §8.3) — одной фразой: что вызвала модель или
+        # что обошлась без них. Детали — в блоке «Инструменты последнего хода».
+        status += _tools_status(reply)
         # Поле ввода чистим только при успехе; при ошибке вопрос остаётся
         # в поле, чтобы его можно было отправить повторно.
         return status
@@ -2609,7 +2880,36 @@ def _reply_status(agent: Agent, reply) -> str:
             f" 📋 Переход трекера задачи перед вызовом при этом применился — "
             f"{reply.task_note} — состояние уйдёт со следующим вопросом."
         )
+    if reply.tool_calls:
+        status += (
+            f" 🔧 До сбоя сделано вызовов инструментов: {len(reply.tool_calls)} "
+            f"за {len(reply.rounds)} {_rounds_word(len(reply.rounds))} "
+            f"— они оплачены, в историю ничего не попало."
+        )
     return status
+
+
+def _tools_status(reply) -> str:
+    """Фраза статуса про инструменты хода (день 17): «🔧 faq_questions →
+    faq_article, 3 раунда, 4.74 с» или «модель ответила без инструментов»."""
+    note = reply.tools_note
+    if not note or note == "выключены":
+        return ""
+    if note.startswith("каталог не получен"):
+        return f" ⚠️ Инструменты: {note} — ход прошёл без них."
+    if not reply.tool_calls:
+        return " 🔧 Модель ответила без инструментов."
+    failed = [call for call in reply.tool_calls if call.status != "ок"]
+    text = (
+        f" 🔧 Инструменты: {' → '.join(call.name for call in reply.tool_calls)}, "
+        f"раундов {len(reply.rounds)}, {reply.tool_elapsed:.2f} с."
+    )
+    if failed:
+        text += (
+            f" ⚠️ Не удалось: {', '.join(f'{c.name} ({c.status})' for c in failed)} "
+            f"— текст ошибки ушёл модели."
+        )
+    return text
 
 
 def on_send(agent: Agent | None, message: str, preset_name: str):
@@ -3111,6 +3411,28 @@ def on_invariants_in_request(agent: Agent | None, enabled: bool, preset_name: st
     return (agent, gr.update(), *_view(agent, status))
 
 
+def on_tools_in_request(agent: Agent | None, enabled: bool, preset_name: str):
+    """«Инструменты MCP в запросе» (день 17, §8.2) — выключено: запрос как на
+    дне 16, без каталога и схем; включено: в начале каждого хода приложение
+    запрашивает у сервера FAQ каталог, и модель сама решает, звать ли
+    инструменты. Нового агента не создаёт и ничего не пишет."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    agent.set_tools_in_request(bool(enabled))
+    if agent.tools_in_request:
+        status = (
+            "Инструменты MCP в запросе: включено. В начале каждого хода — "
+            "каталог сервера FAQ; вызывать ли инструменты, решает модель."
+        )
+    else:
+        status = (
+            "Инструменты MCP в запросе: выключено. Запрос как на дне 16 — без "
+            "каталога и схем, модель отвечает из общих знаний."
+        )
+    return (agent, gr.update(), *_view(agent, status))
+
+
 def on_confirm_transition(agent: Agent | None, preset_name: str):
     """«✅ Подтвердить переход» (§8.3): человек разрешает переход трекера,
     который остановил инвариант `с подтверждением`. Активна всегда: нечего
@@ -3553,10 +3875,29 @@ def on_save_profile(
     return (agent, gr.update(), *_view(agent, status))
 
 
-# --- MCP: сервер BoardGameGeek (день 16, §5) ------------------------------
+# --- MCP: каталог сервера по кнопке (день 16, §5; день 17, §8.3) ----------
 # Блок — не вид на состояние агента: ни `_view()`, ни `agent_state`. Всё, что
 # он показывает, — описание сервера (статично) и результат последнего нажатия
-# в этой вкладке (живёт только в выходах `MCP_OUTPUTS`).
+# в этой вкладке (живёт только в выходах `MCP_OUTPUTS` / `FAQ_MCP_OUTPUTS`).
+# С дня 17 функции параметризованы сервером и строкой текста про агента:
+# блок BoardGameGeek дня 16 и блок своего сервера FAQ — одни и те же
+# компоненты и функции, поведение блока дня 16 не изменилось.
+
+# Что агент делает с инструментами сервера — строка описания и хвост строки
+# токенов в статусе.
+BGG_AGENT_LINE = "Агент инструментами не пользуется и о сервере не знает."
+BGG_TOKENS_TAIL = (
+    "столько добавилось бы к каждому запросу, если отдать их модели; сегодня "
+    "в запрос не уходит ничего"
+)
+FAQ_AGENT_LINE = (
+    "Агент получает эти инструменты в каждом ходе, пока включён переключатель "
+    "«Инструменты MCP в запросе»."
+)
+FAQ_TOKENS_TAIL = (
+    "уходят в запрос каждого раунда при включённом переключателе «Инструменты "
+    "MCP в запросе»"
+)
 
 MCP_TABLE_COLUMNS = ["№", "инструмент", "описание", "параметры (* — обязательный)"]
 MCP_STATUS_INITIAL = (
@@ -3571,39 +3912,78 @@ def _mcp_env_line(launch) -> str:
     return " · ".join(keys) if keys else "—"
 
 
+# Корень репозитория — для командной строки в панели (день 17): абсолютные
+# пути внутри репозитория показываются относительными, пути в домашнем
+# каталоге — через `~`, чтобы на видео не попадала структура папок автора.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _display_arg(arg: str) -> str:
+    """Одно слово командной строки для панели. Путь не разворачивается через
+    `resolve()`, в отличие от `storage.display_path()`: `.venv/bin/python` —
+    ссылка за пределы репозитория, и после `resolve()` стал бы абсолютным."""
+    if arg.startswith("/"):
+        path = Path(arg)
+        for base, prefix in ((_PROJECT_ROOT, ""), (Path.home(), "~/")):
+            try:
+                return prefix + shlex.quote(str(path.relative_to(base)))
+            except ValueError:
+                continue
+    return shlex.quote(arg)
+
+
+def _display_command(command_line: str) -> str:
+    """Командная строка для панели — только вид: процесс запускается строкой
+    как есть, лог тоже пишет её как есть. Неразбираемая строка остаётся
+    как есть — её и так покажет сбой стадии «запуск»."""
+    try:
+        return " ".join(_display_arg(arg) for arg in shlex.split(command_line))
+    except ValueError:
+        return command_line
+
+
 def _mcp_command_md(launch) -> str:
-    return f"`{launch.command_line}` ({launch.origin})"
+    return f"`{_display_command(launch.command_line)}` ({launch.origin})"
 
 
-def _mcp_server_md() -> str:
-    """Описание сервера — собирается один раз при построении интерфейса."""
-    source = f" · [исходники]({BGG_MCP.source})" if BGG_MCP.source else ""
-    if MCP_LAUNCH.error:
+def _mcp_server_md(
+    server: McpServer,
+    launch,
+    agent_line: str,
+    source_label: str = "исходники",
+    server_line: str = "",
+) -> str:
+    """Описание сервера — собирается один раз при построении интерфейса.
+    `agent_line` — что агент делает с инструментами сервера; `server_line`
+    — необязательная строка о самом сервере (день 17: «свой, в репозитории»)."""
+    source = f" · [{source_label}]({server.source})" if server.source else ""
+    if launch.error:
         launch_line = (
-            f"- ⚠️ Командная строка не годится: {MCP_LAUNCH.error} — "
-            f"`{MCP_LAUNCH.command_line}` ({MCP_LAUNCH.origin}). Кнопка покажет "
+            f"- ⚠️ Командная строка не годится: {launch.error} — "
+            f"`{_display_command(launch.command_line)}` ({launch.origin}). Кнопка покажет "
             f"сбой стадии «запуск»."
         )
     else:
-        launch_line = f"- Запуск: {_mcp_command_md(MCP_LAUNCH)}"
+        launch_line = f"- Запуск: {_mcp_command_md(launch)}"
     # Замена действует — показать, что заменено; нет — чем заменить.
-    if MCP_LAUNCH.command_line != BGG_MCP.command:
-        launch_line += f"; по умолчанию — `{BGG_MCP.command}`"
-    elif BGG_MCP.command_env:
+    if launch.command_line != server.command:
+        launch_line += f"; по умолчанию — `{_display_command(server.command)}`"
+    elif server.command_env:
         launch_line += (
-            f"; целиком заменяется переменной {BGG_MCP.command_env} в src/.env"
+            f"; целиком заменяется переменной {server.command_env} в src/.env"
         )
+    server_part = f"- {server_line}\n" if server_line else ""
     return (
-        f"**{BGG_MCP.title}**{source} · транспорт stdio · клиент — официальный "
+        f"**{server.title}**{source} · транспорт stdio · клиент — официальный "
         f"SDK mcp {SDK_VERSION}\n\n"
+        f"{server_part}"
         f"{launch_line}\n"
-        f"- Серверу передаются: {_mcp_env_line(MCP_LAUNCH)} (значения не "
+        f"- Серверу передаются: {_mcp_env_line(launch)} (значения не "
         f"показываются). Остального окружения приложения, в том числе ключа "
         f"DeepSeek, сервер не получает: SDK отдаёт процессу только "
         f"{', '.join(INHERITED_ENV)}.\n"
         f"- Каждое нажатие — новое соединение: запуск процесса → согласование "
-        f"протокола → tools/list → закрытие. Агент инструментами не пользуется "
-        f"и о сервере не знает."
+        f"протокола → tools/list → закрытие. {agent_line}"
     )
 
 
@@ -3643,7 +4023,7 @@ def _mcp_tools_tokens(listing: ToolListing) -> int:
     return estimate_tokens(json.dumps(tools, ensure_ascii=False)) if tools else 0
 
 
-def _mcp_status_md(listing: ToolListing) -> str:
+def _mcp_status_md(listing: ToolListing, tokens_tail: str = BGG_TOKENS_TAIL) -> str:
     command = f"- Запуск: {_mcp_command_md(listing.launch)}"
     if listing.ok:
         return "\n".join([
@@ -3654,8 +4034,7 @@ def _mcp_status_md(listing: ToolListing) -> str:
             f"- Время: соединение {listing.connect_s:.2f} с · tools/list "
             f"{listing.list_s:.2f} с · всего с закрытием {listing.total_s:.2f} с",
             f"- Описания и схемы всех инструментов: ≈{_fmt_int(_mcp_tools_tokens(listing))} "
-            f"токенов по оценке — столько добавилось бы к каждому запросу, если "
-            f"отдать их модели; сегодня в запрос не уходит ничего",
+            f"токенов по оценке — {tokens_tail}",
             command,
         ])
     lines = [
@@ -3678,42 +4057,64 @@ def _mcp_status_md(listing: ToolListing) -> str:
     return "\n".join(lines)
 
 
-def _mcp_param_text(param) -> str:
+def _mcp_param_text(param, with_description: bool = False) -> str:
     text = f"`{param.name}`{'*' if param.required else ''}"
     if param.type:
         text += f" {param.type}"
     if param.enum:
         text += f" ∈ {{{', '.join(param.enum)}}}"
+    if with_description and param.description:
+        text += f" — {param.description}"
     return text
 
 
-def _mcp_tools_table(listing: ToolListing | None) -> pd.DataFrame:
-    """По строке на инструмент — в порядке ответа сервера, без пересортировки."""
+def _mcp_tools_table(
+    listing: ToolListing | None, param_descriptions: bool = False
+) -> pd.DataFrame:
+    """По строке на инструмент — в порядке ответа сервера, без пересортировки.
+    `param_descriptions` (день 17) — показать описания параметров: у своего
+    сервера это «описание входных параметров» из задания; таблица дня 16
+    остаётся как была."""
     rows = [
         [
             number,
             f"`{tool.name}`" + (f" — {tool.title}" if tool.title else ""),
             tool.description,
-            " · ".join(_mcp_param_text(param) for param in tool.params) or "—",
+            " · ".join(
+                _mcp_param_text(param, param_descriptions) for param in tool.params
+            ) or "—",
         ]
         for number, tool in enumerate(listing.tools if listing else (), start=1)
     ]
     return pd.DataFrame(rows, columns=MCP_TABLE_COLUMNS)
 
 
-def on_mcp_list():
-    """Кнопка «Подключиться и получить список инструментов» (§5.2).
+def _mcp_list(
+    server: McpServer, timeout_s: float, tokens_tail: str, param_descriptions: bool
+):
+    """Кнопка «Подключиться и получить список инструментов» (день 16, §5.2;
+    день 17 — тот же обработчик для сервера FAQ).
 
     Без входов: агента не трогает, замка нет — общего состояния у подключений
     нет. Сбой — не исключение, а `ToolListing` со стадией; при сбое таблица и
     JSON очищаются, чтобы старый список не выглядел результатом этого нажатия.
     """
-    listing = list_tools(BGG_MCP, timeout_s=MCP_TIMEOUT_S)
+    listing = list_tools(server, timeout_s=timeout_s)
     return (
-        _mcp_status_md(listing),
-        _mcp_tools_table(listing if listing.ok else None),
+        _mcp_status_md(listing, tokens_tail),
+        _mcp_tools_table(listing if listing.ok else None, param_descriptions),
         list(listing.pages) if listing.ok else [],
     )
+
+
+# Два блока — два обработчика одной функции: сервер и слова про агента
+# передаёт `functools.partial`, как событие у кнопок задачи.
+on_mcp_list = functools.partial(
+    _mcp_list, BGG_MCP, MCP_TIMEOUT_S, BGG_TOKENS_TAIL, False
+)
+on_faq_list = functools.partial(
+    _mcp_list, FAQ_MCP, FAQ_TIMEOUT_S, FAQ_TOKENS_TAIL, True
+)
 
 
 # --- Старт процесса ------------------------------------------------------
@@ -3861,6 +4262,17 @@ _ROUTE_SCENARIO_LABELS: list[str] = [
 ]
 
 
+# --- Сценарий дня 17: подписи для gr.Examples (§8.6) ----------------------
+# Тексты — `presets.TOOLS_SCENARIO`; подписи — здесь, как у сценариев дней
+# 13-15.
+_TOOLS_SCENARIO_LABELS: list[str] = [
+    "И1 · Patches и боты Tink",
+    "И2 · Poison 2 → 1",
+    "И3 · без правил",
+    "И4 · нет в FAQ",
+]
+
+
 # Чат и дебаг-панель — ровно пополам; кнопки компактнее дефолтных.
 APP_CSS = """
 button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8px !important; min-height: 28px !important; }
@@ -3869,13 +4281,15 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 16, неделя 4 — **MCP**. Приложение само запускает MCP-сервер "
-        "BoardGameGeek (bgg-mcp), согласует с ним протокол и получает **список "
-        "его инструментов** — блок наверху дебаг-панели. Каждое нажатие — новое "
-        "соединение: запуск процесса → согласование → tools/list → закрытие. "
-        "Агент инструментами пока не пользуется и о сервере не знает — это "
-        "следующий шаг; в запрос сегодня не уходит ничего. Чат, стратегии, "
-        "память, профиль, состояние задачи и инварианты работают как раньше."
+        "День 17, неделя 4 — **первый инструмент MCP**. Свой MCP-сервер "
+        "(`src/faq_server.py`) вокруг официального FAQ издателя по Too Many "
+        "Bones: два инструмента — список вопросов и текст статьи. **Агент сам "
+        "решает**, сверяться ли с FAQ: вызывает инструменты, получает результат "
+        "и отвечает по нему со ссылкой на статью — вызовы и раунды видны в "
+        "блоке наверху дебаг-панели. Переключатель «Инструменты MCP в запросе» "
+        "выключает инструменты: запрос как на дне 16, ответ из общих знаний. "
+        "Чат, стратегии, память, профиль, задача и инварианты работают как "
+        "раньше."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -3935,6 +4349,20 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "агента; стратегия меняет запрос у того же агента; ветка "
                     "переключает на другую историю — отдельную сессию со "
                     "своим файлом, своей стратегией и своими счётчиками."
+                ),
+            )
+            # «Инструменты MCP в запросе» (день 17, §8.2) — первым из
+            # переключателей запроса, над слоями памяти: инструменты — не блок
+            # сообщений, а отдельный параметр запроса. Событие — `input`
+            # (правило флажков), значение и активность — из `_view()`.
+            tools_in_request_checkbox = gr.Checkbox(
+                value=True,
+                label="Инструменты MCP в запросе",
+                info=(
+                    "Выключено — запрос как на дне 16: без каталога и схем, "
+                    "модель отвечает из общих знаний. Включено — в начале "
+                    "каждого хода приложение запрашивает у сервера FAQ "
+                    "каталог, и модель сама решает, вызывать ли инструменты."
                 ),
             )
             # «Слои памяти в запросе» (день 11, §7.2) — сразу под веткой
@@ -4009,6 +4437,19 @@ with gr.Blocks(title="TooManyRules") as demo:
                 label="Вопрос по правилам",
                 placeholder="Например: из каких фаз состоит ход игрока?",
                 lines=2,
+            )
+            # Сценарий дня 17 (§7.3, §8.6) — у поля ввода, в кадре. Клик кладёт
+            # текст в поле, отправляет человек. И5 — не пример, а действие:
+            # выключить «Инструменты MCP в запросе» и повторить И1.
+            gr.Examples(
+                examples=[[text] for text in TOOLS_SCENARIO],
+                inputs=[question_input],
+                example_labels=_TOOLS_SCENARIO_LABELS,
+                examples_per_page=len(TOOLS_SCENARIO),
+                label=(
+                    "Сценарий дня 17 (И5 — выключить «Инструменты MCP в "
+                    "запросе» и повторить И1)"
+                ),
             )
             with gr.Row():
                 send_btn = gr.Button("Отправить", size="sm", variant="primary", scale=2)
@@ -4217,9 +4658,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                     label="Профили для проверки (заполняет общую часть; сохраняет человек)",
                 )
 
-            # Свёрнуто: у дня 16 сценария в чате нет — его инструмент в
-            # дебаг-панели, поэтому под аккордеоном все сценарии, включая день
-            # 15 (правило «на экране — текущий день»).
+            # Свёрнуто: сценарии прошлых дней. У дня 16 сценария в чате не
+            # было, сценарий дня 17 стоит у поля ввода (правило «на экране —
+            # текущий день»).
             with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15)", open=False):
                 gr.Examples(
                     examples=[
@@ -4333,12 +4774,55 @@ with gr.Blocks(title="TooManyRules") as demo:
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # MCP (день 16, §5.1) — развёрнут в кадр. Не входит в `_view()`:
-            # свои выходы `MCP_OUTPUTS`, обработчик без `agent_state`.
-            # Описание сервера статично — окружение за время жизни процесса не
-            # меняется.
-            with gr.Accordion("MCP: сервер BoardGameGeek (день 16)", open=True):
-                gr.Markdown(_mcp_server_md())
+            # Свой сервер FAQ (день 17, §8.3) — развёрнут в кадр, над блоком
+            # дня 16. Каталог по кнопке — те же компоненты и функции, что у
+            # дня 16, вне `_view()` (свои выходы `FAQ_MCP_OUTPUTS`); вызовы
+            # последнего хода — из `_view()`: они часть ответа агента.
+            with gr.Accordion("MCP: свой сервер FAQ (день 17)", open=True):
+                gr.Markdown(_mcp_server_md(
+                    FAQ_MCP, FAQ_LAUNCH, FAQ_AGENT_LINE,
+                    source_label="категория FAQ на сайте издателя",
+                    server_line=(
+                        "Сервер — `src/faq_server.py` этого репозитория: SDK "
+                        "mcp v2 (`MCPServer`), два инструмента, сайт читается "
+                        "только на вызов."
+                    ),
+                ))
+                faq_list_btn = gr.Button(
+                    "🔌 Подключиться и получить список инструментов",
+                    variant="primary",
+                )
+                faq_status_md = gr.Markdown(MCP_STATUS_INITIAL)
+                faq_tools_table = gr.Dataframe(
+                    value=_mcp_tools_table(None, True),
+                    label="Инструменты сервера — в порядке ответа tools/list",
+                    datatype=["number", "markdown", "str", "markdown"],
+                    column_widths=["7%", "20%", "38%", "35%"],
+                    max_height=360,
+                    wrap=True,
+                )
+                with gr.Accordion("Ответ tools/list целиком (JSON)", open=False):
+                    faq_pages_json = gr.JSON(
+                        value=[],
+                        label="Страницы ответа, как пришли от сервера",
+                        max_height=420,
+                    )
+                gr.Markdown("#### Инструменты последнего хода")
+                tools_md = gr.Markdown("")
+                with gr.Accordion(
+                    "Результаты инструментов последнего хода (JSON)", open=False
+                ):
+                    tools_json = gr.JSON(
+                        value=[],
+                        label="Что ушло модели сообщениями tool",
+                        max_height=420,
+                    )
+            # MCP BoardGameGeek (день 16, §5.1) — с дня 17 свёрнут. Не входит
+            # в `_view()`: свои выходы `MCP_OUTPUTS`, обработчик без
+            # `agent_state`. Описание сервера статично — окружение за время
+            # жизни процесса не меняется.
+            with gr.Accordion("MCP: сервер BoardGameGeek (день 16)", open=False):
+                gr.Markdown(_mcp_server_md(BGG_MCP, MCP_LAUNCH, BGG_AGENT_LINE))
                 mcp_list_btn = gr.Button(
                     "🔌 Подключиться и получить список инструментов",
                     variant="primary",
@@ -4551,8 +5035,8 @@ with gr.Blocks(title="TooManyRules") as demo:
                 )
 
     # Порядок выходов совпадает с порядком значений в `_view()`. Значения
-    # дня 10, дня 11, дня 12, дня 13 и дня 14 — в конце списка, как и в
-    # кортеже `_view()` (§7.7, §8.8).
+    # дня 10, дня 11, дня 12, дня 13, дня 14 и дня 17 — в конце списка, как и
+    # в кортеже `_view()` (§7.7, §8.8; день 17 — §8.4).
     VIEW_OUTPUTS = [
         chatbot,
         status_md,
@@ -4588,6 +5072,9 @@ with gr.Blocks(title="TooManyRules") as demo:
         invariants_in_request_checkbox,
         invariants_md,
         invariants_file_json,
+        tools_in_request_checkbox,
+        tools_md,
+        tools_json,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
     # Выходы формы редактора профиля (день 12, §7.3) — отдельно от
@@ -4621,6 +5108,11 @@ with gr.Blocks(title="TooManyRules") as demo:
     # без входов, агента не трогает; остальные обработчики блок не трогают.
     MCP_OUTPUTS = [mcp_status_md, mcp_tools_table, mcp_pages_json]
     mcp_list_btn.click(on_mcp_list, inputs=None, outputs=MCP_OUTPUTS)
+    # Каталог FAQ по кнопке (день 17, §8.4) — тем же правилом: вне `_view()`,
+    # без `agent_state`. Каталог по кнопке — проверка сервера, а не вид на
+    # агента; каталог хода агент запрашивает сам.
+    FAQ_MCP_OUTPUTS = [faq_status_md, faq_tools_table, faq_pages_json]
+    faq_list_btn.click(on_faq_list, inputs=None, outputs=FAQ_MCP_OUTPUTS)
 
     load_event = demo.load(
         on_load,
@@ -4794,6 +5286,14 @@ with gr.Blocks(title="TooManyRules") as demo:
     invariants_in_request_checkbox.input(
         on_invariants_in_request,
         inputs=[agent_state, invariants_in_request_checkbox, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # «Инструменты MCP в запросе» (день 17, §8.2) — `input`, тем же правилом,
+    # что остальные флажки: один запрос на клик, на обновление значения из
+    # `_view()` не приходит.
+    tools_in_request_checkbox.input(
+        on_tools_in_request,
+        inputs=[agent_state, tools_in_request_checkbox, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
 
