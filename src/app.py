@@ -5,7 +5,8 @@
 # «Профиль в запросе»; день 13: состояние задачи; день 14: инварианты; день
 # 15: жёсткий контроль переходов — красный путь; день 16, неделя 4:
 # подключение к MCP-серверу BoardGameGeek и список его инструментов; день 17:
-# свой MCP-сервер FAQ издателя и function calling агента).
+# свой MCP-сервер FAQ издателя и function calling агента; день 18: сторож FAQ
+# — долгоживущий MCP-сервер по Streamable HTTP с расписанием).
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
@@ -73,6 +74,19 @@
 # (переключатель, блок и JSON результатов). Каталог FAQ по кнопке — как у
 # дня 16, вне `_view()`: функции блока дня 16 параметризованы сервером, у
 # блока FAQ свои выходы `FAQ_MCP_OUTPUTS`. Блок дня 16 свёрнут.
+#
+# День 18 (спецификация дня 18, §7) добавляет второй сервер агенту: сторож FAQ
+# (`src/faq_watch.py`) — отдельная служба по Streamable HTTP, которую
+# запускает человек (`./run.sh faq-watch`), а не приложение. `TOOLBOX` —
+# теперь `mcp_client.McpToolBoxGroup` из двух `McpToolBox`: FAQ по stdio и
+# сторож по адресу; сторож не запущен — агент получает инструменты FAQ и
+# предупреждение в заметке каталога. Блок «Сторож FAQ (день 18)» — снова вне
+# `_view()` (свои выходы `WATCH_MCP_OUTPUTS` и `WATCH_DIGEST_OUTPUTS`, без
+# `agent_state`): описание сервера, каталог по кнопке и сводка сторожа за N
+# дней — дословный ответ инструмента `faq_changes`, без модели. «Инструменты
+# последнего хода» переехали в этот блок, а `_view()` остался на 37
+# значениях: меняется только аккордеон, в котором стоят компоненты. Приложение
+# сервер не опрашивает: сводку сам по себе он пишет в свой терминал.
 #
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
@@ -143,9 +157,13 @@ from mcp_client import (
     SDK_VERSION,
     STAGE_CONNECT,
     STAGE_LIST,
+    TRANSPORT_HTTP,
     McpServer,
     McpToolBox,
+    McpToolBoxGroup,
+    ToolCall,
     ToolListing,
+    call_tool,
     handshake_text,
     list_tools,
     resolve_launch,
@@ -163,6 +181,8 @@ from presets import (
     DEFAULT_STRATEGY,
     FAQ_MCP,
     FAQ_TIMEOUT_S,
+    FAQ_WATCH,
+    FAQ_WATCH_DB,
     INVARIANT_EXAMPLES,
     INVARIANT_MAX_ITEMS,
     INVARIANT_SCENARIO,
@@ -182,6 +202,8 @@ from presets import (
     TOOL_MAX_ROUNDS,
     TOOL_RESULT_MAX_CHARS,
     TOOLS_SCENARIO,
+    WATCH_SCENARIO,
+    WATCH_TIMEOUT_S,
     make_invariants,
     make_memory,
     make_router,
@@ -297,10 +319,15 @@ MCP_LAUNCH = resolve_launch(BGG_MCP, os.environ)
 )
 
 # Инструменты агента (день 17, §8.1) — один `ToolBox` на процесс, рядом с
-# хранилищами: каждый агент получает тот же объект. Состояния у него нет —
-# каталог и каждый вызов идут новым подключением к серверу FAQ. Подключения при
-# старте нет, как у BGG: одна строка лога тем же форматом.
-TOOLBOX = McpToolBox(FAQ_MCP, timeout_s=FAQ_TIMEOUT_S)
+# хранилищами: каждый агент получает тот же объект. Каталог и каждый вызов
+# идут новым подключением. Подключения при старте нет, как у BGG: одна строка
+# лога тем же форматом. С дня 18 (§7.1) — группа из двух серверов: FAQ по
+# stdio и сторож FAQ по HTTP; единственное состояние группы — карта «имя
+# инструмента → сервер» из последнего каталога.
+TOOLBOX = McpToolBoxGroup((
+    McpToolBox(FAQ_MCP, timeout_s=FAQ_TIMEOUT_S),
+    McpToolBox(FAQ_WATCH, timeout_s=WATCH_TIMEOUT_S),
+))
 FAQ_LAUNCH = resolve_launch(FAQ_MCP, os.environ)
 (logger.warning if FAQ_LAUNCH.error else logger.info)(
     "MCP при старте: сервер %s — %s (%s)%s; SDK mcp %s; агенту — каталог в "
@@ -308,6 +335,16 @@ FAQ_LAUNCH = resolve_launch(FAQ_MCP, os.environ)
     FAQ_MCP.name, FAQ_LAUNCH.command_line, FAQ_LAUNCH.origin,
     f" — ⚠️ {FAQ_LAUNCH.error}" if FAQ_LAUNCH.error else "",
     SDK_VERSION,
+)
+# Сторож FAQ (день 18, §7.1) — сервер, который запускает не приложение: только
+# адрес, откуда он и как его запустить.
+WATCH_LAUNCH = resolve_launch(FAQ_WATCH, os.environ)
+(logger.warning if WATCH_LAUNCH.error else logger.info)(
+    "MCP при старте: сервер %s — %s (%s)%s, Streamable HTTP; запускается "
+    "отдельно (./run.sh faq-watch); агенту — вместе с %s",
+    FAQ_WATCH.name, WATCH_LAUNCH.command_line, WATCH_LAUNCH.origin,
+    f" — ⚠️ {WATCH_LAUNCH.error}" if WATCH_LAUNCH.error else "",
+    FAQ_MCP.name,
 )
 
 # Сколько агентов поднялось из файлов при старте процесса — заполняется
@@ -3414,8 +3451,8 @@ def on_invariants_in_request(agent: Agent | None, enabled: bool, preset_name: st
 def on_tools_in_request(agent: Agent | None, enabled: bool, preset_name: str):
     """«Инструменты MCP в запросе» (день 17, §8.2) — выключено: запрос как на
     дне 16, без каталога и схем; включено: в начале каждого хода приложение
-    запрашивает у сервера FAQ каталог, и модель сама решает, звать ли
-    инструменты. Нового агента не создаёт и ничего не пишет."""
+    запрашивает каталог у серверов FAQ и сторожа FAQ (с дня 18), и модель сама
+    решает, звать ли инструменты. Нового агента не создаёт и ничего не пишет."""
     if agent is None:  # страховка на случай сессии без сработавшего load
         agent = _new_agent(preset_name)
 
@@ -3423,7 +3460,8 @@ def on_tools_in_request(agent: Agent | None, enabled: bool, preset_name: str):
     if agent.tools_in_request:
         status = (
             "Инструменты MCP в запросе: включено. В начале каждого хода — "
-            "каталог сервера FAQ; вызывать ли инструменты, решает модель."
+            "каталог серверов FAQ и сторожа FAQ; вызывать ли инструменты, "
+            "решает модель."
         )
     else:
         status = (
@@ -3875,13 +3913,16 @@ def on_save_profile(
     return (agent, gr.update(), *_view(agent, status))
 
 
-# --- MCP: каталог сервера по кнопке (день 16, §5; день 17, §8.3) ----------
+# --- MCP: каталог сервера по кнопке (день 16, §5; день 17, §8.3; день 18) --
 # Блок — не вид на состояние агента: ни `_view()`, ни `agent_state`. Всё, что
 # он показывает, — описание сервера (статично) и результат последнего нажатия
-# в этой вкладке (живёт только в выходах `MCP_OUTPUTS` / `FAQ_MCP_OUTPUTS`).
-# С дня 17 функции параметризованы сервером и строкой текста про агента:
-# блок BoardGameGeek дня 16 и блок своего сервера FAQ — одни и те же
-# компоненты и функции, поведение блока дня 16 не изменилось.
+# в этой вкладке (живёт только в выходах `MCP_OUTPUTS` / `FAQ_MCP_OUTPUTS` /
+# `WATCH_MCP_OUTPUTS`). С дня 17 функции параметризованы сервером и строкой
+# текста про агента: блок BoardGameGeek дня 16 и блок своего сервера FAQ —
+# одни и те же компоненты и функции, поведение блока дня 16 не изменилось. С
+# дня 18 они знают второй транспорт — сервер по адресу (сторож FAQ): вместо
+# командной строки — адрес, вместо «сообщение сервера в терминале
+# приложения» — подсказка, как запустить сервер.
 
 # Что агент делает с инструментами сервера — строка описания и хвост строки
 # токенов в статусе.
@@ -3897,6 +3938,20 @@ FAQ_AGENT_LINE = (
 FAQ_TOKENS_TAIL = (
     "уходят в запрос каждого раунда при включённом переключателе «Инструменты "
     "MCP в запросе»"
+)
+WATCH_AGENT_LINE = (
+    "Агент получает инструменты сторожа вместе с инструментами FAQ дня 17, "
+    "пока включён переключатель «Инструменты MCP в запросе»."
+)
+WATCH_TOKENS_TAIL = (
+    "уходят в запрос каждого раунда вместе со схемами FAQ дня 17 при "
+    "включённом переключателе «Инструменты MCP в запросе»"
+)
+# Как запустить сторож (день 18, §7.2) — подсказка при сбое соединения:
+# `mcp_client` этого не знает, запускает сервер человек.
+WATCH_START_HINT = (
+    "запустите сервер в отдельном терминале: `./run.sh faq-watch` (для "
+    "видео — `./run.sh faq-watch --interval 5`)"
 )
 
 MCP_TABLE_COLUMNS = ["№", "инструмент", "описание", "параметры (* — обязательный)"]
@@ -3946,17 +4001,63 @@ def _mcp_command_md(launch) -> str:
     return f"`{_display_command(launch.command_line)}` ({launch.origin})"
 
 
+def _mcp_launch_line(launch) -> str:
+    """«Запуск: …» у stdio-сервера, «Адрес: …» у сервера по адресу (день 18)."""
+    label = "Адрес" if launch.transport == TRANSPORT_HTTP else "Запуск"
+    return f"- {label}: {_mcp_command_md(launch)}"
+
+
+def _mcp_http_server_md(
+    server: McpServer, launch, agent_line: str, source: str, server_part: str,
+    db: Path | None,
+) -> str:
+    """Описание сервера по адресу (день 18, §7.2): процесс запускает человек,
+    окружение приложения ему не передаётся, подключение — к работающему
+    серверу."""
+    if launch.error:
+        address = (
+            f"- ⚠️ Адрес не годится: {launch.error} — `{launch.command_line}` "
+            f"({launch.origin}). Кнопки покажут сбой стадии «запуск»."
+        )
+    else:
+        address = _mcp_launch_line(launch)
+    if launch.command_line != server.url:
+        address += f"; по умолчанию — `{server.url}`"
+    elif server.url_env:
+        address += f"; целиком заменяется переменной {server.url_env} в src/.env"
+    db_line = f"- База сервера: `{_display_arg(str(db))}`.\n" if db is not None else ""
+    return (
+        f"**{server.title}**{source} · транспорт Streamable HTTP · клиент — "
+        f"официальный SDK mcp {SDK_VERSION}\n\n"
+        f"{server_part}"
+        f"{address}\n"
+        f"- Сервер запускается отдельно: `./run.sh faq-watch` (для видео — "
+        f"`./run.sh faq-watch --interval 5`), работает без приложения и "
+        f"переживает его перезапуски.\n"
+        f"{db_line}"
+        f"- Окружение приложения серверу не передаётся — процесс запускает не "
+        f"приложение.\n"
+        f"- Каждое нажатие — новое подключение к работающему серверу: "
+        f"согласование протокола → запрос → закрытие. {agent_line}"
+    )
+
+
 def _mcp_server_md(
     server: McpServer,
     launch,
     agent_line: str,
     source_label: str = "исходники",
     server_line: str = "",
+    db: Path | None = None,
 ) -> str:
     """Описание сервера — собирается один раз при построении интерфейса.
     `agent_line` — что агент делает с инструментами сервера; `server_line`
-    — необязательная строка о самом сервере (день 17: «свой, в репозитории»)."""
+    — необязательная строка о самом сервере (день 17: «свой, в репозитории»);
+    `db` — база сервера по адресу (день 18)."""
     source = f" · [{source_label}]({server.source})" if server.source else ""
+    server_part = f"- {server_line}\n" if server_line else ""
+    if launch.transport == TRANSPORT_HTTP:
+        return _mcp_http_server_md(server, launch, agent_line, source, server_part, db)
     if launch.error:
         launch_line = (
             f"- ⚠️ Командная строка не годится: {launch.error} — "
@@ -3972,7 +4073,6 @@ def _mcp_server_md(
         launch_line += (
             f"; целиком заменяется переменной {server.command_env} в src/.env"
         )
-    server_part = f"- {server_line}\n" if server_line else ""
     return (
         f"**{server.title}**{source} · транспорт stdio · клиент — официальный "
         f"SDK mcp {SDK_VERSION}\n\n"
@@ -4024,7 +4124,7 @@ def _mcp_tools_tokens(listing: ToolListing) -> int:
 
 
 def _mcp_status_md(listing: ToolListing, tokens_tail: str = BGG_TOKENS_TAIL) -> str:
-    command = f"- Запуск: {_mcp_command_md(listing.launch)}"
+    command = _mcp_launch_line(listing.launch)
     if listing.ok:
         return "\n".join([
             f"✅ **Соединение установлено** · {_mcp_at(listing)}",
@@ -4042,7 +4142,11 @@ def _mcp_status_md(listing: ToolListing, tokens_tail: str = BGG_TOKENS_TAIL) -> 
         f"{listing.total_s:.2f} с",
         f"- {listing.error}",
     ]
-    if listing.stage == STAGE_CONNECT:
+    if listing.stage == STAGE_CONNECT and listing.launch.transport == TRANSPORT_HTTP:
+        # Сервер по адресу запускает человек (день 18): скорее всего, он не
+        # запущен или запущен на другом порту.
+        lines.append(f"- Сервер не отвечает — {WATCH_START_HINT}")
+    elif listing.stage == STAGE_CONNECT:
         # Причину «Connection closed» знает только сервер — она в его stderr,
         # который идёт в терминал приложения как есть (§4.6).
         lines.append(
@@ -4115,6 +4219,54 @@ on_mcp_list = functools.partial(
 on_faq_list = functools.partial(
     _mcp_list, FAQ_MCP, FAQ_TIMEOUT_S, FAQ_TOKENS_TAIL, True
 )
+on_watch_list = functools.partial(
+    _mcp_list, FAQ_WATCH, WATCH_TIMEOUT_S, WATCH_TOKENS_TAIL, True
+)
+
+
+# --- Сторож FAQ: сводка по кнопке (день 18, §7.2) --------------------------
+# «Агрегированный результат» из задания без модели: тот же `faq_changes`, что
+# зовёт агент, и его текст дословно — видно, что сводку отдаёт инструмент, а
+# не пересказ. Вне `_view()`, как каталог: свои выходы `WATCH_DIGEST_OUTPUTS`.
+
+WATCH_DAYS_DEFAULT = 7
+WATCH_DIGEST_INITIAL = "Ещё не запрашивали. Каждое нажатие — новое подключение к серверу."
+
+
+def _watch_digest_status(call: ToolCall) -> str:
+    """Статус вызова одной строкой: соединение, протокол, время — или сбой со
+    стадией."""
+    at = datetime.fromisoformat(call.at).strftime("%d.%m.%Y %H:%M:%S")
+    head = f"`faq_changes({_md_cell(json.dumps(call.arguments, ensure_ascii=False))})` · {at}"
+    if call.error:
+        hint = f" — {WATCH_START_HINT}" if call.stage == STAGE_CONNECT else ""
+        return (
+            f"❌ **Сбой на стадии «{call.stage}»** · {head} · через {call.total_s:.2f} с: "
+            f"{call.error}{hint}"
+        )
+    server = " ".join(p for p in (call.server_name, call.server_version) if p) or "сервер не назвался"
+    facts = (
+        f"{server} · протокол {call.protocol_version} ({handshake_text(call.handshake)}) · "
+        f"соединение {call.connect_s:.2f} с · вызов {call.call_s:.2f} с · всего "
+        f"{call.total_s:.2f} с · {_fmt_int(len(call.text))} симв. "
+        f"≈{_fmt_int(estimate_tokens(call.text))} ток."
+    )
+    if call.is_error:
+        return f"⚠️ **Ошибка инструмента** · {head} · {facts}"
+    return f"✅ {head} · {facts}"
+
+
+def on_watch_digest(days):
+    """Кнопка «Сводка сторожа за N дней» (день 18, §7.2). Без `agent_state`:
+    агента не трогает. Сбой — не исключение, а `ToolCall` со стадией."""
+    try:
+        number = int(days) if days is not None else WATCH_DAYS_DEFAULT
+    except (TypeError, ValueError):
+        number = WATCH_DAYS_DEFAULT
+    call = call_tool(FAQ_WATCH, "faq_changes", {"days": number}, timeout_s=WATCH_TIMEOUT_S)
+    if call.error:
+        return _watch_digest_status(call), ""
+    return _watch_digest_status(call), f"```text\n{call.text}\n```"
 
 
 # --- Старт процесса ------------------------------------------------------
@@ -4273,6 +4425,16 @@ _TOOLS_SCENARIO_LABELS: list[str] = [
 ]
 
 
+# --- Сценарий дня 18: подписи для gr.Examples (§7.3) ----------------------
+# Тексты — `presets.WATCH_SCENARIO`.
+_WATCH_SCENARIO_LABELS: list[str] = [
+    "Н1 · что нового за месяц",
+    "Н2 · раз в час",
+    "Н3 · когда проверка",
+    "Н4 · вопрос о правилах",
+]
+
+
 # Чат и дебаг-панель — ровно пополам; кнопки компактнее дефолтных.
 APP_CSS = """
 button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8px !important; min-height: 28px !important; }
@@ -4281,15 +4443,14 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 17, неделя 4 — **первый инструмент MCP**. Свой MCP-сервер "
-        "(`src/faq_server.py`) вокруг официального FAQ издателя по Too Many "
-        "Bones: два инструмента — список вопросов и текст статьи. **Агент сам "
-        "решает**, сверяться ли с FAQ: вызывает инструменты, получает результат "
-        "и отвечает по нему со ссылкой на статью — вызовы и раунды видны в "
-        "блоке наверху дебаг-панели. Переключатель «Инструменты MCP в запросе» "
-        "выключает инструменты: запрос как на дне 16, ответ из общих знаний. "
-        "Чат, стратегии, память, профиль, задача и инварианты работают как "
-        "раньше."
+        "День 18, неделя 4 — **планировщик и фоновые задачи**. Сторож FAQ "
+        "(`src/faq_watch.py`) — отдельный MCP-сервер по Streamable HTTP, "
+        "который работает сам по себе: **по расписанию** снимает официальный "
+        "FAQ издателя в SQLite и **после каждого снимка сам выдаёт сводку** "
+        "изменений в свой терминал. Агент спрашивает у него агрегированную "
+        "сводку за период (`faq_changes`) и меняет расписание "
+        "(`faq_watch_schedule`); сводку можно получить и кнопкой в блоке "
+        "наверху дебаг-панели. Инструменты FAQ дня 17 — как раньше."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -4361,8 +4522,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                 info=(
                     "Выключено — запрос как на дне 16: без каталога и схем, "
                     "модель отвечает из общих знаний. Включено — в начале "
-                    "каждого хода приложение запрашивает у сервера FAQ "
-                    "каталог, и модель сама решает, вызывать ли инструменты."
+                    "каждого хода приложение запрашивает каталог у серверов "
+                    "FAQ и сторожа FAQ, и модель сама решает, вызывать ли "
+                    "инструменты."
                 ),
             )
             # «Слои памяти в запросе» (день 11, §7.2) — сразу под веткой
@@ -4438,18 +4600,14 @@ with gr.Blocks(title="TooManyRules") as demo:
                 placeholder="Например: из каких фаз состоит ход игрока?",
                 lines=2,
             )
-            # Сценарий дня 17 (§7.3, §8.6) — у поля ввода, в кадре. Клик кладёт
-            # текст в поле, отправляет человек. И5 — не пример, а действие:
-            # выключить «Инструменты MCP в запросе» и повторить И1.
+            # Сценарий дня 18 (§7.3, §8.3) — у поля ввода, в кадре. Клик кладёт
+            # текст в поле, отправляет человек.
             gr.Examples(
-                examples=[[text] for text in TOOLS_SCENARIO],
+                examples=[[text] for text in WATCH_SCENARIO],
                 inputs=[question_input],
-                example_labels=_TOOLS_SCENARIO_LABELS,
-                examples_per_page=len(TOOLS_SCENARIO),
-                label=(
-                    "Сценарий дня 17 (И5 — выключить «Инструменты MCP в "
-                    "запросе» и повторить И1)"
-                ),
+                example_labels=_WATCH_SCENARIO_LABELS,
+                examples_per_page=len(WATCH_SCENARIO),
+                label="Сценарий дня 18 (сторож FAQ должен быть запущен: ./run.sh faq-watch)",
             )
             with gr.Row():
                 send_btn = gr.Button("Отправить", size="sm", variant="primary", scale=2)
@@ -4659,9 +4817,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                 )
 
             # Свёрнуто: сценарии прошлых дней. У дня 16 сценария в чате не
-            # было, сценарий дня 17 стоит у поля ввода (правило «на экране —
+            # было, сценарий дня 18 стоит у поля ввода (правило «на экране —
             # текущий день»).
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15)", open=False):
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17)", open=False):
                 gr.Examples(
                     examples=[
                         ["Из каких фаз состоит ход игрока?"],
@@ -4770,15 +4928,93 @@ with gr.Blocks(title="TooManyRules") as demo:
                     ),
                 )
 
+                # Сценарий дня 17 (§7.3, §8.6): И1-И4. И5 — не пример, а
+                # действие: выключить «Инструменты MCP в запросе» и повторить
+                # И1. С дня 18 свёрнут вместе с остальными прошлыми днями.
+                gr.Examples(
+                    examples=[[text] for text in TOOLS_SCENARIO],
+                    inputs=[question_input],
+                    example_labels=_TOOLS_SCENARIO_LABELS,
+                    examples_per_page=len(TOOLS_SCENARIO),
+                    label=(
+                        "Сценарий дня 17 (И5 — выключить «Инструменты MCP в "
+                        "запросе» и повторить И1)"
+                    ),
+                )
+
 
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # Свой сервер FAQ (день 17, §8.3) — развёрнут в кадр, над блоком
-            # дня 16. Каталог по кнопке — те же компоненты и функции, что у
-            # дня 16, вне `_view()` (свои выходы `FAQ_MCP_OUTPUTS`); вызовы
-            # последнего хода — из `_view()`: они часть ответа агента.
-            with gr.Accordion("MCP: свой сервер FAQ (день 17)", open=True):
+            # Сторож FAQ (день 18, §7.2) — развёрнут в кадр, над блоком дня
+            # 17. Каталог по кнопке — те же функции, что у дней 16-17; сводка
+            # сторожа — `faq_changes` кнопкой; оба — вне `_view()` (свои
+            # выходы `WATCH_MCP_OUTPUTS`, `WATCH_DIGEST_OUTPUTS`). Вызовы
+            # агента последнего хода переехали сюда из блока дня 17 — те же
+            # компоненты и выходы `_view()`, другой аккордеон.
+            with gr.Accordion("Сторож FAQ (день 18)", open=True):
+                gr.Markdown(_mcp_server_md(
+                    FAQ_WATCH, WATCH_LAUNCH, WATCH_AGENT_LINE,
+                    source_label="категория FAQ на сайте издателя",
+                    server_line=(
+                        "Сервер — `src/faq_watch.py` этого репозитория: SDK mcp "
+                        "v2 (`MCPServer`), планировщик снимков в `lifespan`, "
+                        "SQLite; сайт читает только планировщик, два инструмента "
+                        "отвечают из базы. Сводку каждого снимка сервер сам "
+                        "пишет в свой терминал."
+                    ),
+                    db=FAQ_WATCH_DB,
+                ))
+                watch_list_btn = gr.Button(
+                    "🔌 Подключиться и получить список инструментов",
+                    variant="primary",
+                )
+                watch_status_md = gr.Markdown(MCP_STATUS_INITIAL)
+                watch_tools_table = gr.Dataframe(
+                    value=_mcp_tools_table(None, True),
+                    label="Инструменты сервера — в порядке ответа tools/list",
+                    datatype=["number", "markdown", "str", "markdown"],
+                    column_widths=["7%", "20%", "38%", "35%"],
+                    max_height=360,
+                    wrap=True,
+                )
+                with gr.Accordion("Ответ tools/list целиком (JSON)", open=False):
+                    watch_pages_json = gr.JSON(
+                        value=[],
+                        label="Страницы ответа, как пришли от сервера",
+                        max_height=420,
+                    )
+                # Сводка сторожа — дословно то, что получила бы модель.
+                # Управления расписанием в панели нет: его меняет инструмент
+                # (из чата через агента) или аргумент запуска сервера.
+                with gr.Row():
+                    watch_days_input = gr.Number(
+                        value=WATCH_DAYS_DEFAULT,
+                        minimum=1,
+                        maximum=365,
+                        precision=0,
+                        label="Дней",
+                        scale=1,
+                    )
+                    watch_digest_btn = gr.Button(
+                        "📰 Сводка сторожа за N дней", variant="primary", scale=3,
+                    )
+                watch_digest_status_md = gr.Markdown(WATCH_DIGEST_INITIAL)
+                watch_digest_md = gr.Markdown("")
+                gr.Markdown("#### Инструменты последнего хода агента (все серверы)")
+                tools_md = gr.Markdown("")
+                with gr.Accordion(
+                    "Результаты инструментов последнего хода (JSON)", open=False
+                ):
+                    tools_json = gr.JSON(
+                        value=[],
+                        label="Что ушло модели сообщениями tool",
+                        max_height=420,
+                    )
+            # Свой сервер FAQ (день 17, §8.3) — с дня 18 свёрнут. Каталог по
+            # кнопке — те же компоненты и функции, что у дня 16, вне `_view()`
+            # (свои выходы `FAQ_MCP_OUTPUTS`).
+            with gr.Accordion("MCP: свой сервер FAQ (день 17)", open=False):
                 gr.Markdown(_mcp_server_md(
                     FAQ_MCP, FAQ_LAUNCH, FAQ_AGENT_LINE,
                     source_label="категория FAQ на сайте издателя",
@@ -4805,16 +5041,6 @@ with gr.Blocks(title="TooManyRules") as demo:
                     faq_pages_json = gr.JSON(
                         value=[],
                         label="Страницы ответа, как пришли от сервера",
-                        max_height=420,
-                    )
-                gr.Markdown("#### Инструменты последнего хода")
-                tools_md = gr.Markdown("")
-                with gr.Accordion(
-                    "Результаты инструментов последнего хода (JSON)", open=False
-                ):
-                    tools_json = gr.JSON(
-                        value=[],
-                        label="Что ушло модели сообщениями tool",
                         max_height=420,
                     )
             # MCP BoardGameGeek (день 16, §5.1) — с дня 17 свёрнут. Не входит
@@ -5113,6 +5339,14 @@ with gr.Blocks(title="TooManyRules") as demo:
     # агента; каталог хода агент запрашивает сам.
     FAQ_MCP_OUTPUTS = [faq_status_md, faq_tools_table, faq_pages_json]
     faq_list_btn.click(on_faq_list, inputs=None, outputs=FAQ_MCP_OUTPUTS)
+    # Сторож FAQ (день 18, §7.3) — тем же правилом: каталог и сводка вне
+    # `_view()`, обработчики без `agent_state`.
+    WATCH_MCP_OUTPUTS = [watch_status_md, watch_tools_table, watch_pages_json]
+    watch_list_btn.click(on_watch_list, inputs=None, outputs=WATCH_MCP_OUTPUTS)
+    WATCH_DIGEST_OUTPUTS = [watch_digest_status_md, watch_digest_md]
+    watch_digest_btn.click(
+        on_watch_digest, inputs=[watch_days_input], outputs=WATCH_DIGEST_OUTPUTS
+    )
 
     load_event = demo.load(
         on_load,

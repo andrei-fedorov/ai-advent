@@ -19,6 +19,13 @@
 # `tools/call`. Состояния между вызовами нет: процесс живёт одно соединение,
 # кэша страниц нет.
 #
+# С дня 18 чтение сайта вынесено в публичные функции — `read_sections()`,
+# `read_article()` и тип `Article` (спецификация дня 18, §4): их берёт сторож
+# FAQ `faq_watch.py`, отдельная программа, которая импортирует этот файл.
+# Ребро между двумя серверами лежит вне графа приложения; сам этот файл
+# по-прежнему не импортирует ничего из проекта. Ответы `faq_questions` и
+# `faq_article` не изменились.
+#
 # SDK — вторая мажорная версия: `MCPServer` (в v1 он назывался `FastMCP`;
 # `from mcp.server.fastmcp import FastMCP` в v2 падает с сообщением о
 # миграции). Примеры v1 сюда не переносить.
@@ -79,6 +86,10 @@ ARTICLE_TITLE = ("h2", "")                               # последний h2
 ARTICLE_BODY = ("article", "#article-body")              # тело статьи
 BREADCRUMBS = ("div", "breadcrumbs")                     # хлебные крошки статьи
 BREADCRUMB_LINK = ("a", "breadcrumbs-btn")               # категория и раздел статьи
+# Дата изменения статьи (день 18, §4): «Modified on: Tue, 13 Nov, 2018 at
+# 8:35 AM» — есть только на странице статьи. Её отсутствие — не ошибка:
+# `faq_article` дату не показывает, сторож без неё пишет пустую строку.
+ARTICLE_MODIFIED = ("div", "date-highlight")
 
 # Теги, у которых нет закрывающего: в дерево не проталкиваются.
 VOID_TAGS = frozenset({
@@ -281,6 +292,17 @@ class Section:
     articles: list[tuple[str, str]] = field(default_factory=list)  # (номер, вопрос)
 
 
+@dataclass(frozen=True)
+class Article:
+    """Статья, прочитанная со своей страницы (день 18, §4)."""
+    id: str
+    question: str
+    section: str                                   # раздел по хлебным крошкам; "" — не найден
+    url: str                                       # каноническая ссылка, без хвоста после номера
+    modified: str                                  # «Modified on: …», пробелы схлопнуты; "" — блока нет
+    text: str                                      # ответ издателя — `body_text()`
+
+
 @dataclass
 class Config:
     base_url: str
@@ -429,21 +451,32 @@ def _in_sections(count: int) -> str:
     return f"в {count} {'разделе' if count % 10 == 1 and count % 100 != 11 else 'разделах'}"
 
 
+async def read_sections(
+    site: Site, config: Config, section_filter: str = ""
+) -> tuple[list[Section], list[Section]]:
+    """Все разделы категории и выбранные фильтром (день 18, §4); выбранные
+    дочитаны по страницам. Имя категории сверяется с ожидаемым. Сбой сайта и
+    разметки — `ToolError`."""
+    path = CATEGORY_PATH.format(id=config.category)
+    sections = _category_sections(await site.get(path), config, path)
+    wanted = section_filter.strip().lower()
+    chosen = [s for s in sections if wanted in s.name.lower()] if wanted else sections
+    # Дочитываются только разделы, прошедшие фильтр, и только те, где
+    # страница категории показала меньше объявленного. Параллельно, с
+    # потолком одновременных запросов; порядок разделов при этом не
+    # меняется — список `chosen` тот же.
+    await asyncio.gather(*(
+        _read_folder(site, s) for s in chosen if len(s.articles) < s.declared
+    ))
+    return sections, chosen
+
+
 async def questions(config: Config, section_filter: str) -> tuple[str, str]:
     """Ответ `faq_questions` и строка для лога."""
-    path = CATEGORY_PATH.format(id=config.category)
     async with Site(config) as site:
-        sections = _category_sections(await site.get(path), config, path)
-        wanted = section_filter.strip().lower()
-        chosen = [s for s in sections if wanted in s.name.lower()] if wanted else sections
-        # Дочитываются только разделы, прошедшие фильтр, и только те, где
-        # страница категории показала меньше объявленного. Параллельно, с
-        # потолком одновременных запросов; порядок разделов при этом не
-        # меняется — список `chosen` тот же.
-        await asyncio.gather(*(
-            _read_folder(site, s) for s in chosen if len(s.articles) < s.declared
-        ))
+        sections, chosen = await read_sections(site, config, section_filter)
         requests = site.requests
+    wanted = section_filter.strip().lower()
 
     total = sum(len(s.articles) for s in chosen)
     header = f"FAQ «{config.category_name}» ({config.category_url})"
@@ -486,13 +519,14 @@ async def questions(config: Config, section_filter: str) -> tuple[str, str]:
 
 # --- faq_article -----------------------------------------------------------
 
-async def article(config: Config, article_id: int) -> tuple[str, str]:
-    """Ответ `faq_article` и строка для лога."""
+async def read_article(site: Site, config: Config, article_id: int | str) -> Article:
+    """Статья со своей страницы (день 18, §4): проверка категории по хлебным
+    крошкам, вопрос, раздел, дата изменения и текст. `Site` — параметром:
+    сторож читает все статьи снимка одним клиентом httpx. Сбой — `ToolError`."""
     path = ARTICLE_PATH.format(id=article_id)
-    async with Site(config) as site:
-        page = await site.get(
-            path, not_found=f"статьи {article_id} в FAQ нет (сайт ответил 404)"
-        )
+    page = await site.get(
+        path, not_found=f"статьи {article_id} в FAQ нет (сайт ответил 404)"
+    )
 
     crumbs = page.find(BREADCRUMBS)
     links = crumbs.find_all(BREADCRUMB_LINK) if crumbs is not None else []
@@ -522,13 +556,29 @@ async def article(config: Config, article_id: int) -> tuple[str, str]:
         raise _not_parsed(ARTICLE_BODY, path)
     if title is None:
         raise _not_parsed(ARTICLE_TITLE, path)
+    modified = page.find(ARTICLE_MODIFIED)
+
+    return Article(
+        id=str(article_id),
+        question=title.text(),
+        section=folder.text() if folder is not None else "",
+        url=f"{config.base_url}{path}",
+        modified=modified.text() if modified is not None else "",
+        text=body_text(body),
+    )
+
+
+async def article(config: Config, article_id: int) -> tuple[str, str]:
+    """Ответ `faq_article` и строка для лога."""
+    async with Site(config) as site:
+        found = await read_article(site, config, article_id)
 
     text = "\n".join([
-        f"Вопрос: {title.text()}",
-        f"Раздел: {folder.text() if folder is not None else '—'}",
-        f"Ссылка: {config.base_url}{path}",
+        f"Вопрос: {found.question}",
+        f"Раздел: {found.section or '—'}",
+        f"Ссылка: {found.url}",
         "Ответ издателя:",
-        body_text(body) or "(текст статьи пуст)",
+        found.text or "(текст статьи пуст)",
     ])
     return text, f"{len(text)} символов"
 

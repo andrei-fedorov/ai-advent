@@ -1,0 +1,1097 @@
+# TooManyRules — сторож FAQ: свой долгоживущий MCP-сервер по Streamable HTTP
+# (день 18, неделя 4).
+#
+# **Отдельная программа, а не модуль приложения** (спецификация дня 18, §3.1),
+# как `faq_server.py`, но запускает её не `mcp_client`, а человек:
+# `./run.sh faq-watch` (командная строка — `presets.FAQ_WATCH_ARGV`).
+# Приложение её не импортирует, в графе зависимостей приложения её нет. Сама
+# она импортирует `faq_server.py` — чтение сайта и разбор страниц; это ребро
+# между двумя серверами, вне графа приложения. Серверную часть SDK `mcp`
+# импортируют две программы — `faq_server.py` и эта; клиентскую — только
+# `mcp_client.py`.
+#
+# Что делает (§2.1):
+# 1. по расписанию (по умолчанию раз в сутки) снимает FAQ целиком — список
+#    вопросов и тексты всех статей — и сохраняет снимок в SQLite;
+# 2. сравнивает снимок с прошлым удачным и после каждого снимка сам пишет
+#    сводку в свой терминал (stderr) и события в базу;
+# 3. по вызову `faq_changes` отдаёт агрегированную сводку за период — из базы,
+#    без запросов к сайту;
+# 4. по вызову `faq_watch_schedule` меняет расписание: ответ сразу, снимок по
+#    новому расписанию — потом, в фоне.
+#
+# Сервер знает портал Freshdesk, но не конкретную игру: адрес портала, id
+# категории, её имя и путь к базе приходят аргументами командной строки.
+#
+# Процесс живёт долго и держит своё состояние — базу и расписание; подключения
+# клиента при этом короткие (одно на вызов), поэтому `stateless_http=True`:
+# сессий Streamable HTTP сервер не держит. Планировщик — одна фоновая задача в
+# `lifespan` сервера: в SDK v2 для Streamable HTTP lifespan входит один раз на
+# процесс, а не на подключение (§2.9).
+#
+# Единственное место работы с базой сторожа (`sqlite3` из стандартной
+# библиотеки). Правило «диск трогает только `storage.py`» — про приложение, а
+# это отдельная программа со своими данными; база — данные сервера, приложение
+# её не открывает.
+#
+# Логи — только stderr, с префиксом `[FAQ-сторож]`. Строк на каждый запрос к
+# сайту нет: логгер `faq_server` здесь не настроен, и его INFO не выходит.
+
+import argparse
+import asyncio
+import difflib
+import hashlib
+import json
+import logging
+import socket
+import sqlite3
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, closing, contextmanager
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Annotated
+
+import anyio
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field
+
+from faq_server import ARTICLE_PATH, Article, Config, Site, read_article, read_sections
+
+SERVER_NAME = "toomanyrules-faq-watch"
+SERVER_VERSION = "1.0.0"
+
+# --- Сеть ------------------------------------------------------------------
+# Адрес — только 127.0.0.1, аргумента хоста нет (§15): наружу сервер не
+# открывается. Путь `/mcp` — по умолчанию SDK.
+HOST = "127.0.0.1"
+DEFAULT_PORT = 8765
+
+# --- Расписание (§2.4) -----------------------------------------------------
+# Нижняя граница — вежливость к чужому сайту: полный снимок — 89 запросов.
+DEFAULT_INTERVAL_MIN = 1440
+MIN_INTERVAL_MIN = 5
+MAX_INTERVAL_MIN = 10080
+# После неудачной попытки — повтор через `min(интервал, RETRY_MIN)`.
+RETRY_MIN = 15
+# Планировщик спит не дольше этого и каждый раз заново сверяет стенные часы
+# со сроком: на ноутбуке, который засыпал, монотонные часы во сне стоят.
+SCHEDULER_TICK_S = 60
+
+# --- Сводка (§3.6) ---------------------------------------------------------
+DAYS_DEFAULT = 7
+DAYS_MAX = 365
+DIFF_MAX_LINES = 12          # строк разницы текста на статью
+DIFF_LINE_MAX_CHARS = 200    # строка разницы — абзац статьи; длиннее — с «…»
+CHANGES_MAX_ITEMS = 40       # статей в каждой части сводки
+
+TIME_FORMAT = "%d.%m.%Y %H:%M"
+DATE_FORMAT = "%d.%m.%Y"
+
+# Дата изменения на странице статьи (§2.9): «Modified on: Tue, 13 Nov, 2018 at
+# 8:35 AM» — пробелы уже схлопнуты `faq_server`. Часовой пояс портала на
+# странице не указан — разобранное время хранится без пояса.
+MODIFIED_PREFIX = "Modified on:"
+MODIFIED_FORMAT = "%a, %d %b, %Y at %I:%M %p"
+
+# Хеш текста ответа — первые 16 шестнадцатеричных знаков sha256 (§3.5).
+HASH_CHARS = 16
+
+# Виды событий сравнения (§2.5).
+KIND_NEW = "новая"
+KIND_CHANGED = "изменена"
+KIND_MOVED = "перенесена"
+KIND_DELETED = "удалена"
+KINDS = (KIND_NEW, KIND_CHANGED, KIND_MOVED, KIND_DELETED)
+
+# Откуда взялся интервал — для строки старта.
+ORIGIN_DB = "из базы"
+ORIGIN_DEFAULT = "по умолчанию"
+ORIGIN_ARG = "из --interval"
+
+# --- База (§3.9) -----------------------------------------------------------
+# Версия схемы — `PRAGMA user_version`. 0 у пустой базы: схема создаётся; своя
+# версия — работаем; любая другая — чужая база, сервер не стартует.
+SCHEMA_VERSION = 1
+SCHEMA = (
+    """CREATE TABLE runs (
+        id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
+        ok INTEGER NOT NULL, error TEXT NOT NULL DEFAULT '', articles INTEGER NOT NULL DEFAULT 0,
+        requests INTEGER NOT NULL DEFAULT 0, elapsed_s REAL NOT NULL)""",
+    "CREATE TABLE texts (hash TEXT PRIMARY KEY, text TEXT NOT NULL)",
+    """CREATE TABLE articles (
+        run_id INTEGER NOT NULL REFERENCES runs(id), article_id TEXT NOT NULL,
+        section TEXT NOT NULL, question TEXT NOT NULL, modified_raw TEXT NOT NULL,
+        modified_at TEXT, text_hash TEXT NOT NULL REFERENCES texts(hash), chars INTEGER NOT NULL,
+        PRIMARY KEY (run_id, article_id))""",
+    """CREATE TABLE changes (
+        run_id INTEGER NOT NULL REFERENCES runs(id), article_id TEXT NOT NULL,
+        kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')""",
+    "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+)
+SETTING_INTERVAL = "interval_minutes"
+
+# --- Описания инструментов (§3.7) ------------------------------------------
+# Описание инструмента и есть промпт (правило дня 17). Черновик спецификации;
+# каждое изменение по сбою живого прогона — строкой в комментарии у константы.
+CHANGES_DESCRIPTION = (
+    "Сводка изменений официального FAQ издателя по игре {name} за последние дни: что сторож "
+    "FAQ заметил, сравнивая снимки, которые он делает по расписанию (новые, изменённые, "
+    "перенесённые и удалённые статьи), какие статьи по датам сайта изменены за период, и "
+    "состояние самого сторожа. Вызывай, когда игрок спрашивает, что нового или что "
+    "изменилось в FAQ, в разъяснениях или эррате издателя. Для вопросов о самих правилах — "
+    "faq_questions и faq_article. Отвечая, перескажи по-русски и дай ссылки на статьи."
+)
+DAYS_DESCRIPTION = "За сколько последних дней: от 1 до 365. «За месяц» — 30, «за неделю» — 7."
+SCHEDULE_DESCRIPTION = (
+    "Меняет, как часто сторож проверяет FAQ по игре {name}: интервал в минутах, от 5 до "
+    "10080 (неделя). Сохраняется и после перезапуска сервера. Вызывай только по прямой "
+    "просьбе игрока изменить частоту проверок — не для того, чтобы узнать новости FAQ."
+)
+INTERVAL_DESCRIPTION = "Интервал между проверками в минутах: 60 — раз в час, 1440 — раз в сутки."
+
+# Аннотации честные (§3.3): мир закрытый — инструменты работают с базой, а не
+# с сайтом. Сводка только читает; расписание пишет, но не разрушает, и повтор
+# с тем же значением ничего не меняет.
+CHANGES_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=True,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+SCHEDULE_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
+logger = logging.getLogger("toomanyrules.faq_watch")
+
+# Корень репозитория — только для показа путей в логах: структура папок
+# автора не должна попадать в видео.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+# --- Мелочи ----------------------------------------------------------------
+
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    if 11 <= count % 100 <= 14:
+        return many
+    match count % 10:
+        case 1:
+            return one
+        case 2 | 3 | 4:
+            return few
+        case _:
+            return many
+
+
+def _count(count: int, one: str, few: str, many: str) -> str:
+    return f"{count} {_plural(count, one, few, many)}"
+
+
+def _articles_word(count: int) -> str:
+    return _count(count, "статья", "статьи", "статей")
+
+
+def _events_word(count: int) -> str:
+    return _count(count, "событие", "события", "событий")
+
+
+def _requests_word(count: int) -> str:
+    return _count(count, "запрос", "запроса", "запросов")
+
+
+def _now() -> datetime:
+    """Стенные часы с часовым поясом машины, до секунд (§3.9)."""
+    return datetime.now().astimezone().replace(microsecond=0)
+
+
+def _iso(moment: datetime) -> str:
+    return moment.isoformat(timespec="seconds")
+
+
+def _fmt(moment: datetime) -> str:
+    return moment.astimezone().strftime(TIME_FORMAT)
+
+
+def display_path(path: Path) -> str:
+    """Путь для логов: внутри репозитория — относительный, в домашнем
+    каталоге — через `~`."""
+    resolved = path.resolve()
+    for base, prefix in ((_REPO_ROOT, ""), (Path.home(), "~/")):
+        try:
+            return prefix + str(resolved.relative_to(base))
+        except ValueError:
+            continue
+    return str(resolved)
+
+
+def parse_modified(raw: str) -> datetime | None:
+    """«Modified on: Tue, 13 Nov, 2018 at 8:35 AM» → время без пояса; не
+    разобралось — `None` (это не сбой снимка, а предупреждение в сводке)."""
+    text = " ".join(raw.split())
+    if text.startswith(MODIFIED_PREFIX):
+        text = text[len(MODIFIED_PREFIX):].strip()
+    try:
+        return datetime.strptime(text, MODIFIED_FORMAT)
+    except ValueError:
+        return None
+
+
+def text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:HASH_CHARS]
+
+
+def next_due(
+    last_ok: datetime | None, failed_after: datetime | None, interval_min: int, now: datetime
+) -> datetime:
+    """Срок следующего снимка — чистая функция над историей попыток (§2.4).
+
+    `last_ok` — начало последнего удачного снимка; `failed_after` — начало
+    последней неудачной попытки, если она была после него (или удачных нет
+    вовсе). Срок уже прошёл — вызывающий снимает сразу. Неудача без удачных
+    снимков тоже ждёт повтора, а не идёт сразу: иначе недоступный сайт
+    опрашивался бы без передышки.
+    """
+    if failed_after is not None:
+        return failed_after + timedelta(minutes=min(interval_min, RETRY_MIN))
+    if last_ok is None:
+        return now
+    return last_ok + timedelta(minutes=interval_min)
+
+
+# --- База ------------------------------------------------------------------
+
+class DbError(Exception):
+    """База чужая или битая — сервер не стартует и ничего в неё не пишет."""
+
+
+def check_db(path: Path) -> int:
+    """Версия схемы существующей базы; 0 — нового пути или пустого файла.
+    Только чтение (`mode=ro`): отказ не должен оставить следов в файле."""
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    try:
+        uri = path.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            tables = conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
+    except sqlite3.Error as exc:
+        raise DbError(f"файл не открывается как база SQLite: {exc}") from exc
+    if version == 0 and tables:
+        raise DbError("версия схемы 0, но в базе уже есть таблицы — это не база сторожа")
+    if version not in (0, SCHEMA_VERSION):
+        raise DbError(f"версия схемы {version}, сервер знает только {SCHEMA_VERSION}")
+    return version
+
+
+def _connect(path: Path) -> sqlite3.Connection:
+    # Автокоммит на уровне драйвера: транзакции открываются явно
+    # (`_transaction`), чтобы запись снимка была ровно одной транзакцией.
+    conn = sqlite3.connect(path, isolation_level=None, timeout=5)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextmanager
+def _transaction(conn: sqlite3.Connection) -> Iterator[None]:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+def init_db(path: Path, version: int) -> None:
+    """Схема для новой базы (одной транзакцией, вместе с версией) и режим WAL:
+    инструменты читают, пока снимок пишет."""
+    if version == SCHEMA_VERSION:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(_connect(path)) as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
+        with _transaction(conn):
+            for statement in SCHEMA:
+                conn.execute(statement)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+@dataclass(frozen=True)
+class Run:
+    """Попытка снимка — строка `runs`."""
+    id: int
+    started_at: datetime
+    ok: bool
+    error: str
+    articles: int
+    requests: int
+    elapsed_s: float
+
+
+def _run(row: sqlite3.Row) -> Run:
+    return Run(
+        id=row["id"],
+        started_at=datetime.fromisoformat(row["started_at"]),
+        ok=bool(row["ok"]),
+        error=row["error"],
+        articles=row["articles"],
+        requests=row["requests"],
+        elapsed_s=row["elapsed_s"],
+    )
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """Статья снимка — то, что нужно для сравнения (§2.5)."""
+    article_id: str
+    section: str
+    question: str
+    modified_raw: str
+    modified_at: datetime | None
+    hash: str
+    chars: int
+
+
+def _snapshot_rows(conn: sqlite3.Connection, run_id: int) -> dict[str, Snapshot]:
+    rows = conn.execute(
+        "SELECT article_id, section, question, modified_raw, modified_at, text_hash, chars "
+        "FROM articles WHERE run_id = ? ORDER BY rowid",
+        (run_id,),
+    )
+    return {
+        row["article_id"]: Snapshot(
+            article_id=row["article_id"],
+            section=row["section"],
+            question=row["question"],
+            modified_raw=row["modified_raw"],
+            modified_at=datetime.fromisoformat(row["modified_at"]) if row["modified_at"] else None,
+            hash=row["text_hash"],
+            chars=row["chars"],
+        )
+        for row in rows
+    }
+
+
+# --- Сравнение (§2.5) ------------------------------------------------------
+
+@dataclass(frozen=True)
+class Event:
+    article_id: str
+    kind: str
+    before: Snapshot | None
+    after: Snapshot | None
+
+    def detail(self) -> str:
+        """JSON для `changes.detail`: вопрос, раздел, хеш и длина было/стало.
+        Разницу строк сводка строит на лету по двум текстам из `texts`."""
+        def side(snap: Snapshot | None) -> dict | None:
+            if snap is None:
+                return None
+            return {
+                "section": snap.section,
+                "question": snap.question,
+                "hash": snap.hash,
+                "chars": snap.chars,
+            }
+        return json.dumps(
+            {"before": side(self.before), "after": side(self.after)}, ensure_ascii=False
+        )
+
+
+def compare(previous: dict[str, Snapshot], current: dict[str, Snapshot]) -> list[Event]:
+    """События нового снимка относительно прошлого удачного — в порядке
+    нового снимка, удалённые — в конце, в порядке прошлого. Одна смена даты
+    «Modified on» событием не считается: игроку она ничего не говорит."""
+    events: list[Event] = []
+    for article_id, after in current.items():
+        before = previous.get(article_id)
+        if before is None:
+            events.append(Event(article_id, KIND_NEW, None, after))
+            continue
+        if before.section != after.section:
+            events.append(Event(article_id, KIND_MOVED, before, after))
+        if before.question != after.question or before.hash != after.hash:
+            events.append(Event(article_id, KIND_CHANGED, before, after))
+    for article_id, before in previous.items():
+        if article_id not in current:
+            events.append(Event(article_id, KIND_DELETED, before, None))
+    return events
+
+
+def _event_from_row(row: sqlite3.Row) -> Event:
+    detail = json.loads(row["detail"] or "{}")
+
+    def side(data: dict | None) -> Snapshot | None:
+        if not data:
+            return None
+        return Snapshot(
+            article_id=row["article_id"], section=data.get("section", ""),
+            question=data.get("question", ""), modified_raw="", modified_at=None,
+            hash=data.get("hash", ""), chars=data.get("chars", 0),
+        )
+
+    return Event(row["article_id"], row["kind"], side(detail.get("before")), side(detail.get("after")))
+
+
+def _event_brief(event: Event) -> str:
+    """Событие одной строкой — для сводки снимка в терминале."""
+    snap = event.after or event.before
+    head = f"{event.kind} · {event.article_id} · {snap.section}"
+    if event.kind == KIND_MOVED:
+        return f"{head} · раздел: было {event.before.section}"
+    if event.kind == KIND_CHANGED:
+        parts = []
+        if event.before.question != event.after.question:
+            parts.append("вопрос изменён")
+        if event.before.hash != event.after.hash:
+            parts.append(f"текст {event.before.chars} → {event.after.chars} симв.")
+        return f"{head} · {' · '.join(parts)}"
+    return f"{head} · {snap.question}"
+
+
+def _clip(line: str) -> str:
+    if len(line) <= DIFF_LINE_MAX_CHARS:
+        return line
+    return line[:DIFF_LINE_MAX_CHARS].rstrip() + " …"
+
+
+def text_diff(old: str, new: str) -> list[str]:
+    """Строки разницы без контекста, не больше `DIFF_MAX_LINES`."""
+    lines = [
+        line for line in difflib.unified_diff(
+            old.splitlines(), new.splitlines(), lineterm="", n=0
+        )
+        if line[:1] in "+-" and not line.startswith(("---", "+++"))
+    ]
+    shown = [_clip(f"{line[0]} {line[1:].strip()}") for line in lines[:DIFF_MAX_LINES]]
+    if len(lines) > DIFF_MAX_LINES:
+        shown.append(f"… и ещё {len(lines) - DIFF_MAX_LINES} строк")
+    return shown
+
+
+# --- Сторож ----------------------------------------------------------------
+
+class SnapshotError(Exception):
+    """Снимок неполный — попытка неудачная, со статьями не записывается."""
+
+
+@dataclass
+class Running:
+    number: int
+    started_at: datetime
+
+
+class Watch:
+    """Состояние процесса сторожа: где база, какой интервал, идёт ли снимок и
+    как разбудить планировщик. Один на процесс; снимки делает только
+    планировщик, инструменты читают базу и меняют интервал."""
+
+    def __init__(self, config: Config, db: Path) -> None:
+        self.config = config
+        self.db = db
+        self.interval = DEFAULT_INTERVAL_MIN
+        self.interval_origin = ORIGIN_DEFAULT
+        self.running: Running | None = None
+        # Событие создаётся в цикле событий — при старте планировщика.
+        self.wake: anyio.Event | None = None
+
+    # --- расписание ---
+
+    def load_interval(self, from_arg: int | None) -> None:
+        """Кто задал интервал последним, тот и прав (§2.4): явный `--interval`
+        перекрывает сохранённый и сохраняется сам; без него — из базы или
+        умолчание."""
+        if from_arg is not None:
+            self.save_interval(from_arg)
+            self.interval_origin = ORIGIN_ARG
+            return
+        with closing(_connect(self.db)) as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (SETTING_INTERVAL,)
+            ).fetchone()
+        if row is not None and str(row["value"]).isdigit():
+            value = int(row["value"])
+            if MIN_INTERVAL_MIN <= value <= MAX_INTERVAL_MIN:
+                self.interval, self.interval_origin = value, ORIGIN_DB
+                return
+            logger.warning(
+                "интервал в базе вне %d-%d мин: %s — действует умолчание",
+                MIN_INTERVAL_MIN, MAX_INTERVAL_MIN, row["value"],
+            )
+        self.interval, self.interval_origin = DEFAULT_INTERVAL_MIN, ORIGIN_DEFAULT
+
+    def save_interval(self, minutes: int) -> None:
+        with closing(_connect(self.db)) as conn, _transaction(conn):
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (SETTING_INTERVAL, str(minutes)),
+            )
+        self.interval = minutes
+
+    def attempts(self, conn: sqlite3.Connection) -> tuple[Run | None, Run | None]:
+        """Последний удачный снимок и неудачная попытка после него (если
+        последняя попытка — неудачная)."""
+        last_ok = conn.execute("SELECT * FROM runs WHERE ok = 1 ORDER BY id DESC LIMIT 1").fetchone()
+        last = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+        ok_run = _run(last_ok) if last_ok is not None else None
+        failed = _run(last) if last is not None and not last["ok"] else None
+        return ok_run, failed
+
+    def next_due(self, conn: sqlite3.Connection | None = None) -> datetime:
+        if conn is None:
+            with closing(_connect(self.db)) as own:
+                return self.next_due(own)
+        ok_run, failed = self.attempts(conn)
+        return next_due(
+            ok_run.started_at if ok_run else None,
+            failed.started_at if failed else None,
+            self.interval,
+            _now(),
+        )
+
+    def _due_text(self, due: datetime) -> str:
+        if self.running is not None:
+            return f"идёт сейчас (снимок #{self.running.number}, начат {_fmt(self.running.started_at)})"
+        if due <= _now():
+            return "сейчас — срок уже прошёл"
+        return _fmt(due)
+
+    # --- планировщик (§3.4) ---
+
+    async def scheduler(self) -> None:
+        """Один цикл: снимки не перекрываются, срок — из базы по стенным
+        часам, смена интервала будит цикл раньше конца сна."""
+        self.wake = anyio.Event()
+        while True:
+            try:
+                due = self.next_due()
+                while _now() < due and not self.wake.is_set():
+                    wait_s = min(SCHEDULER_TICK_S, max(0.0, (due - _now()).total_seconds()))
+                    with anyio.move_on_after(wait_s):
+                        await self.wake.wait()
+                self.wake = anyio.Event()
+                # Интервал мог смениться за время сна — пересчитать срок.
+                due = self.next_due()
+                if _now() >= due:
+                    await self.snapshot(due)
+            except Exception:
+                # Сторож не падает от одной ошибки: трассировка — в stderr,
+                # следующая попытка — через шаг проверки часов.
+                logger.exception(
+                    "планировщик: ошибка в коде сервера — повтор через %d с", SCHEDULER_TICK_S
+                )
+                await anyio.sleep(SCHEDULER_TICK_S)
+
+    # --- снимок (§3.5) ---
+
+    async def _read_site(self, site: Site) -> tuple[dict[str, Snapshot], dict[str, str], list[str]]:
+        """Все статьи категории: снимок, тексты по хешу и предупреждения."""
+        sections, _ = await read_sections(site, self.config)
+        incomplete = [s for s in sections if len(s.articles) != s.declared]
+        if incomplete:
+            raise SnapshotError("неполный снимок: " + "; ".join(
+                f"раздел {s.name} — на сайте {s.declared}, прочитано {len(s.articles)}"
+                for s in incomplete
+            ))
+        warnings: list[str] = []
+        listed: dict[str, tuple[str, str]] = {}
+        for section in sections:
+            for article_id, question in section.articles:
+                if article_id in listed:
+                    warnings.append(
+                        f"статья {article_id} в двух разделах: {listed[article_id][0]} и "
+                        f"{section.name} — взят первый"
+                    )
+                    continue
+                listed[article_id] = (section.name, question)
+
+        found: dict[str, Article] = {}
+
+        async def one(article_id: str) -> None:
+            found[article_id] = await read_article(site, self.config, article_id)
+
+        # Параллельно в пределах того же `Site`: потолок одновременных
+        # запросов и счётчик — дня 17. Сбой одной статьи отменяет остальные.
+        try:
+            async with asyncio.TaskGroup() as group:
+                for article_id in listed:
+                    group.create_task(one(article_id))
+        except ExceptionGroup as errors:
+            first = errors.exceptions[0]
+            while isinstance(first, ExceptionGroup):
+                first = first.exceptions[0]
+            raise first from None
+
+        snapshot: dict[str, Snapshot] = {}
+        texts: dict[str, str] = {}
+        for article_id, (section, question) in listed.items():
+            article = found[article_id]
+            modified_at = parse_modified(article.modified)
+            if modified_at is None:
+                warnings.append(
+                    f"дата изменения не разобрана: {article_id} — "
+                    f"«{article.modified or 'блока даты на странице нет'}»"
+                )
+            digest = text_hash(article.text)
+            texts[digest] = article.text
+            # Номер, раздел и вопрос — из списка, дата и текст — со страницы.
+            snapshot[article_id] = Snapshot(
+                article_id=article_id,
+                section=section,
+                question=question,
+                modified_raw=article.modified,
+                modified_at=modified_at,
+                hash=digest,
+                chars=len(article.text),
+            )
+        return snapshot, texts, warnings
+
+    def _next_number(self) -> int:
+        with closing(_connect(self.db)) as conn:
+            return (conn.execute("SELECT max(id) FROM runs").fetchone()[0] or 0) + 1
+
+    async def snapshot(self, due: datetime) -> None:
+        """Одна попытка снимка. Исключений наружу не выпускает, кроме отмены:
+        любая неудача — строка `runs` с `ok=0` и причиной."""
+        number = self._next_number()
+        started_at = _now()
+        started = time.perf_counter()
+        self.running = Running(number, started_at)
+        logger.info(
+            "снимок #%d: начат (срок %s, раз в %d мин)", number, _fmt(due), self.interval
+        )
+        site = Site(self.config)
+        reason = ""
+        result = None
+        try:
+            async with site:
+                result = await self._read_site(site)
+        except anyio.get_cancelled_exc_class():
+            logger.info(
+                "снимок #%d: прерван остановкой сервера через %.1f с — в базу не попал",
+                number, time.perf_counter() - started,
+            )
+            raise
+        except (ToolError, SnapshotError) as exc:
+            reason = str(exc)
+        except Exception as exc:
+            logger.exception("снимок #%d: ошибка в коде сервера", number)
+            reason = f"ошибка в коде сервера: {type(exc).__name__}: {exc}"
+        finally:
+            self.running = None
+        elapsed = time.perf_counter() - started
+        finished_at = _now()
+
+        with closing(_connect(self.db)) as conn:
+            if reason:
+                with _transaction(conn):
+                    conn.execute(
+                        "INSERT INTO runs (id, started_at, finished_at, ok, error, requests, elapsed_s) "
+                        "VALUES (?, ?, ?, 0, ?, ?, ?)",
+                        (number, _iso(started_at), _iso(finished_at), reason, site.requests, elapsed),
+                    )
+                logger.warning(
+                    "снимок #%d: сбой через %.1f с — %s; повтор %s",
+                    number, elapsed, reason, _fmt(self.next_due(conn)),
+                )
+                return
+
+            snapshot, texts, warnings = result
+            previous_run, _ = self.attempts(conn)
+            # Одна транзакция (§3.5): попытка, статьи, новые тексты и события.
+            # До её конца в базе от снимка нет ничего.
+            with _transaction(conn):
+                previous = _snapshot_rows(conn, previous_run.id) if previous_run else None
+                events = compare(previous, snapshot) if previous is not None else []
+                conn.execute(
+                    "INSERT INTO runs (id, started_at, finished_at, ok, articles, requests, elapsed_s) "
+                    "VALUES (?, ?, ?, 1, ?, ?, ?)",
+                    (number, _iso(started_at), _iso(finished_at), len(snapshot), site.requests, elapsed),
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO texts (hash, text) VALUES (?, ?)", texts.items()
+                )
+                conn.executemany(
+                    "INSERT INTO articles (run_id, article_id, section, question, modified_raw, "
+                    "modified_at, text_hash, chars) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            number, snap.article_id, snap.section, snap.question, snap.modified_raw,
+                            snap.modified_at.isoformat() if snap.modified_at else None,
+                            snap.hash, snap.chars,
+                        )
+                        for snap in snapshot.values()
+                    ],
+                )
+                conn.executemany(
+                    "INSERT INTO changes (run_id, article_id, kind, detail) VALUES (?, ?, ?, ?)",
+                    [(number, event.article_id, event.kind, event.detail()) for event in events],
+                )
+            head = (
+                f"снимок #{number}: {_articles_word(len(snapshot))}, "
+                f"{_requests_word(site.requests)}, {elapsed:.1f} с"
+            )
+            if previous_run is None:
+                logger.info(
+                    "%s — первый снимок: %s, база для сравнения", head, _articles_word(len(snapshot))
+                )
+            else:
+                since = f"с #{previous_run.id} ({_fmt(previous_run.started_at)})"
+                if events:
+                    counts = {kind: sum(1 for e in events if e.kind == kind) for kind in KINDS}
+                    logger.info(
+                        "%s — %s: новых %d · изменено %d · перенесено %d · удалено %d",
+                        head, since, counts[KIND_NEW], counts[KIND_CHANGED],
+                        counts[KIND_MOVED], counts[KIND_DELETED],
+                    )
+                    for event in events:
+                        logger.info("  %s", _event_brief(event))
+                else:
+                    logger.info("%s — %s: изменений нет", head, since)
+            for warning in warnings:
+                logger.warning("  ⚠️ %s", warning)
+            logger.info("следующий снимок: %s", _fmt(self.next_due(conn)))
+
+    # --- инструменты ---
+
+    def _article_url(self, article_id: str) -> str:
+        return f"{self.config.base_url}{ARTICLE_PATH.format(id=article_id)}"
+
+    def _event_lines(self, conn: sqlite3.Connection, event: Event, at: datetime) -> list[str]:
+        snap = event.after or event.before
+        lines = [
+            f"- {event.kind} · {event.article_id} · {snap.section} · {snap.question} · "
+            f"снимок {_fmt(at)}",
+            f"  {self._article_url(event.article_id)}",
+        ]
+        if event.kind == KIND_MOVED:
+            lines.append(f"  раздел: было {event.before.section} / стало {event.after.section}")
+        elif event.kind == KIND_CHANGED:
+            if event.before.question != event.after.question:
+                lines.append(
+                    f"  вопрос: было «{event.before.question}» / стало «{event.after.question}»"
+                )
+            if event.before.hash != event.after.hash:
+                lines.append(f"  текст: {event.before.chars} → {event.after.chars} симв.")
+                old = conn.execute("SELECT text FROM texts WHERE hash = ?", (event.before.hash,)).fetchone()
+                new = conn.execute("SELECT text FROM texts WHERE hash = ?", (event.after.hash,)).fetchone()
+                if old is not None and new is not None:
+                    lines.extend(f"  {line}" for line in text_diff(old["text"], new["text"]))
+        return lines
+
+    def changes(self, days: int) -> tuple[str, str]:
+        """Ответ `faq_changes` и строка для лога (§3.6). Только база — ни
+        одного запроса к сайту."""
+        now = _now()
+        since = now - timedelta(days=days)
+        with closing(_connect(self.db)) as conn:
+            runs = [_run(row) for row in conn.execute("SELECT * FROM runs ORDER BY id")]
+            in_period = [run for run in runs if run.started_at >= since]
+            ok_runs = [run for run in runs if run.ok]
+            last_ok = ok_runs[-1] if ok_runs else None
+            first_ok = ok_runs[0] if ok_runs else None
+            due = self.next_due(conn)
+
+            lines = [
+                f"Сторож FAQ «{self.config.category_name}» ({self.config.category_url})",
+            ]
+            status = f"Расписание: раз в {self.interval} мин. Снимков за {days} дн.: {len(in_period)}"
+            failures = [run for run in in_period if not run.ok]
+            if failures:
+                last_failure = failures[-1]
+                status += (
+                    f" (удачных {len(in_period) - len(failures)}, сбоев {len(failures)} — "
+                    f"последний {_fmt(last_failure.started_at)}: {last_failure.error})."
+                )
+            elif in_period:
+                status += " (все удачные)."
+            else:
+                status += "."
+            lines.append(status)
+            if last_ok is None:
+                lines.append(
+                    f"Удачных снимков ещё нет. Следующий: {self._due_text(due)}."
+                )
+            else:
+                lines.append(
+                    f"Последний удачный снимок: {_fmt(last_ok.started_at)}, "
+                    f"{_articles_word(last_ok.articles)}. Следующий: {self._due_text(due)}. "
+                    f"Наблюдение ведётся с {_fmt(first_ok.started_at)}."
+                )
+
+            # Замечено сторожем — события удачных снимков периода, от новых к старым.
+            lines.append("")
+            events: list[tuple[Event, datetime]] = []
+            period_ok = {run.id: run.started_at for run in in_period if run.ok}
+            if period_ok:
+                rows = conn.execute(
+                    "SELECT run_id, article_id, kind, detail FROM changes WHERE run_id >= ? "
+                    "ORDER BY run_id DESC, rowid",
+                    (min(period_ok),),
+                )
+                events = [
+                    (_event_from_row(row), period_ok[row["run_id"]])
+                    for row in rows if row["run_id"] in period_ok
+                ]
+            title = f"Замечено сторожем за {days} дн. (сравнение соседних снимков)"
+            if first_ok is None:
+                lines.append(f"{title}: снимков для сравнения ещё нет.")
+            else:
+                lines.append(
+                    f"{title}: {_events_word(len(events))}." if events
+                    else f"{title}: изменений нет."
+                )
+                if first_ok.started_at > since:
+                    lines.append(
+                        f"Сторож наблюдает с {_fmt(first_ok.started_at)}, раньше этого ничего "
+                        f"не замечено."
+                    )
+                for event, at in events[:CHANGES_MAX_ITEMS]:
+                    lines.extend(self._event_lines(conn, event, at))
+                if len(events) > CHANGES_MAX_ITEMS:
+                    lines.append(f"… и ещё {len(events) - CHANGES_MAX_ITEMS}")
+
+            # По датам сайта — последний удачный снимок, граница — до суток.
+            lines.append("")
+            site_title = (
+                f"По датам сайта («Modified on», по последнему снимку; часовой пояс сайта "
+                f"неизвестен — граница периода с точностью до суток) за {days} дн."
+            )
+            dated: list[Snapshot] = []
+            unparsed = 0
+            if last_ok is None:
+                lines.append(f"{site_title}: снимков ещё нет.")
+            else:
+                first_day: date = since.date()
+                for snap in _snapshot_rows(conn, last_ok.id).values():
+                    if snap.modified_at is None:
+                        unparsed += 1
+                    elif snap.modified_at.date() >= first_day:
+                        dated.append(snap)
+                dated.sort(key=lambda snap: snap.modified_at, reverse=True)
+                lines.append(
+                    f"{site_title}: {_articles_word(len(dated))}." if dated
+                    else f"{site_title}: статей нет."
+                )
+                for snap in dated[:CHANGES_MAX_ITEMS]:
+                    lines.append(
+                        f"- {snap.modified_at.strftime(DATE_FORMAT)} · {snap.article_id} · "
+                        f"{snap.section} · {snap.question}"
+                    )
+                    lines.append(f"  {self._article_url(snap.article_id)}")
+                if len(dated) > CHANGES_MAX_ITEMS:
+                    lines.append(f"… и ещё {len(dated) - CHANGES_MAX_ITEMS}")
+                if unparsed:
+                    lines.append(f"Дат не разобрано: {unparsed}.")
+        summary = f"{_events_word(len(events))}, {len(dated)} по датам сайта"
+        return "\n".join(lines), summary
+
+    def schedule(self, minutes: int) -> tuple[str, str]:
+        """Ответ `faq_watch_schedule` и строка для лога (§3.7): интервал
+        сохраняется в базе, планировщик просыпается и пересчитывает срок."""
+        previous = self.interval
+        self.save_interval(minutes)
+        self.interval_origin = ORIGIN_DB
+        if self.wake is not None:
+            self.wake.set()
+        with closing(_connect(self.db)) as conn:
+            ok_run, _ = self.attempts(conn)
+            due = self.next_due(conn)
+        last = (
+            f"Последний удачный снимок — {_fmt(ok_run.started_at)}"
+            if ok_run else "Удачных снимков ещё нет"
+        )
+        if self.running is not None:
+            upcoming = (
+                f"снимок #{self.running.number} идёт сейчас; следующий — по новому "
+                f"расписанию после него"
+            )
+        elif due <= _now():
+            upcoming = "срок по новому расписанию уже прошёл — снимок начинается сейчас"
+        else:
+            upcoming = f"следующий — {_fmt(due)}"
+        text = f"Расписание: раз в {minutes} мин (было {previous}). {last}, {upcoming}."
+        return text, f"было {previous}; следующий снимок {self._due_text(due)}"
+
+    def start_line(self, port: int) -> str:
+        with closing(_connect(self.db)) as conn:
+            total = conn.execute("SELECT count(*) FROM runs").fetchone()[0]
+            ok_run, _ = self.attempts(conn)
+            due = self.next_due(conn)
+        last = f", последний удачный {_fmt(ok_run.started_at)}" if ok_run else ", удачных нет"
+        return (
+            f"слушаю http://{HOST}:{port}/mcp · база {display_path(self.db)} "
+            f"(снимков: {total}{last}) · раз в {self.interval} мин ({self.interval_origin}) · "
+            f"следующий снимок {'сразу' if due <= _now() else _fmt(due)}"
+        )
+
+
+# --- Сервер ----------------------------------------------------------------
+
+def build_server(watch: Watch) -> MCPServer:
+    @asynccontextmanager
+    async def scheduler_lifespan(_server: MCPServer):
+        # Вход — task group с планировщиком, выход (Ctrl+C) — её отмена.
+        # Снимок, прерванный отменой, в базу не попадает (§3.3).
+        async with anyio.create_task_group() as group:
+            group.start_soon(watch.scheduler)
+            try:
+                yield None
+            finally:
+                group.cancel_scope.cancel()
+
+    # `log_level="WARNING"` — и SDK, и uvicorn: строки INFO каждого
+    # HTTP-запроса — шум; свою строку «слушаю …» сервер пишет сам.
+    server = MCPServer(
+        name=SERVER_NAME, version=SERVER_VERSION, log_level="WARNING",
+        lifespan=scheduler_lifespan,
+    )
+    name = watch.config.category_name
+
+    @server.tool(
+        title="Сводка изменений FAQ",
+        description=CHANGES_DESCRIPTION.format(name=name),
+        annotations=CHANGES_ANNOTATIONS,
+        structured_output=False,
+    )
+    async def faq_changes(
+        days: Annotated[int, Field(ge=1, le=DAYS_MAX, description=DAYS_DESCRIPTION)] = DAYS_DEFAULT,
+    ) -> str:
+        return _logged(f"faq_changes(days={days})", lambda: watch.changes(days))
+
+    @server.tool(
+        title="Расписание сторожа FAQ",
+        description=SCHEDULE_DESCRIPTION.format(name=name),
+        annotations=SCHEDULE_ANNOTATIONS,
+        structured_output=False,
+    )
+    async def faq_watch_schedule(
+        interval_minutes: Annotated[
+            int, Field(ge=MIN_INTERVAL_MIN, le=MAX_INTERVAL_MIN, description=INTERVAL_DESCRIPTION)
+        ],
+    ) -> str:
+        return _logged(
+            f"faq_watch_schedule({interval_minutes})", lambda: watch.schedule(interval_minutes)
+        )
+
+    return server
+
+
+def _logged(call: str, work) -> str:
+    """Строка лога на вызов. Ошибка базы — `ToolError` с текстом (клиент
+    увидит `isError`); любое другое исключение — ошибка в коде, трассировку
+    пишет SDK."""
+    started = time.perf_counter()
+    try:
+        text, summary = work()
+    except sqlite3.Error as exc:
+        logger.warning("%s: отказ — база сторожа: %s", call, exc)
+        raise ToolError(f"база сторожа не читается: {type(exc).__name__}: {exc}") from exc
+    logger.info("%s: %s, %.2f с", call, summary, time.perf_counter() - started)
+    return text
+
+
+def _interval(value: str) -> int:
+    if not value.isdigit() or not MIN_INTERVAL_MIN <= int(value) <= MAX_INTERVAL_MIN:
+        raise argparse.ArgumentTypeError(
+            f"ожидается целое число минут от {MIN_INTERVAL_MIN} до {MAX_INTERVAL_MIN}, "
+            f"пришло «{value}»"
+        )
+    return int(value)
+
+
+def _args(argv: list[str] | None = None) -> tuple[Config, Path, int, int | None]:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Сторож FAQ: MCP-сервер (Streamable HTTP) с планировщиком снимков одной "
+            "категории FAQ портала Freshdesk."
+        ),
+    )
+    parser.add_argument("--base-url", required=True, help="адрес портала без завершающего /")
+    parser.add_argument("--category", required=True, help="id категории — строка цифр")
+    parser.add_argument(
+        "--category-name", required=True,
+        help="ожидаемое имя категории: сверяется с заголовком её страницы",
+    )
+    parser.add_argument("--db", required=True, help="путь к файлу базы; каталог создаётся")
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help=f"порт на {HOST}, по умолчанию {DEFAULT_PORT}",
+    )
+    parser.add_argument(
+        "--interval", type=_interval, default=None,
+        help=(
+            f"интервал снимков в минутах, {MIN_INTERVAL_MIN}-{MAX_INTERVAL_MIN}; задан — "
+            f"перекрывает сохранённый в базе и сохраняется"
+        ),
+    )
+    args = parser.parse_args(argv)
+    if not args.category.isdigit():
+        parser.error(f"--category: ожидается строка цифр, пришло «{args.category}»")
+    if not 1 <= args.port <= 65535:
+        parser.error(f"--port: ожидается 1-65535, пришло {args.port}")
+    config = Config(
+        base_url=args.base_url.rstrip("/"),
+        category=args.category,
+        category_name=args.category_name,
+    )
+    return config, Path(args.db).expanduser(), args.port, args.interval
+
+
+def _port_free(port: int) -> str:
+    """Пустая строка — порт свободен; иначе причина. Проверка до базы: занятый
+    порт не должен оставить в ней следов (uvicorn сообщил бы о порте уже
+    после входа в lifespan — после старта планировщика)."""
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as probe:
+        # Как у uvicorn: сокет в TIME_WAIT после перезапуска — не занятость.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind((HOST, port))
+        except OSError as exc:
+            return str(exc)
+    return ""
+
+
+def main() -> None:
+    config, db, port, interval = _args()
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("[FAQ-сторож] %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    # Строки httpx «HTTP Request: GET …» — шум; строки `faq_server` на каждый
+    # запрос к сайту сторожу тоже не нужны (89 на снимок).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    try:
+        version = check_db(db)
+    except DbError as exc:
+        logger.error("база %s: %s — сервер не запущен, файл не изменён", display_path(db), exc)
+        sys.exit(2)
+    busy = _port_free(port)
+    if busy:
+        logger.error("порт %s:%d занят (%s) — сервер не запущен", HOST, port, busy)
+        sys.exit(1)
+    init_db(db, version)
+
+    watch = Watch(config, db)
+    watch.load_interval(interval)
+    logger.info("%s", watch.start_line(port))
+    try:
+        build_server(watch).run("streamable-http", host=HOST, port=port, stateless_http=True)
+    except KeyboardInterrupt:
+        pass
+    logger.info("остановлен")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,10 +1,11 @@
 # TooManyRules — MCP-клиент (день 16, неделя 4; день 17 — вызов инструмента
-# и адаптер для агента).
+# и адаптер для агента; день 18 — сервер по адресу и группа серверов).
 #
 # Единственное место в проекте, где импортируется клиентская часть SDK `mcp`,
 # — как `agent.py` единственное место вызова LLM API, а `storage.py` —
-# единственное место работы с диском (серверную часть SDK импортирует только
-# `faq_server.py` — отдельная программа, не модуль приложения). Модуль
+# единственное место работы с диском (серверную часть SDK импортируют только
+# отдельные программы-серверы `faq_server.py` и, с дня 18, `faq_watch.py` — не
+# модули приложения). Модуль
 # запускает stdio-сервер, согласует с ним протокол, забирает список
 # инструментов по всем страницам (`list_tools()`) или вызывает один
 # инструмент (`call_tool()`, день 17), закрывает соединение и отдаёт результат
@@ -43,6 +44,16 @@
 # независимых подключения. У `McpToolBox` своего состояния тоже нет, кроме
 # описания сервера и потолка времени.
 #
+# С дня 18 (спецификация дня 18, §5) — второй транспорт: **Streamable HTTP**.
+# Сервер с `url` в описании запускает не приложение, а человек; процесс живёт
+# своей жизнью, и клиент только подключается по адресу — `Client(url)` вместо
+# `Client(StdioServerParameters(...))`. Подключение по-прежнему одно на вызов.
+# Окружение такому серверу не передаётся, а сбой «сервер не отвечает» — это
+# стадия «соединение», а не «запуск»: запускать модулю нечего. HTTP SDK ходит
+# через пакет `httpx2` (не `httpx`), и его ошибки — не `OSError`, поэтому они
+# перечислены в ожидаемых отдельно. Там же `McpToolBoxGroup` — несколько
+# серверов для агента как один `ToolBox`.
+#
 # Процесс сервера не наследует окружение приложения: SDK передаёт ему только
 # белый список (`INHERITED_ENV`) и то, что перечислено явно (`env_keys`
 # описания сервера, если заданы). Значения переменных нигде не показываются и
@@ -62,8 +73,10 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import anyio
+import httpx2
 from dotenv import load_dotenv
 from mcp import Client, ListToolsResult, MCPError, StdioServerParameters
 from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS
@@ -75,6 +88,10 @@ from mcp.types import CallToolResult
 load_dotenv()
 
 logger = logging.getLogger("toomanyrules.mcp")
+# HTTP-клиент SDK (день 18) пишет строку INFO на каждый POST — их по три на
+# подключение к HTTP-серверу. Шум: подключение, согласование и вызов модуль
+# логирует сам.
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 
 # --- Константы -------------------------------------------------------------
 
@@ -93,36 +110,61 @@ INHERITED_ENV: tuple[str, ...] = tuple(DEFAULT_INHERITED_ENV_VARS)
 
 ORIGIN_DEFAULT = "по умолчанию"
 
+# Транспорт сервера (день 18, §5.1): stdio — процесс запускает модуль,
+# Streamable HTTP — процесс уже работает, модуль подключается по адресу.
+TRANSPORT_STDIO = "stdio"
+TRANSPORT_HTTP = "streamable-http"
+TRANSPORT_LABELS = {TRANSPORT_STDIO: "stdio", TRANSPORT_HTTP: "Streamable HTTP"}
+
 # Тексты причин — нейтральные: модуль не знает, какой сервер запускает.
 ERROR_EMPTY_COMMAND = "командная строка пустая"
 ERROR_BAD_COMMAND = "командная строка не разбирается: {reason}"
 ERROR_TIMEOUT = "таймаут {seconds:g} с"
 ERROR_NO_TOOLS = "сервер не объявил возможность tools"
 ERROR_REPEATED_CURSOR = "курсор повторился: {cursor}"
+ERROR_BAD_URL = "адрес не годится: {reason}"
+ERROR_NO_ANSWER = "сервер не отвечает по адресу: {reason}"
+ERROR_NOT_IN_GROUP = "инструмента нет в каталоге группы"
 
 
 # --- Типы ------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class McpServer:
-    """Как запустить stdio-сервер. Описание — из presets.py; модуль про конкретный сервер не знает."""
+    """Как запустить stdio-сервер или где найти HTTP-сервер. Описание — из
+    presets.py; модуль про конкретный сервер не знает.
+
+    Сервер с `url` (день 18) — HTTP-сервер, запущенный не приложением:
+    `command`, `command_env` и `env_keys` у него пустые, окружение ему не
+    передаётся — процесс уже живёт своей жизнью."""
     name: str                       # короткое имя для лога: «bgg»
     title: str                      # для панели
     command: str                    # командная строка по умолчанию — как в терминале
     command_env: str = ""           # переменная окружения, целиком заменяющая command; "" — замены нет
     env_keys: tuple[str, ...] = ()  # переменные, которые передаются серверу, если заданы
     source: str = ""                # ссылка на сервер — для панели
+    # Поля дня 18 — в конце, с умолчаниями (§5.1):
+    url: str = ""                   # Streamable HTTP: адрес сервера; "" — stdio по command
+    url_env: str = ""               # переменная окружения, целиком заменяющая url; "" — замены нет
+
+    @property
+    def transport(self) -> str:
+        return TRANSPORT_HTTP if self.url else TRANSPORT_STDIO
 
 
 @dataclass(frozen=True)
 class Launch:
-    """Чем будет запущен сервер при данном окружении. Считается чистой функцией (`resolve_launch`)."""
+    """Чем будет запущен сервер при данном окружении. Считается чистой функцией (`resolve_launch`).
+
+    У HTTP-сервера (день 18) `command_line` — итоговый адрес, `origin` —
+    «по умолчанию» или «из <url_env>», `argv` пуст."""
     command_line: str               # итоговая строка — для лога и панели
     origin: str                     # «по умолчанию» | «из <имя переменной command_env>»
     argv: tuple[str, ...]           # разобранная строка; () — если не разобралась
     env_set: tuple[str, ...]        # какие из env_keys заданы и будут переданы
     env_missing: tuple[str, ...]    # какие не заданы
     error: str = ""                 # пустая или неразбираемая строка
+    transport: str = TRANSPORT_STDIO  # день 18: TRANSPORT_STDIO | TRANSPORT_HTTP
 
 
 @dataclass(frozen=True)
@@ -230,8 +272,11 @@ def resolve_launch(server: McpServer, environ: Mapping[str, str]) -> Launch:
     Окружение приходит параметром: её зовут и подключение (с `os.environ`), и
     панель при построении, и строка лога при старте — и все видят одно и то же.
     Замена из `command_env` берётся целиком, если непустая; строка разбирается
-    `shlex.split()`, тильда и переменные внутри неё не раскрываются.
+    `shlex.split()`, тильда и переменные внутри неё не раскрываются. У
+    HTTP-сервера (день 18) — адрес из `url` или замена из `url_env`.
     """
+    if server.transport == TRANSPORT_HTTP:
+        return _resolve_url(server, environ)
     override = environ.get(server.command_env, "") if server.command_env else ""
     # Непустая, но из одних пробелов — это замена, и она даёт сбой «пустая»:
     # молча откатиться к умолчанию значило бы запустить не то, что просили.
@@ -257,6 +302,34 @@ def resolve_launch(server: McpServer, environ: Mapping[str, str]) -> Launch:
         env_set=env_set,
         env_missing=env_missing,
         error=error,
+    )
+
+
+def _resolve_url(server: McpServer, environ: Mapping[str, str]) -> Launch:
+    """Адрес HTTP-сервера (день 18, §5.1): `http://` или `https://` и хост.
+    Пустая замена — нет замены; замена из пробелов — сбой (правило дня 16)."""
+    override = environ.get(server.url_env, "") if server.url_env else ""
+    if override:
+        url, origin = override, f"из {server.url_env}"
+    else:
+        url, origin = server.url, ORIGIN_DEFAULT
+    error = ""
+    if not url.strip():
+        error = ERROR_BAD_URL.format(reason="пустой")
+    else:
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https"):
+            error = ERROR_BAD_URL.format(reason=f"нужен http:// или https:// — «{url}»")
+        elif not parts.hostname:
+            error = ERROR_BAD_URL.format(reason=f"нет хоста — «{url}»")
+    return Launch(
+        command_line=url,
+        origin=origin,
+        argv=(),
+        env_set=(),
+        env_missing=(),
+        error=error,
+        transport=TRANSPORT_HTTP,
     )
 
 
@@ -427,7 +500,7 @@ def handshake_text(handshake: str) -> str:
 
 
 async def _connect_and_list(
-    params: StdioServerParameters, progress: _Progress, timeout_s: float,
+    params: StdioServerParameters | str, progress: _Progress, timeout_s: float,
 ) -> None:
     # Один потолок на весь путь: запуск, согласование, все страницы и штатное
     # закрытие. Если он истёк, SDK закрывает процесс под защитой от отмены —
@@ -457,7 +530,7 @@ async def _connect_and_list(
 
 
 async def _connect_and_call(
-    params: StdioServerParameters, progress: _Progress, timeout_s: float,
+    params: StdioServerParameters | str, progress: _Progress, timeout_s: float,
     name: str, arguments: dict,
 ) -> None:
     # Тот же путь, что `_connect_and_list()`, но вместо листания — один
@@ -479,7 +552,12 @@ def _first_leaf(exc: BaseException) -> BaseException:
     return exc
 
 
-_EXPECTED_ERRORS = (MCPError, OSError, TimeoutError, _NoToolsError, _RepeatedCursorError)
+# `httpx2.HTTPError` (день 18, §5.3) — HTTP-клиент SDK: сервер не запущен
+# (`ConnectError`), оборван, ответил не тем статусом. Это не `OSError`, и без
+# этой строки сбой шёл бы в лог с трассировкой как ошибка в коде.
+_EXPECTED_ERRORS = (
+    MCPError, OSError, TimeoutError, httpx2.HTTPError, _NoToolsError, _RepeatedCursorError,
+)
 
 
 def _error_text(exc: BaseException, timeout_s: float) -> str:
@@ -490,6 +568,10 @@ def _error_text(exc: BaseException, timeout_s: float) -> str:
         return ERROR_TIMEOUT.format(seconds=timeout_s)
     if isinstance(exc, (_NoToolsError, _RepeatedCursorError)):
         return str(exc)
+    if isinstance(exc, (httpx2.ConnectError, httpx2.ConnectTimeout)):
+        # Сервер не запущен. Как его запустить, модуль не знает — подсказку
+        # показывает панель.
+        return ERROR_NO_ANSWER.format(reason=f"{type(exc).__name__}: {exc}")
     return f"{type(exc).__name__}: {exc}"
 
 
@@ -515,17 +597,26 @@ def _run(connect, prefix: str, launch: Launch, progress: _Progress,
     `list_tools()` и `call_tool()`: строка «подключение», разбор сбоя по
     стадиям, строка «соединение закрыто». Возвращает стадию сбоя, текст сбоя
     (оба "" при успехе) и полное время."""
-    logger.info(
-        "%s подключение: %s (%s); серверу передаются: %s%s",
-        prefix, launch.command_line, launch.origin, _names(launch.env_set) or "—",
-        f" (не заданы {_names(launch.env_missing)})" if launch.env_missing else "",
-    )
-    # Значения — только для процесса сервера; дальше этой строки они не идут.
-    params = StdioServerParameters(
-        command=launch.argv[0],
-        args=list(launch.argv[1:]),
-        env={key: os.environ[key] for key in launch.env_set},
-    )
+    http = launch.transport == TRANSPORT_HTTP
+    if http:
+        # Сервер уже работает — ни процесса, ни окружения: только адрес.
+        logger.info(
+            "%s подключение: %s (%s), транспорт %s",
+            prefix, launch.command_line, launch.origin, TRANSPORT_LABELS[TRANSPORT_HTTP],
+        )
+        params: StdioServerParameters | str = launch.command_line
+    else:
+        logger.info(
+            "%s подключение: %s (%s); серверу передаются: %s%s",
+            prefix, launch.command_line, launch.origin, _names(launch.env_set) or "—",
+            f" (не заданы {_names(launch.env_missing)})" if launch.env_missing else "",
+        )
+        # Значения — только для процесса сервера; дальше этой строки они не идут.
+        params = StdioServerParameters(
+            command=launch.argv[0],
+            args=list(launch.argv[1:]),
+            env={key: os.environ[key] for key in launch.env_set},
+        )
     stage, error = "", ""
     try:
         anyio.run(connect, params, progress, timeout_s, *args)
@@ -534,17 +625,20 @@ def _run(connect, prefix: str, launch: Launch, progress: _Progress,
         stage = progress.stage or progress.after_connect
         # Нет файла, нет прав — процесс не запустился, хоть SDK и был уже
         # внутри подключения. `TimeoutError` — тоже `OSError`, но таймаут
-        # значит, что процесс запущен и молчит.
+        # значит, что процесс запущен и молчит. У HTTP-сервера процесса
+        # модуль не запускает — стадия остаётся «соединение» (день 18).
         if (
-            isinstance(leaf, OSError) and not isinstance(leaf, TimeoutError)
+            not http and isinstance(leaf, OSError) and not isinstance(leaf, TimeoutError)
             and stage == STAGE_CONNECT
         ):
             stage = STAGE_LAUNCH
         error = _error_text(leaf, timeout_s)
         total_s = time.perf_counter() - progress.started
+        # stderr процесса есть только у stdio-сервера: он в терминале
+        # приложения. HTTP-сервер пишет в свой терминал.
         hint = (
             " — сообщение сервера выше, в его stderr"
-            if stage == STAGE_CONNECT and isinstance(leaf, MCPError) else ""
+            if not http and stage == STAGE_CONNECT and isinstance(leaf, MCPError) else ""
         )
         # Неожиданный тип — скорее ошибка в коде, чем у сервера: с трассировкой.
         logger.warning(
@@ -696,3 +790,82 @@ class McpToolBox:
             "text": call.text,
             "elapsed": call.total_s,
         }
+
+
+# --- Группа серверов для агента (день 18, §5.4) ----------------------------
+
+class McpToolBoxGroup:
+    """Несколько `McpToolBox` как один `ToolBox`: каталоги сливаются, вызов
+    уходит серверу, который объявил инструмент в последнем каталоге.
+
+    Агент при этом не меняется — группа отвечает протоколу `agent.ToolBox`
+    структурно, как и отдельный `McpToolBox`. Один сервер недоступен — ход идёт
+    с инструментами остальных, а сбой уходит в необязательный ключ
+    `"warning"` каталога; ни одного — каталог не получен, как у одного сервера.
+
+    Единственное состояние — карта «имя инструмента → сервер» из последнего
+    удачного каталога. Она заменяется целиком в конце `catalog()` и читается
+    без замка: агенты одного процесса видят один и тот же набор серверов,
+    поэтому карты разных ходов совпадают.
+    """
+
+    def __init__(self, boxes: tuple[McpToolBox, ...]) -> None:
+        self._boxes = boxes
+        self._routes: dict[str, McpToolBox] = {}
+
+    @property
+    def name(self) -> str:
+        """Имена серверов через «+» — для логов агента и строки каталога: «faq+watch»."""
+        return "+".join(box.name for box in self._boxes)
+
+    def catalog(self) -> dict:
+        """Каталоги серверов по очереди, в порядке `boxes`; инструменты
+        сливаются в том же порядке. Имя, уже встреченное у предыдущего
+        сервера, пропускается с предупреждением. Формат — как у
+        `McpToolBox.catalog()` плюс необязательный `"warning"`; `elapsed` —
+        сумма."""
+        tools: list[dict] = []
+        routes: dict[str, McpToolBox] = {}
+        failures: list[str] = []
+        warnings: list[str] = []
+        elapsed = 0.0
+        received = 0
+        for box in self._boxes:
+            catalog = box.catalog()
+            elapsed += catalog.get("elapsed") or 0.0
+            if not catalog.get("ok"):
+                failures.append(f"{box.name}: {catalog.get('error') or 'причина не названа'}")
+                continue
+            received += 1
+            for tool in catalog.get("tools") or []:
+                owner = routes.get(tool["name"])
+                if owner is not None:
+                    warnings.append(
+                        f"{box.name}: инструмент {tool['name']} уже есть у {owner.name} — пропущен"
+                    )
+                    continue
+                routes[tool["name"]] = box
+                tools.append(tool)
+        if not received:
+            return {"ok": False, "error": "; ".join(failures), "elapsed": elapsed, "tools": []}
+        self._routes = routes
+        result = {"ok": True, "error": "", "elapsed": elapsed, "tools": tools}
+        if failures or warnings:
+            result["warning"] = "; ".join(failures + warnings)
+        return result
+
+    def call(self, name: str, arguments: dict) -> dict:
+        """Вызов — серверу инструмента по карте последнего удачного каталога.
+        Имени нет в карте — ответ без подключения (агент и так не отправляет
+        имена вне каталога хода, это защита)."""
+        box = self._routes.get(name)
+        if box is None:
+            return {
+                "ok": False,
+                "is_error": False,
+                "error": ERROR_NOT_IN_GROUP,
+                "stage": "",
+                "text": "",
+                "elapsed": 0.0,
+            }
+        return box.call(name, arguments)
