@@ -30,8 +30,11 @@ pip install -q -r requirements.txt
 
 if [ -z "$APP" ]; then
     # Командная строка сторожа живёт в одном месте — presets.FAQ_WATCH_ARGV.
-    # Ключей у сервера нет, поэтому src/.env здесь не проверяется.
-    exec python -c 'import os, sys, presets; argv = presets.FAQ_WATCH_ARGV + sys.argv[1:]; os.execv(argv[0], argv)' "${@:2}"
+    # Ключей у сервера нет, поэтому src/.env здесь не проверяется и серверу не
+    # передаётся: окружение снимается до import presets — импорт подхватывает
+    # src/.env (load_dotenv в mcp_client), и через execv ключи уехали бы в
+    # процесс сторожа.
+    exec python -c 'import os, sys; env = dict(os.environ); import presets; argv = presets.FAQ_WATCH_ARGV + sys.argv[1:]; os.execve(argv[0], argv, env)' "${@:2}"
 fi
 
 if [ ! -f ".env" ]; then

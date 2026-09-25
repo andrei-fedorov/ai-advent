@@ -123,7 +123,8 @@ ERROR_TIMEOUT = "таймаут {seconds:g} с"
 ERROR_NO_TOOLS = "сервер не объявил возможность tools"
 ERROR_REPEATED_CURSOR = "курсор повторился: {cursor}"
 ERROR_BAD_URL = "адрес не годится: {reason}"
-ERROR_NO_ANSWER = "сервер не отвечает по адресу: {reason}"
+NO_ANSWER = "сервер не отвечает по адресу"
+ERROR_NO_ANSWER = NO_ANSWER + ": {reason}"
 ERROR_NOT_IN_GROUP = "инструмента нет в каталоге группы"
 
 
@@ -560,6 +561,13 @@ _EXPECTED_ERRORS = (
 )
 
 
+def is_no_answer(error: str) -> bool:
+    """Сбой — «сервер по адресу не отвечает» (не запущен или другой порт), а
+    не таймаут и не чужой ответ (день 18): панели — чтобы подсказывать запуск
+    сервера только тогда, когда он и правда не запущен."""
+    return error.startswith(NO_ANSWER)
+
+
 def _error_text(exc: BaseException, timeout_s: float) -> str:
     if isinstance(exc, MCPError):
         return f"MCPError({exc.code}): {exc.message}"
@@ -803,10 +811,14 @@ class McpToolBoxGroup:
     с инструментами остальных, а сбой уходит в необязательный ключ
     `"warning"` каталога; ни одного — каталог не получен, как у одного сервера.
 
-    Единственное состояние — карта «имя инструмента → сервер» из последнего
-    удачного каталога. Она заменяется целиком в конце `catalog()` и читается
-    без замка: агенты одного процесса видят один и тот же набор серверов,
-    поэтому карты разных ходов совпадают.
+    Единственное состояние — карта «имя инструмента → сервер», которую
+    удачные каталоги только пополняют: каталог дописывает свои имена в копию
+    карты и подменяет её одним присваиванием, читается она без замка. Имена
+    не удаляются (правка по ревью дня 18): иначе каталог хода другого агента,
+    снятый, пока сторож лежит, выкинул бы из карты инструмент, законный по
+    каталогу этого хода. Набор инструментов у сервера постоянный — устаревшая
+    запись стоит самое большее одного неудачного подключения с честной
+    ошибкой.
     """
 
     def __init__(self, boxes: tuple[McpToolBox, ...]) -> None:
@@ -848,14 +860,14 @@ class McpToolBoxGroup:
                 tools.append(tool)
         if not received:
             return {"ok": False, "error": "; ".join(failures), "elapsed": elapsed, "tools": []}
-        self._routes = routes
+        self._routes = {**self._routes, **routes}
         result = {"ok": True, "error": "", "elapsed": elapsed, "tools": tools}
         if failures or warnings:
             result["warning"] = "; ".join(failures + warnings)
         return result
 
     def call(self, name: str, arguments: dict) -> dict:
-        """Вызов — серверу инструмента по карте последнего удачного каталога.
+        """Вызов — серверу инструмента по карте, которую пополняют каталоги.
         Имени нет в карте — ответ без подключения (агент и так не отправляет
         имена вне каталога хода, это защита)."""
         box = self._routes.get(name)

@@ -41,6 +41,7 @@ import argparse
 import asyncio
 import difflib
 import hashlib
+import itertools
 import json
 import logging
 import socket
@@ -88,6 +89,13 @@ DAYS_MAX = 365
 DIFF_MAX_LINES = 12          # строк разницы текста на статью
 DIFF_LINE_MAX_CHARS = 200    # строка разницы — абзац статьи; длиннее — с «…»
 CHANGES_MAX_ITEMS = 40       # статей в каждой части сводки
+# Весь ответ `faq_changes`, символов. 40 статей на часть этого не держат:
+# изменённая статья с разницей — до ≈2,7 тыс. символов, а у клиента дня 17
+# потолок результата — 12 000, дальше он обрезает хвост, где стоит вся часть
+# «по датам сайта». Бюджет — с запасом ниже: та часть резервируется первой,
+# события — пока есть место (правка по ревью дня 18).
+CHANGES_MAX_CHARS = 10_000
+CHANGES_TAIL_RESERVE = 60    # место под строку «… и ещё N — не поместились в ответ»
 
 TIME_FORMAT = "%d.%m.%Y %H:%M"
 DATE_FORMAT = "%d.%m.%Y"
@@ -242,6 +250,11 @@ def parse_modified(raw: str) -> datetime | None:
         return datetime.strptime(text, MODIFIED_FORMAT)
     except ValueError:
         return None
+
+
+def _size(lines: list[str]) -> int:
+    """Длина строк, склеенных через перевод строки, — в символах ответа."""
+    return sum(len(line) + 1 for line in lines)
 
 
 def text_hash(text: str) -> str:
@@ -464,12 +477,17 @@ def _clip(line: str) -> str:
 
 
 def text_diff(old: str, new: str) -> list[str]:
-    """Строки разницы без контекста, не больше `DIFF_MAX_LINES`."""
+    """Строки разницы без контекста, не больше `DIFF_MAX_LINES`.
+
+    Заголовок `---`/`+++` — первые две строки вывода — отбрасывается по
+    позиции: по началу строки выпала бы и строка статьи, начатая с «--».
+    Пустые строки (промежутки между абзацами) — не разница, а шум, который
+    съедал бы лимит строк (правка по ревью дня 18)."""
     lines = [
-        line for line in difflib.unified_diff(
-            old.splitlines(), new.splitlines(), lineterm="", n=0
+        line for line in itertools.islice(
+            difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=0), 2, None
         )
-        if line[:1] in "+-" and not line.startswith(("---", "+++"))
+        if line[:1] in ("+", "-") and line[1:].strip()
     ]
     shown = [_clip(f"{line[0]} {line[1:].strip()}") for line in lines[:DIFF_MAX_LINES]]
     if len(lines) > DIFF_MAX_LINES:
@@ -500,6 +518,13 @@ class Watch:
         self.interval = DEFAULT_INTERVAL_MIN
         self.interval_origin = ORIGIN_DEFAULT
         self.running: Running | None = None
+        # Срок «не раньше» после попытки, которой нет в `runs` (§2.4, правка
+        # по ревью): сайт прочитан, но база снимок не приняла, или после
+        # чтения упал код. Срок из базы тогда остался в прошлом, и без этого
+        # поля планировщик перечитывал бы сайт на каждом шаге проверки часов.
+        # Только в памяти процесса: запись попытки его снимает, перезапуск —
+        # тоже.
+        self.not_before: datetime | None = None
         # Событие создаётся в цикле событий — при старте планировщика.
         self.wake: anyio.Event | None = None
 
@@ -551,12 +576,21 @@ class Watch:
             with closing(_connect(self.db)) as own:
                 return self.next_due(own)
         ok_run, failed = self.attempts(conn)
-        return next_due(
+        due = next_due(
             ok_run.started_at if ok_run else None,
             failed.started_at if failed else None,
             self.interval,
             _now(),
         )
+        if self.not_before is not None and self.not_before > due:
+            return self.not_before
+        return due
+
+    def _hold_off(self) -> datetime:
+        """Срок «не раньше» после попытки, которой нет в базе:
+        `min(интервал, RETRY_MIN)` от сейчас — как повтор после неудачи."""
+        self.not_before = _now() + timedelta(minutes=min(self.interval, RETRY_MIN))
+        return self.not_before
 
     def _due_text(self, due: datetime) -> str:
         if self.running is not None:
@@ -584,10 +618,14 @@ class Watch:
                 if _now() >= due:
                     await self.snapshot(due)
             except Exception:
-                # Сторож не падает от одной ошибки: трассировка — в stderr,
-                # следующая попытка — через шаг проверки часов.
+                # Сторож не падает от одной ошибки: трассировка — в stderr.
+                # Ошибка могла случиться после чтения сайта, а попытки в базе
+                # нет — поэтому снимок не раньше `_hold_off()`, а не на
+                # следующем шаге проверки часов. Сон — на случай, если падает
+                # само чтение срока из базы: без него цикл крутился бы вхолостую.
                 logger.exception(
-                    "планировщик: ошибка в коде сервера — повтор через %d с", SCHEDULER_TICK_S
+                    "планировщик: ошибка в коде сервера — снимок не раньше %s",
+                    _fmt(self._hold_off()),
                 )
                 await anyio.sleep(SCHEDULER_TICK_S)
 
@@ -661,7 +699,8 @@ class Watch:
 
     async def snapshot(self, due: datetime) -> None:
         """Одна попытка снимка. Исключений наружу не выпускает, кроме отмены:
-        любая неудача — строка `runs` с `ok=0` и причиной."""
+        неудача чтения сайта — строка `runs` с `ok=0` и причиной; база не
+        приняла запись — строка лога и срок «не раньше» (`_hold_off()`)."""
         number = self._next_number()
         started_at = _now()
         started = time.perf_counter()
@@ -691,82 +730,121 @@ class Watch:
         elapsed = time.perf_counter() - started
         finished_at = _now()
 
-        with closing(_connect(self.db)) as conn:
-            if reason:
-                with _transaction(conn):
-                    conn.execute(
-                        "INSERT INTO runs (id, started_at, finished_at, ok, error, requests, elapsed_s) "
-                        "VALUES (?, ?, ?, 0, ?, ?, ?)",
-                        (number, _iso(started_at), _iso(finished_at), reason, site.requests, elapsed),
+        # Запись попытки — отдельно от чтения сайта (правка по ревью): ошибка
+        # базы здесь — не «ошибка в коде сервера», и попытки в `runs` после
+        # неё нет, поэтому повтор — не раньше `_hold_off()`, а не через шаг
+        # проверки часов с новым чтением всего сайта.
+        try:
+            with closing(_connect(self.db)) as conn:
+                if reason:
+                    self._record_failure(
+                        conn, number, started_at, finished_at, reason, site.requests, elapsed
                     )
-                logger.warning(
-                    "снимок #%d: сбой через %.1f с — %s; повтор %s",
-                    number, elapsed, reason, _fmt(self.next_due(conn)),
-                )
-                return
-
-            snapshot, texts, warnings = result
-            previous_run, _ = self.attempts(conn)
-            # Одна транзакция (§3.5): попытка, статьи, новые тексты и события.
-            # До её конца в базе от снимка нет ничего.
-            with _transaction(conn):
-                previous = _snapshot_rows(conn, previous_run.id) if previous_run else None
-                events = compare(previous, snapshot) if previous is not None else []
-                conn.execute(
-                    "INSERT INTO runs (id, started_at, finished_at, ok, articles, requests, elapsed_s) "
-                    "VALUES (?, ?, ?, 1, ?, ?, ?)",
-                    (number, _iso(started_at), _iso(finished_at), len(snapshot), site.requests, elapsed),
-                )
-                conn.executemany(
-                    "INSERT OR IGNORE INTO texts (hash, text) VALUES (?, ?)", texts.items()
-                )
-                conn.executemany(
-                    "INSERT INTO articles (run_id, article_id, section, question, modified_raw, "
-                    "modified_at, text_hash, chars) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        (
-                            number, snap.article_id, snap.section, snap.question, snap.modified_raw,
-                            snap.modified_at.isoformat() if snap.modified_at else None,
-                            snap.hash, snap.chars,
-                        )
-                        for snap in snapshot.values()
-                    ],
-                )
-                conn.executemany(
-                    "INSERT INTO changes (run_id, article_id, kind, detail) VALUES (?, ?, ?, ?)",
-                    [(number, event.article_id, event.kind, event.detail()) for event in events],
-                )
-            head = (
-                f"снимок #{number}: {_articles_word(len(snapshot))}, "
-                f"{_requests_word(site.requests)}, {elapsed:.1f} с"
-            )
-            if previous_run is None:
-                logger.info(
-                    "%s — первый снимок: %s, база для сравнения", head, _articles_word(len(snapshot))
-                )
-            else:
-                since = f"с #{previous_run.id} ({_fmt(previous_run.started_at)})"
-                if events:
-                    counts = {kind: sum(1 for e in events if e.kind == kind) for kind in KINDS}
-                    logger.info(
-                        "%s — %s: новых %d · изменено %d · перенесено %d · удалено %d",
-                        head, since, counts[KIND_NEW], counts[KIND_CHANGED],
-                        counts[KIND_MOVED], counts[KIND_DELETED],
-                    )
-                    for event in events:
-                        logger.info("  %s", _event_brief(event))
                 else:
-                    logger.info("%s — %s: изменений нет", head, since)
-            for warning in warnings:
-                logger.warning("  ⚠️ %s", warning)
-            logger.info("следующий снимок: %s", _fmt(self.next_due(conn)))
+                    snapshot, texts, warnings = result
+                    previous_run, events = self._record_snapshot(
+                        conn, number, started_at, finished_at, snapshot, texts,
+                        site.requests, elapsed,
+                    )
+        except sqlite3.Error as exc:
+            logger.error(
+                "снимок #%d: %s, но база его не записала — %s: %s; повтор не раньше %s",
+                number, f"сбой ({reason})" if reason else f"прочитан за {elapsed:.1f} с",
+                type(exc).__name__, exc, _fmt(self._hold_off()),
+            )
+            return
+        self.not_before = None
+
+        if reason:
+            logger.warning(
+                "снимок #%d: сбой через %.1f с — %s; повтор %s",
+                number, elapsed, reason, _fmt(self.next_due()),
+            )
+            return
+        head = (
+            f"снимок #{number}: {_articles_word(len(snapshot))}, "
+            f"{_requests_word(site.requests)}, {elapsed:.1f} с"
+        )
+        if previous_run is None:
+            logger.info(
+                "%s — первый снимок: %s, база для сравнения", head, _articles_word(len(snapshot))
+            )
+        else:
+            since = f"с #{previous_run.id} ({_fmt(previous_run.started_at)})"
+            if events:
+                counts = {kind: sum(1 for e in events if e.kind == kind) for kind in KINDS}
+                logger.info(
+                    "%s — %s: новых %d · изменено %d · перенесено %d · удалено %d",
+                    head, since, counts[KIND_NEW], counts[KIND_CHANGED],
+                    counts[KIND_MOVED], counts[KIND_DELETED],
+                )
+                for event in events:
+                    logger.info("  %s", _event_brief(event))
+            else:
+                logger.info("%s — %s: изменений нет", head, since)
+        for warning in warnings:
+            logger.warning("  ⚠️ %s", warning)
+        logger.info("следующий снимок: %s", _fmt(self.next_due()))
+
+    @staticmethod
+    def _record_failure(
+        conn: sqlite3.Connection, number: int, started_at: datetime, finished_at: datetime,
+        reason: str, requests: int, elapsed: float,
+    ) -> None:
+        """Неудачная попытка — строка `runs` с `ok=0` и причиной, без статей."""
+        with _transaction(conn):
+            conn.execute(
+                "INSERT INTO runs (id, started_at, finished_at, ok, error, requests, elapsed_s) "
+                "VALUES (?, ?, ?, 0, ?, ?, ?)",
+                (number, _iso(started_at), _iso(finished_at), reason, requests, elapsed),
+            )
+
+    def _record_snapshot(
+        self, conn: sqlite3.Connection, number: int, started_at: datetime,
+        finished_at: datetime, snapshot: dict[str, Snapshot], texts: dict[str, str],
+        requests: int, elapsed: float,
+    ) -> tuple[Run | None, list[Event]]:
+        """Удачный снимок одной транзакцией (§3.5): попытка, статьи, новые
+        тексты и события. До её конца в базе от снимка нет ничего. Возвращает
+        прошлый удачный снимок и события сравнения с ним."""
+        previous_run, _ = self.attempts(conn)
+        with _transaction(conn):
+            previous = _snapshot_rows(conn, previous_run.id) if previous_run else None
+            events = compare(previous, snapshot) if previous is not None else []
+            conn.execute(
+                "INSERT INTO runs (id, started_at, finished_at, ok, articles, requests, elapsed_s) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?)",
+                (number, _iso(started_at), _iso(finished_at), len(snapshot), requests, elapsed),
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO texts (hash, text) VALUES (?, ?)", texts.items()
+            )
+            conn.executemany(
+                "INSERT INTO articles (run_id, article_id, section, question, modified_raw, "
+                "modified_at, text_hash, chars) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        number, snap.article_id, snap.section, snap.question, snap.modified_raw,
+                        snap.modified_at.isoformat() if snap.modified_at else None,
+                        snap.hash, snap.chars,
+                    )
+                    for snap in snapshot.values()
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO changes (run_id, article_id, kind, detail) VALUES (?, ?, ?, ?)",
+                [(number, event.article_id, event.kind, event.detail()) for event in events],
+            )
+        return previous_run, events
 
     # --- инструменты ---
 
     def _article_url(self, article_id: str) -> str:
         return f"{self.config.base_url}{ARTICLE_PATH.format(id=article_id)}"
 
-    def _event_lines(self, conn: sqlite3.Connection, event: Event, at: datetime) -> list[str]:
+    def _event_lines(
+        self, conn: sqlite3.Connection, event: Event, at: datetime, *, with_diff: bool = True,
+    ) -> list[str]:
         snap = event.after or event.before
         lines = [
             f"- {event.kind} · {event.article_id} · {snap.section} · {snap.question} · "
@@ -782,6 +860,9 @@ class Watch:
                 )
             if event.before.hash != event.after.hash:
                 lines.append(f"  текст: {event.before.chars} → {event.after.chars} симв.")
+                if not with_diff:
+                    lines.append("  разница не показана — ответ длинный")
+                    return lines
                 old = conn.execute("SELECT text FROM texts WHERE hash = ?", (event.before.hash,)).fetchone()
                 new = conn.execute("SELECT text FROM texts WHERE hash = ?", (event.after.hash,)).fetchone()
                 if old is not None and new is not None:
@@ -828,8 +909,42 @@ class Watch:
                     f"Наблюдение ведётся с {_fmt(first_ok.started_at)}."
                 )
 
+            # По датам сайта — последний удачный снимок, граница — до суток.
+            # Собирается первой: часть короткая, и её место в бюджете
+            # `CHANGES_MAX_CHARS` зарезервировано, хотя в ответе она последняя.
+            site_title = (
+                f"По датам сайта («Modified on», по последнему снимку; часовой пояс сайта "
+                f"неизвестен — граница периода с точностью до суток) за {days} дн."
+            )
+            site_lines: list[str] = []
+            dated: list[Snapshot] = []
+            unparsed = 0
+            if last_ok is None:
+                site_lines.append(f"{site_title}: снимков ещё нет.")
+            else:
+                first_day: date = since.date()
+                for snap in _snapshot_rows(conn, last_ok.id).values():
+                    if snap.modified_at is None:
+                        unparsed += 1
+                    elif snap.modified_at.date() >= first_day:
+                        dated.append(snap)
+                dated.sort(key=lambda snap: snap.modified_at, reverse=True)
+                site_lines.append(
+                    f"{site_title}: {_articles_word(len(dated))}." if dated
+                    else f"{site_title}: статей нет."
+                )
+                for snap in dated[:CHANGES_MAX_ITEMS]:
+                    site_lines.append(
+                        f"- {snap.modified_at.strftime(DATE_FORMAT)} · {snap.article_id} · "
+                        f"{snap.section} · {snap.question}"
+                    )
+                    site_lines.append(f"  {self._article_url(snap.article_id)}")
+                if len(dated) > CHANGES_MAX_ITEMS:
+                    site_lines.append(f"… и ещё {len(dated) - CHANGES_MAX_ITEMS}")
+                if unparsed:
+                    site_lines.append(f"Дат не разобрано: {unparsed}.")
+
             # Замечено сторожем — события удачных снимков периода, от новых к старым.
-            lines.append("")
             events: list[tuple[Event, datetime]] = []
             period_ok = {run.id: run.started_at for run in in_period if run.ok}
             if period_ok:
@@ -843,55 +958,44 @@ class Watch:
                     for row in rows if row["run_id"] in period_ok
                 ]
             title = f"Замечено сторожем за {days} дн. (сравнение соседних снимков)"
+            observer: list[str] = []
             if first_ok is None:
-                lines.append(f"{title}: снимков для сравнения ещё нет.")
+                observer.append(f"{title}: снимков для сравнения ещё нет.")
             else:
-                lines.append(
+                observer.append(
                     f"{title}: {_events_word(len(events))}." if events
                     else f"{title}: изменений нет."
                 )
                 if first_ok.started_at > since:
-                    lines.append(
+                    observer.append(
                         f"Сторож наблюдает с {_fmt(first_ok.started_at)}, раньше этого ничего "
                         f"не замечено."
                     )
-                for event, at in events[:CHANGES_MAX_ITEMS]:
-                    lines.extend(self._event_lines(conn, event, at))
-                if len(events) > CHANGES_MAX_ITEMS:
-                    lines.append(f"… и ещё {len(events) - CHANGES_MAX_ITEMS}")
-
-            # По датам сайта — последний удачный снимок, граница — до суток.
-            lines.append("")
-            site_title = (
-                f"По датам сайта («Modified on», по последнему снимку; часовой пояс сайта "
-                f"неизвестен — граница периода с точностью до суток) за {days} дн."
-            )
-            dated: list[Snapshot] = []
-            unparsed = 0
-            if last_ok is None:
-                lines.append(f"{site_title}: снимков ещё нет.")
-            else:
-                first_day: date = since.date()
-                for snap in _snapshot_rows(conn, last_ok.id).values():
-                    if snap.modified_at is None:
-                        unparsed += 1
-                    elif snap.modified_at.date() >= first_day:
-                        dated.append(snap)
-                dated.sort(key=lambda snap: snap.modified_at, reverse=True)
-                lines.append(
-                    f"{site_title}: {_articles_word(len(dated))}." if dated
-                    else f"{site_title}: статей нет."
+                # Бюджет событий — что осталось от `CHANGES_MAX_CHARS` после
+                # остальных частей и запаса на строку «… и ещё N». Событие, не
+                # поместившееся с разницей, идёт без неё; не поместившееся и
+                # так — конец списка.
+                budget = (
+                    CHANGES_MAX_CHARS - _size(lines + ["", *observer, "", *site_lines])
+                    - CHANGES_TAIL_RESERVE
                 )
-                for snap in dated[:CHANGES_MAX_ITEMS]:
-                    lines.append(
-                        f"- {snap.modified_at.strftime(DATE_FORMAT)} · {snap.article_id} · "
-                        f"{snap.section} · {snap.question}"
+                shown = 0
+                for event, at in events[:CHANGES_MAX_ITEMS]:
+                    block = self._event_lines(conn, event, at)
+                    if _size(block) > budget:
+                        block = self._event_lines(conn, event, at, with_diff=False)
+                    if _size(block) > budget:
+                        break
+                    observer.extend(block)
+                    budget -= _size(block)
+                    shown += 1
+                if shown < len(events):
+                    cut = shown < min(len(events), CHANGES_MAX_ITEMS)
+                    observer.append(
+                        f"… и ещё {len(events) - shown}"
+                        + (" — не поместились в ответ" if cut else "")
                     )
-                    lines.append(f"  {self._article_url(snap.article_id)}")
-                if len(dated) > CHANGES_MAX_ITEMS:
-                    lines.append(f"… и ещё {len(dated) - CHANGES_MAX_ITEMS}")
-                if unparsed:
-                    lines.append(f"Дат не разобрано: {unparsed}.")
+        lines += ["", *observer, "", *site_lines]
         summary = f"{_events_word(len(events))}, {len(dated)} по датам сайта"
         return "\n".join(lines), summary
 

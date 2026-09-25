@@ -165,6 +165,7 @@ from mcp_client import (
     ToolListing,
     call_tool,
     handshake_text,
+    is_no_answer,
     list_tools,
     resolve_launch,
 )
@@ -323,7 +324,7 @@ MCP_LAUNCH = resolve_launch(BGG_MCP, os.environ)
 # идут новым подключением. Подключения при старте нет, как у BGG: одна строка
 # лога тем же форматом. С дня 18 (§7.1) — группа из двух серверов: FAQ по
 # stdio и сторож FAQ по HTTP; единственное состояние группы — карта «имя
-# инструмента → сервер» из последнего каталога.
+# инструмента → сервер», которую каталоги только пополняют.
 TOOLBOX = McpToolBoxGroup((
     McpToolBox(FAQ_MCP, timeout_s=FAQ_TIMEOUT_S),
     McpToolBox(FAQ_WATCH, timeout_s=WATCH_TIMEOUT_S),
@@ -4143,9 +4144,12 @@ def _mcp_status_md(listing: ToolListing, tokens_tail: str = BGG_TOKENS_TAIL) -> 
         f"- {listing.error}",
     ]
     if listing.stage == STAGE_CONNECT and listing.launch.transport == TRANSPORT_HTTP:
-        # Сервер по адресу запускает человек (день 18): скорее всего, он не
-        # запущен или запущен на другом порту.
-        lines.append(f"- Сервер не отвечает — {WATCH_START_HINT}")
+        # Сервер по адресу запускает человек (день 18). Подсказка запуска —
+        # только когда по адресу никто не отвечает (не запущен или другой
+        # порт): при таймауте и чужом сервере на порту сервер запущен, и она
+        # бы сбивала (правка по ревью).
+        if is_no_answer(listing.error):
+            lines.append(f"- Сервер не отвечает — {WATCH_START_HINT}")
     elif listing.stage == STAGE_CONNECT:
         # Причину «Connection closed» знает только сервер — она в его stderr,
         # который идёт в терминал приложения как есть (§4.6).
@@ -4239,7 +4243,7 @@ def _watch_digest_status(call: ToolCall) -> str:
     at = datetime.fromisoformat(call.at).strftime("%d.%m.%Y %H:%M:%S")
     head = f"`faq_changes({_md_cell(json.dumps(call.arguments, ensure_ascii=False))})` · {at}"
     if call.error:
-        hint = f" — {WATCH_START_HINT}" if call.stage == STAGE_CONNECT else ""
+        hint = f" — {WATCH_START_HINT}" if is_no_answer(call.error) else ""
         return (
             f"❌ **Сбой на стадии «{call.stage}»** · {head} · через {call.total_s:.2f} с: "
             f"{call.error}{hint}"
