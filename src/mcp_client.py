@@ -528,7 +528,7 @@ class _Progress:
                 "%d символов (%s, %s)",
                 self.prefix, len(messages), chars, request.get("max_tokens"),
                 len(response.get("text") or ""), response.get("model") or "?",
-                response.get("finish_reason") or "endTurn",
+                _stop_reason(response.get("finish_reason")),
             )
         else:
             logger.warning(
@@ -618,10 +618,19 @@ def _build_sampling_callback(progress: _Progress, sampler: Callable[[dict], dict
             role="assistant",
             content=TextContent(type="text", text=response.get("text") or ""),
             model=response.get("model") or "",
-            stop_reason=response.get("finish_reason") or "endTurn",
+            stop_reason=_stop_reason(response.get("finish_reason")),
         )
 
     return sampling_callback
+
+
+def _stop_reason(finish_reason: str | None) -> str:
+    """`finish_reason` модели → `stop_reason` MCP (§4.1). Словарь MCP знает
+    только этот модуль: `sampler` отдаёт причину как у модели (`"length"`,
+    `"stop"`). `"maxTokens"` тоже понимается как обрыв — иначе сервер не
+    распознал бы оборванную памятку и записал бы её (правка по ревью: перевод
+    был в агенте, и заглушка с `"length"` проходила мимо проверки)."""
+    return "maxTokens" if finish_reason in ("length", "maxTokens") else "endTurn"
 
 
 async def _connect_and_call(

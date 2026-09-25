@@ -2153,6 +2153,11 @@ def _cheatsheet_chain_md(calls: list[dict]) -> str:
             arguments = json.loads(call["arguments"] or "{}")
         except ValueError:
             arguments = {}
+        # Не объект (`[]`, `"q1"`, `null`) агент отклоняет, но запись в
+        # журнале хода остаётся с исходной строкой — панель не должна падать
+        # (правка по ревью).
+        if not isinstance(arguments, dict):
+            arguments = {}
         input_ref = str(arguments.get(_PIPELINE_INPUT_ARG[name]) or "")
         if not ok:
             mark = "⚠️"

@@ -717,7 +717,8 @@ class ToolBox(Protocol):
     какой сервер ею воспользуется — решает сервер (`McpServer.sampling`).
     Вход `sample`: `{"system": str, "messages": [{"role": "user"|"assistant",
     "text": str}], "max_tokens": int}`. Выход: `{"ok": bool, "text": str,
-    "model": str, "finish_reason": str, "error": str}`.
+    "model": str, "finish_reason": str, "error": str}`; `finish_reason` — как
+    у модели (`"stop"`, `"length"`): словарь MCP знает только реализация.
     """
 
     @property
@@ -3753,7 +3754,9 @@ class Agent:
                 prompt_tokens=None, completion_tokens=None, total_tokens=None,
                 cost_usd=None, covers=0, folded_tokens=0, text="",
             )
-            self._record_sampling(call)
+            # Отказ без вызова модели — не вызов API: в счётчики он не идёт,
+            # а просьба сервера видна в логе и в `sampling_calls` ответа
+            # (§6.2, правка по ревью).
             logger.warning(
                 "[%s] %s: отказ — %s; модель не вызывалась", self._log_name, label, error,
             )
@@ -3789,7 +3792,6 @@ class Agent:
             self._record_sampling(call)
             return {"ok": False, "text": "", "model": "", "finish_reason": "", "error": str(exc)}, call
 
-        truncated = result.finish_reason == "length"
         call = ServiceCall(
             kind="sampling", label=label, ok=True, error=None,
             elapsed=result.elapsed,
@@ -3815,7 +3817,9 @@ class Agent:
             "ok": True,
             "text": result.text,
             "model": self._config.model,
-            "finish_reason": "maxTokens" if truncated else "endTurn",
+            # Как у модели: перевод в `stop_reason` MCP — у реализации
+            # `ToolBox` (§4.1), агент словаря MCP не знает.
+            "finish_reason": result.finish_reason or "",
             "error": "",
         }, call
 
@@ -3840,7 +3844,6 @@ class Agent:
         name = tool_call.function.name
         raw = tool_call.function.arguments or ""
         elapsed = 0.0
-        samples = 0
         sampling_calls: list[ServiceCall] = []
 
         def sampler(request: dict) -> dict:
@@ -3863,7 +3866,6 @@ class Agent:
                 started = time.perf_counter()
                 result = self._tools.call(name, arguments, sample=sampler)
                 elapsed = time.perf_counter() - started
-                samples = int(result.get("samples") or 0)
                 if result.get("ok"):
                     status = TOOL_STATUS_OK
                     content = result.get("text") or ""
@@ -3876,6 +3878,11 @@ class Agent:
                         f"Инструмент недоступен: сбой на стадии "
                         f"«{result.get('stage') or '—'}»: {result.get('error') or ''}"
                     )
+        # Просьбы сервера считает агент по своим записям, а не по `samples`
+        # клиента: если потолок подключения истёк во время вызова модели,
+        # поток доработает и запись появится, а клиент до счёта не дойдёт —
+        # колонка «сэмпл.» раздала бы цены не тем вызовам (правка по ревью).
+        samples = len(sampling_calls)
         chars = len(content)
         truncated = chars > self._tool_result_max_chars
         if truncated:

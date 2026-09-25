@@ -333,6 +333,10 @@ def _articles_word(count: int) -> str:
     return _count(count, "статья", "статьи", "статей")
 
 
+def _bytes_word(count: int) -> str:
+    return _count(count, "байт", "байта", "байт")
+
+
 def _events_word(count: int) -> str:
     return _count(count, "событие", "события", "событий")
 
@@ -662,7 +666,9 @@ def _score_article(
 def _require_search_ref(raw: str) -> int:
     """Разбирает id поиска (`q…`) — отдельная проверка вида, а не JSON Schema
     (§3.1): модель лучше исправляется по понятному тексту, чем по ошибке
-    валидации pydantic."""
+    валидации pydantic. Регистр и пробелы по краям не важны: «Q7» — тот же
+    q7 (правка по ревью)."""
+    raw = raw.strip().lower()
     tail = raw[len(SUMMARY_PREFIX):]
     if raw.startswith(SUMMARY_PREFIX) and tail.isdigit():
         raise ToolError(f"{raw} — id памятки, а нужен id поиска ({SEARCH_PREFIX}…) из faq_search")
@@ -674,6 +680,7 @@ def _require_search_ref(raw: str) -> int:
 
 def _require_summary_ref(raw: str) -> int:
     """Разбирает id памятки (`s…`) — та же проверка вида, что у поиска."""
+    raw = raw.strip().lower()
     tail = raw[len(SEARCH_PREFIX):]
     if raw.startswith(SEARCH_PREFIX) and tail.isdigit():
         raise ToolError(f"{raw} — id поиска, а нужен id памятки ({SUMMARY_PREFIX}…) из faq_summarize")
@@ -702,6 +709,14 @@ def _summary_user_text(topic: str, articles: list[tuple[str, str, str, str]]) ->
 
 def _summary_items(text: str) -> list[str]:
     return [line for line in text.splitlines() if line.startswith("- ")]
+
+
+def _is_no_answer(text: str) -> bool:
+    """Ответ «нет ответа на тему» (§3.6) — без точки, кавычек и «ёлочек» по
+    краям: промпт сам показывает строку в «ёлочках», и модель может их
+    повторить. Отказ после оплаченного сэмплинга из-за знака препинания был
+    бы ложным (правка по ревью)."""
+    return text.strip().strip(" .«»\"'").strip() == NO_ANSWER_LINE
 
 
 @dataclass(frozen=True)
@@ -1371,7 +1386,7 @@ class Watch:
         if not text:
             raise ToolError("модель клиента вернула не памятку: (пустой ответ)")
         items = _summary_items(text)
-        if not items and text != NO_ANSWER_LINE:
+        if not items and not _is_no_answer(text):
             raise ToolError(f"модель клиента вернула не памятку: {text[:200]}")
         article_ids = {article_id for article_id, *_ in articles}
         foreign = sorted({m for m in re.findall(r"\[(\d+)\]", text) if m not in article_ids})
@@ -1397,7 +1412,13 @@ class Watch:
         ]
         if foreign:
             lines.append("⚠️ ссылки вне поиска: " + ", ".join(foreign))
-        summary = f"{ref} — {len(items)} пунктов, модель {model}"
+        # Время в строке лога — только тело инструмента: раунды — разные
+        # HTTP-запросы, и сервер без состояния не знает, когда начался первый;
+        # время сэмплинга — в логах клиента и агента (§3.8).
+        summary = (
+            f"{ref} — {_count(len(items), 'пункт', 'пункта', 'пунктов')}, модель {model}, "
+            f"без сэмплинга"
+        )
         return "\n".join(lines), summary
 
     def _load_summary(self, conn: sqlite3.Connection, summary_id: int) -> sqlite3.Row:
@@ -1497,7 +1518,7 @@ class Watch:
         shown_path = display_path(path)
         lines = [
             f"файл: {shown_path}",
-            f"Памятка {summary_ref} «{topic}» сохранена: {file_bytes} байта, {items} "
+            f"Памятка {summary_ref} «{topic}» сохранена: {_bytes_word(file_bytes)}, {items} "
             f"{_plural(items, 'пункт', 'пункта', 'пунктов')}, {len(articles)} "
             f"{_plural(len(articles), 'источник', 'источника', 'источников')}.",
             f"Проверка: файл перечитан, текст памятки {summary_ref} записан без изменений "
@@ -1505,7 +1526,7 @@ class Watch:
             f"Цепочка: поиск {search_ref} («{record.query}», снимок #{record.run_id}) → "
             f"памятка {summary_ref} → файл.",
         ]
-        return "\n".join(lines), f"{shown_path}, {file_bytes} байта, sha совпадает"
+        return "\n".join(lines), f"{shown_path}, {_bytes_word(file_bytes)}, sha совпадает"
 
     def start_line(self, port: int) -> str:
         with closing(_connect(self.db)) as conn:
@@ -1587,7 +1608,18 @@ def build_server(watch: Watch) -> MCPServer:
         # просьбы, и просьба должна совпадать — всё берётся из базы по
         # search_id, без времени и случайности. Проверки входа — здесь, до
         # просьбы к модели клиента: неверный id не должен стоить вызова.
-        record, articles = watch.summary_source(search_id)
+        # Отказ — строкой лога, как у тел инструментов в `_logged()`: это
+        # проверка передачи данных, её должно быть видно в терминале сервера
+        # (§3.8, правка по ревью). Отказ бывает только на первом раунде —
+        # просьбы нет, второго раунда нет, строка не повторяется.
+        try:
+            record, articles = watch.summary_source(search_id)
+        except ToolError as exc:
+            logger.info("faq_summarize(%s): отказ — %s", search_id, exc)
+            raise
+        except sqlite3.Error as exc:
+            logger.warning("faq_summarize(%s): отказ — база сторожа: %s", search_id, exc)
+            raise ToolError(f"база сторожа не читается: {type(exc).__name__}: {exc}") from exc
         user_text = _summary_user_text(topic, articles)
         # Строка «просьба к модели клиента» — только на первом раунде
         # (`ctx.input_responses is None`): на повторе функция выполняется
