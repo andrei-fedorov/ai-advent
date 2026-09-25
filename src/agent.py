@@ -2,7 +2,8 @@
 # день 9 — управление контекстом, день 10 — общий служебный вызов, checkpoint'ы
 # и ветки диалога; день 11 — модель памяти: рабочая и долговременная память;
 # день 12 — профиль пользователя и роутер режима; день 13 — состояние задачи;
-# день 14 — инварианты; день 17 — инструменты MCP; день 18 — группа серверов).
+# день 14 — инварианты; день 17 — инструменты MCP; день 18 — группа серверов;
+# день 19 — сэмплинг: сервер просит модель у клиента).
 #
 # Единственное место в проекте, где происходят вызовы LLM API. Модуль
 # намеренно ничего не знает ни про Gradio, ни про Too Many Bones: внутри
@@ -95,6 +96,17 @@
 # каталог может прийти не целиком — с необязательным ключом `"warning"`. Он
 # дописывается к заметке каталога хода и уходит в лог; остальное — как на
 # дне 17.
+#
+# День 19 добавляет сэмплинг — шестую служебную работу (спецификация дня 19,
+# §6.2), и единственную, что идёт не до основного запроса, а внутри него,
+# между раундами: сервер, вызванный инструментом, просит модель у клиента, а
+# клиент — это агент. Протокол `ToolBox.call()` получает необязательный
+# параметр `sample` — обычную функцию над словарями (`agent.py` про MCP
+# по-прежнему не знает); агент передаёт её в каждый вызов инструмента, решает
+# сервер, пользоваться ли ей. Сэмплинг зовёт тот же `_call_service_model()`,
+# что и остальные пять работ, со своими счётчиками `sampling_*`, и не берёт
+# замок агента — он выполняется в чужом потоке (`anyio.to_thread` на стороне
+# `mcp_client`), пока `ask()` ждёт ответа `_tools.call()` под своим замком.
 
 import copy
 import functools
@@ -103,7 +115,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Protocol
@@ -258,10 +270,12 @@ class AgentConfig:
 
 @dataclass(frozen=True)
 class ServiceCall:
-    """Служебный вызов модели, сделанный до основного запроса: стратегией
-    (день 9), моделью памяти — разбор памяти (день 11, `kind="memory"`),
-    роутером профиля (день 12, `kind="route"`), трекером задачи (день 13,
-    `kind="task"`) или стражем инвариантов (день 14, `kind="invariant"`).
+    """Служебный вызов модели: стратегией (день 9), моделью памяти — разбор
+    памяти (день 11, `kind="memory"`), роутером профиля (день 12,
+    `kind="route"`), трекером задачи (день 13, `kind="task"`), стражем
+    инвариантов (день 14, `kind="invariant"`) или сэмплингом (день 19,
+    `kind="sampling"`). Первые пять сделаны до основного запроса; сэмплинг —
+    единственный, что идёт внутри него, между раундами (§6.2).
 
     Это настоящий вызов: он считается в счётчиках агента и процесса наравне с
     обычными и логируется так же. Но это не ход — он не пишет в стек
@@ -330,6 +344,9 @@ class ToolCallRecord:
     chars: int                      # длина результата до обрезки
     truncated: bool
     elapsed: float                  # с запуском сервера; 0 — на сервер не ходили
+    # Поле дня 19 — в конце: сколько просьб к модели клиента выполнил этот
+    # вызов (`call()["samples"]`, §4.2). 0 — обычный вызов без сэмплинга.
+    samples: int = 0
 
 
 @dataclass(frozen=True)
@@ -427,6 +444,10 @@ class AgentReply:
     rounds: tuple[ModelRound, ...] = ()
     tool_calls: tuple[ToolCallRecord, ...] = ()
     tool_elapsed: float = 0.0
+    # Поле дня 19 — в конце (§6.3): все сэмплинги этого хода, в порядке
+    # выполнения. Служебные вызовы — как `service_call`/`memory_call`/…, но
+    # их может быть несколько за ход (по одному на `faq_summarize`).
+    sampling_calls: tuple[ServiceCall, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -515,6 +536,10 @@ class TurnStats:
     tools_tokens: int = 0
     tool_elapsed: float = 0.0
     first_prompt_tokens: int = 0
+    # Поля дня 19 — снова в конце: цена сэмплинга этого хода — своя колонка,
+    # как у остальных служебных работ (спецификация дня 19, §7.2).
+    sampling_tokens: int = 0
+    sampling_cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -684,7 +709,16 @@ class ToolBox(Protocol):
     несколько серверов как один). Один на процесс и общий для всех агентов.
     Обмен словарями: реализация протокол не импортирует, агент не импортирует
     `mcp_client` — про MCP он не знает. Исключений на ожидаемых сбоях методы
-    не бросают."""
+    не бросают.
+
+    С дня 19 (§6.1) `call()` получает необязательный `sample` — обычную
+    функцию словарь → словарь, которой сервер может попросить модель у
+    клиента (MCP sampling). Агент передаёт её в каждый вызов и не знает,
+    какой сервер ею воспользуется — решает сервер (`McpServer.sampling`).
+    Вход `sample`: `{"system": str, "messages": [{"role": "user"|"assistant",
+    "text": str}], "max_tokens": int}`. Выход: `{"ok": bool, "text": str,
+    "model": str, "finish_reason": str, "error": str}`.
+    """
 
     @property
     def name(self) -> str: ...
@@ -692,8 +726,10 @@ class ToolBox(Protocol):
     # и необязательный "warning" (день 18, §6): каталог получен не целиком —
     # например, один сервер группы недоступен; ход идёт с тем, что получено.
     def catalog(self) -> dict: ...
-    # {"ok", "is_error", "error", "stage", "text", "elapsed"}
-    def call(self, name: str, arguments: dict) -> dict: ...
+    # {"ok", "is_error", "error", "stage", "text", "elapsed", "samples"}
+    def call(
+        self, name: str, arguments: dict, sample: Callable[[dict], dict] | None = None
+    ) -> dict: ...
 
 
 # --- Счётчики процесса и реестр агентов ----------------------------------
@@ -928,6 +964,12 @@ class Agent:
         tools: ToolBox | None = None,
         tool_max_rounds: int = 4,
         tool_result_max_chars: int = 12_000,
+        # Потолки сэмплинга (день 19, §6.2) — снова в конце, с умолчаниями по
+        # той же причине, что лимиты инструментов выше: настоящие передаёт
+        # `app.py` из `presets.py`. Проверяет их агент, а не сервер — MCP
+        # оставляет решение, можно ли просьбу выполнить, клиенту.
+        sampling_max_tokens: int = 1500,
+        sampling_max_chars: int = 40_000,
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -958,6 +1000,10 @@ class Agent:
         self._tools = tools
         self._tool_max_rounds = tool_max_rounds
         self._tool_result_max_chars = tool_result_max_chars
+        # Потолки сэмплинга (день 19, §6.2) — состояние агента, не диалога:
+        # на диск не едут, в checkpoint не входят.
+        self._sampling_max_tokens = sampling_max_tokens
+        self._sampling_max_chars = sampling_max_chars
         self._tools_in_request: bool = True
         # Схемы последнего успешно полученного каталога — только для оценки
         # корзины `tools` в панели до вопроса (§5.4): чистые методы в сеть не
@@ -1036,6 +1082,14 @@ class Agent:
             "guard_calls": 0,
             "guard_tokens": 0,
             "guard_cost_usd": 0.0,
+            # Счётчики дня 19: сэмплинг. Считается в общих счётчиках выше,
+            # как любой вызов, но не в `service_*`, `memory_*`, `route_*`,
+            # `tracker_*` и `guard_*` — у каждой служебной работы своя цена
+            # (спецификация дня 19, §6.3). В калибровку не идёт по той же
+            # причине, что остальные служебные вызовы.
+            "sampling_calls": 0,
+            "sampling_tokens": 0,
+            "sampling_cost_usd": 0.0,
         }
         # Журнал ходов (день 8). Ведёт себя как счётчики агента, а не как стек
         # сообщений: `reset()` его не чистит, на диск он не едет, и после
@@ -1451,6 +1505,7 @@ class Agent:
         # финальный текст.
         rounds: list[ModelRound] = []
         calls: list[ToolCallRecord] = []
+        sampling_calls: list[ServiceCall] = []
         reasonings: list[tuple[int, str]] = []
         # Кэш промпта — сумма по раундам (§5.7): раунды одного хода — почти
         # один и тот же префикс, и попадания видно.
@@ -1512,6 +1567,7 @@ class Agent:
                     rounds=tuple(rounds),
                     tool_calls=tuple(calls),
                     tool_elapsed=tool_elapsed,
+                    sampling_calls=tuple(sampling_calls),
                 )
             elapsed = time.perf_counter() - started
             model_elapsed += elapsed
@@ -1571,8 +1627,11 @@ class Agent:
 
             messages = messages + [_assistant_with_calls(message)]
             for tool_call in requested:
-                record, content = self._run_tool_call(number, tool_call, known_names)
+                record, content, calls_sampling = self._run_tool_call(
+                    number, tool_call, known_names, client
+                )
                 calls.append(record)
+                sampling_calls.extend(calls_sampling)
                 tool_elapsed += record.elapsed
                 # Ответ — на каждый `tool_call_id`, даже на отклонённый:
                 # иначе API откажет в следующем раунде.
@@ -1646,6 +1705,7 @@ class Agent:
             rounds=tuple(rounds),
             tool_calls=tuple(calls),
             tool_elapsed=tool_elapsed,
+            sampling_calls=tuple(sampling_calls),
         )
 
         if self._config.keep_history:
@@ -1878,6 +1938,9 @@ class Agent:
         раундов, что у родителя, — тем же объектом, как хранилище
         долговременной памяти. Переключатель «Инструменты MCP в запросе» у
         ветки — включён.
+
+        С дня 19 (§6.2) ветка получает те же потолки сэмплинга, что у
+        родителя: они относятся к агенту, не к диалогу.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -1938,6 +2001,8 @@ class Agent:
             tools=self._tools,
             tool_max_rounds=self._tool_max_rounds,
             tool_result_max_chars=self._tool_result_max_chars,
+            sampling_max_tokens=self._sampling_max_tokens,
+            sampling_max_chars=self._sampling_max_chars,
         )
 
     @_locked
@@ -3659,9 +3724,104 @@ class Agent:
             return ""
         return json.dumps(self._last_tool_specs, ensure_ascii=False)
 
+    def _run_sampling(
+        self, client: OpenAI, tool_name: str, request: dict
+    ) -> tuple[dict, ServiceCall]:
+        """Сэмплинг — шестая служебная работа (спецификация дня 19, §6.2):
+        сервер, вызванный инструментом, просит модель у клиента. Вызывается
+        из `sample`, который `_run_tool_call()` передаёт в `_tools.call()` —
+        внутри вызова инструмента, между раундами основного запроса, а не до
+        него, как остальные пять служебных работ.
+
+        Во вход идёт только просьба сервера (§6.2): ни истории, ни памяти, ни
+        профиля, ни инвариантов агента сервер не видит. Проверки — свои
+        (`sampling_max_chars`, `sampling_max_tokens`), а не сервера: MCP
+        оставляет решение, можно ли просьбу выполнить, клиенту. Исключение
+        API не пробрасывается — сбой становится словарём протокола, а до
+        сервера он всё равно не доходит (`mcp_client`, §4.3).
+        """
+        label = f"сэмплинг для {tool_name}"
+        started = time.perf_counter()
+        system = str(request.get("system") or "")
+        raw_messages = request.get("messages") or []
+        total_chars = len(system) + sum(len(str(item.get("text") or "")) for item in raw_messages)
+        if total_chars > self._sampling_max_chars:
+            error = f"просьба длиннее {self._sampling_max_chars} символов ({total_chars})"
+            call = ServiceCall(
+                kind="sampling", label=label, ok=False, error=error,
+                elapsed=time.perf_counter() - started,
+                prompt_tokens=None, completion_tokens=None, total_tokens=None,
+                cost_usd=None, covers=0, folded_tokens=0, text="",
+            )
+            self._record_sampling(call)
+            logger.warning(
+                "[%s] %s: отказ — %s; модель не вызывалась", self._log_name, label, error,
+            )
+            return {"ok": False, "text": "", "model": "", "finish_reason": "", "error": error}, call
+
+        requested_max = request.get("max_tokens")
+        max_tokens = (
+            requested_max if isinstance(requested_max, int) and requested_max > 0
+            else self._sampling_max_tokens
+        )
+        capped = max_tokens > self._sampling_max_tokens
+        if capped:
+            max_tokens = self._sampling_max_tokens
+
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        for item in raw_messages:
+            messages.append(
+                {"role": item.get("role") or "user", "content": str(item.get("text") or "")}
+            )
+
+        try:
+            result = self._call_service_model(client, messages, max_tokens)
+        except Exception as exc:
+            logger.exception("[%s] %s упал", self._log_name, label)
+            call = ServiceCall(
+                kind="sampling", label=label, ok=False, error=str(exc),
+                elapsed=time.perf_counter() - started,
+                prompt_tokens=None, completion_tokens=None, total_tokens=None,
+                cost_usd=None, covers=0, folded_tokens=0, text="",
+            )
+            self._record_sampling(call)
+            return {"ok": False, "text": "", "model": "", "finish_reason": "", "error": str(exc)}, call
+
+        truncated = result.finish_reason == "length"
+        call = ServiceCall(
+            kind="sampling", label=label, ok=True, error=None,
+            elapsed=result.elapsed,
+            prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens, cost_usd=result.cost_usd,
+            covers=0, folded_tokens=0, text=result.text,
+            finish_reason=result.finish_reason,
+        )
+        self._record_sampling(call)
+        logger.info(
+            "[%s] %s: %d сообщ.%s, max_tokens %d%s — ок, %s/%s ток., %s, %.2f с",
+            self._log_name, label, len(raw_messages), " + system" if system else "",
+            max_tokens, " (урезано)" if capped else "",
+            _num(result.prompt_tokens), _num(result.completion_tokens),
+            _cost_str(result.cost_usd), result.elapsed,
+        )
+        if capped:
+            logger.warning(
+                "[%s] %s: сервер просил max_tokens %s — урезано до потолка %d",
+                self._log_name, label, requested_max, self._sampling_max_tokens,
+            )
+        return {
+            "ok": True,
+            "text": result.text,
+            "model": self._config.model,
+            "finish_reason": "maxTokens" if truncated else "endTurn",
+            "error": "",
+        }, call
+
     def _run_tool_call(
-        self, round_number: int, tool_call, known_names: list[str]
-    ) -> tuple[ToolCallRecord, str]:
+        self, round_number: int, tool_call, known_names: list[str], client: OpenAI
+    ) -> tuple[ToolCallRecord, str, tuple[ServiceCall, ...]]:
         """Один вызов инструмента, который попросила модель (день 17, §5.5):
         запись для журнала хода и текст сообщения `tool`. Исключений не
         бросает — любой сбой становится текстом для модели.
@@ -3671,10 +3831,23 @@ class Agent:
         сбой соединения. Результат длиннее `tool_result_max_chars` обрезается
         с пометкой — её видят модель, панель и лог: чужой сервер не может
         молча раздуть запрос.
+
+        С дня 19 (§6.1) в `_tools.call()` уходит `sample` — агент передаёт её
+        в каждый вызов, пользуется ли ею сервер, решает он сам. Каждая
+        просьба сервера становится отдельным `ServiceCall`
+        (`_run_sampling()`); все просьбы этого вызова возвращаются вызывающему.
         """
         name = tool_call.function.name
         raw = tool_call.function.arguments or ""
         elapsed = 0.0
+        samples = 0
+        sampling_calls: list[ServiceCall] = []
+
+        def sampler(request: dict) -> dict:
+            response, call = self._run_sampling(client, name, request)
+            sampling_calls.append(call)
+            return response
+
         if name not in known_names:
             status = TOOL_STATUS_UNKNOWN
             content = f"Инструмента {name} нет. Доступны: {', '.join(known_names)}"
@@ -3688,8 +3861,9 @@ class Agent:
                 content = f"Аргументы не разобраны: {exc}. Пришло: {raw}"
             else:
                 started = time.perf_counter()
-                result = self._tools.call(name, arguments)
+                result = self._tools.call(name, arguments, sample=sampler)
                 elapsed = time.perf_counter() - started
+                samples = int(result.get("samples") or 0)
                 if result.get("ok"):
                     status = TOOL_STATUS_OK
                     content = result.get("text") or ""
@@ -3720,19 +3894,21 @@ class Agent:
             chars=chars,
             truncated=truncated,
             elapsed=elapsed,
+            samples=samples,
         )
         warn = status != TOOL_STATUS_OK or truncated
         (logger.warning if warn else logger.info)(
-            "[%s] инструмент %s: %s, %d символов, %.2f с%s%s",
+            "[%s] инструмент %s: %s, %d символов, %.2f с%s%s%s",
             self._log_name, name, status, chars, elapsed,
             (
                 f" — обрезан до {self._tool_result_max_chars}"
                 if truncated
                 else ""
             ),
+            f" · сэмплингов: {samples}" if samples else "",
             f" — {content[:300]}" if status != TOOL_STATUS_OK else "",
         )
-        return record, content
+        return record, content, tuple(sampling_calls)
 
     def _optional_params(self) -> dict:
         """Опциональные параметры запроса. То, что в конфиге `None`, в API
@@ -4231,6 +4407,7 @@ class Agent:
         rounds: tuple[ModelRound, ...] = (),
         tool_calls: tuple[ToolCallRecord, ...] = (),
         tool_elapsed: float = 0.0,
+        sampling_calls: tuple[ServiceCall, ...] = (),
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
@@ -4240,9 +4417,11 @@ class Agent:
         вызова, уже оплачены и сохранены — они едут в ответ, чтобы панель
         показала и их. С дня 17 так же едут раунды и вызовы инструментов,
         сделанные до сбоя API на раунде > 1: в панели видно, на чём
-        оборвалось. Токены и деньги в ответе — `None`: в счётчики успешные
-        раунды уже попали (`_record_round()`), а упавший вызов считается
-        здесь одной ошибкой.
+        оборвалось. С дня 19 — и сэмплинги, выполненные при этих вызовах
+        (§6.2): они уже оплачены, даже если основной запрос упал позже.
+        Токены и деньги в ответе — `None`: в счётчики успешные раунды уже
+        попали (`_record_round()`), а упавший вызов считается здесь одной
+        ошибкой.
         """
         reply = AgentReply(
             ok=False,
@@ -4276,6 +4455,7 @@ class Agent:
             rounds=rounds,
             tool_calls=tool_calls,
             tool_elapsed=tool_elapsed,
+            sampling_calls=sampling_calls,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
@@ -4366,6 +4546,15 @@ class Agent:
                     (reply.rounds[0].prompt_tokens or 0) if reply.rounds
                     else (reply.prompt_tokens or 0)
                 ),
+                # Цена сэмплинга этого хода (день 19, §6.3): сумма всех
+                # просьб — их бывает несколько за ход.
+                sampling_tokens=sum(
+                    call.total_tokens or 0 for call in reply.sampling_calls
+                ),
+                sampling_cost_usd=(
+                    sum(call.cost_usd or 0.0 for call in reply.sampling_calls)
+                    if reply.sampling_calls else None
+                ),
             )
         )
         # Экономия копится по ходам и может быть отрицательной: на коротком
@@ -4430,6 +4619,20 @@ class Agent:
         self._totals["guard_calls"] += 1
         self._totals["guard_tokens"] += call.total_tokens or 0
         self._totals["guard_cost_usd"] += call.cost_usd or 0.0
+
+    def _record_sampling(self, call: ServiceCall) -> None:
+        """Учёт сэмплинга (день 19, §6.3): в общих счётчиках агента и
+        процесса — как любой вызов, и отдельно в своих `sampling_*`. Не в
+        `service_*`, `memory_*`, `route_*`, `tracker_*` и `guard_*` — у каждой
+        служебной работы своя цена. В калибровку не идёт по той же причине,
+        что остальные служебные вызовы. В отличие от них, вызывается не из
+        `ask()` под замком агента, а из чужого потока сэмплинга, пока `ask()`
+        ждёт ответа `_tools.call()` — стек в это время не меняется, поэтому
+        отдельной блокировки счётчиков здесь нет (§6.2)."""
+        self._record_extra_call(call)
+        self._totals["sampling_calls"] += 1
+        self._totals["sampling_tokens"] += call.total_tokens or 0
+        self._totals["sampling_cost_usd"] += call.cost_usd or 0.0
 
     def _active_invariants(self) -> int:
         """Сколько инвариантов действует сейчас; 0 — книги нет."""

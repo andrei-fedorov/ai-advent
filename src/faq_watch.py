@@ -1,5 +1,6 @@
 # TooManyRules — сторож FAQ: свой долгоживущий MCP-сервер по Streamable HTTP
-# (день 18, неделя 4).
+# (день 18, неделя 4; день 19 — пайплайн памятки к столу: поиск, сжатие
+# моделью клиента через MCP sampling, сохранение в файл).
 #
 # **Отдельная программа, а не модуль приложения** (спецификация дня 18, §3.1),
 # как `faq_server.py`, но запускает её не `mcp_client`, а человек:
@@ -18,10 +19,18 @@
 # 3. по вызову `faq_changes` отдаёт агрегированную сводку за период — из базы,
 #    без запросов к сайту;
 # 4. по вызову `faq_watch_schedule` меняет расписание: ответ сразу, снимок по
-#    новому расписанию — потом, в фоне.
+#    новому расписанию — потом, в фоне;
+# 5. (день 19) `faq_search` находит статьи в последнем снимке по английским
+#    ключевым словам, `faq_summarize` сжимает найденное в памятку по-русски
+#    (модель клиента, через MCP sampling), `cheatsheet_save` сохраняет памятку
+#    в Markdown-файл. Данные между тремя шагами передаются по ссылке — id
+#    `q…`/`s…`, а не текстом: каждый шаг сам достаёт из базы то, что записал
+#    предыдущий, и проверяет, что переданный id — того вида и с той же базы
+#    (спецификация дня 19, §2.3).
 #
 # Сервер знает портал Freshdesk, но не конкретную игру: адрес портала, id
 # категории, её имя и путь к базе приходят аргументами командной строки.
+# День 19 добавляет `--out` — каталог для файлов памяток.
 #
 # Процесс живёт долго и держит своё состояние — базу и расписание; подключения
 # клиента при этом короткие (одно на вызов), поэтому `stateless_http=True`:
@@ -32,10 +41,21 @@
 # Единственное место работы с базой сторожа (`sqlite3` из стандартной
 # библиотеки). Правило «диск трогает только `storage.py`» — про приложение, а
 # это отдельная программа со своими данными; база — данные сервера, приложение
-# её не открывает.
+# её не открывает. День 19 добавляет второй вид файлов — памятки в `--out`:
+# запись атомарная (временный файл + `os.replace`, как у хранилищ
+# приложения), файлы не перезаписываются.
 #
 # Логи — только stderr, с префиксом `[FAQ-сторож]`. Строк на каждый запрос к
 # сайту нет: логгер `faq_server` здесь не настроен, и его INFO не выходит.
+#
+# `faq_summarize` (день 19, §2.4) — первое место в проекте, где сервер MCP
+# просит модель у клиента (`sampling/createMessage`), а не наоборот: сервер
+# отвечает `InputRequiredResult`, клиент выполняет просьбу и повторяет
+# `tools/call` с ответом (эра протокола 2026-07-28, §2.9). У сервера при этом
+# нет ни ключа DeepSeek, ни SDK `openai` — правило «LLM API — только в
+# agent.py» этим не нарушается: модель вызывает клиент. Реализовано через
+# `Annotated[CreateMessageResult, Resolve(fn)]` SDK v2: параметр с `Resolve` в
+# схему инструмента не попадает, модель его не видит.
 
 import argparse
 import asyncio
@@ -44,6 +64,8 @@ import hashlib
 import itertools
 import json
 import logging
+import os
+import re
 import socket
 import sqlite3
 import sys
@@ -56,15 +78,15 @@ from pathlib import Path
 from typing import Annotated
 
 import anyio
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer, Resolve, Sample
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import ToolAnnotations
+from mcp.types import CreateMessageResult, SamplingMessage, TextContent, ToolAnnotations
 from pydantic import Field
 
 from faq_server import ARTICLE_PATH, Article, Config, Site, read_article, read_sections
 
 SERVER_NAME = "toomanyrules-faq-watch"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 # --- Сеть ------------------------------------------------------------------
 # Адрес — только 127.0.0.1, аргумента хоста нет (§15): наружу сервер не
@@ -121,10 +143,12 @@ ORIGIN_DB = "из базы"
 ORIGIN_DEFAULT = "по умолчанию"
 ORIGIN_ARG = "из --interval"
 
-# --- База (§3.9) -----------------------------------------------------------
-# Версия схемы — `PRAGMA user_version`. 0 у пустой базы: схема создаётся; своя
-# версия — работаем; любая другая — чужая база, сервер не стартует.
-SCHEMA_VERSION = 1
+# --- База (§3.9, день 19 §3.7) ----------------------------------------------
+# Версия схемы — `PRAGMA user_version`. 0 у пустой базы: схема создаётся
+# целиком; 1 — база дня 18: добавляются только три новые таблицы; своя версия
+# (2) — работаем; любая другая — чужая база, сервер не стартует. Миграция
+# 1 → 2 — единственная, добавочная: таблицы дня 18 не меняются.
+SCHEMA_VERSION = 2
 SCHEMA = (
     """CREATE TABLE runs (
         id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
@@ -140,6 +164,22 @@ SCHEMA = (
         run_id INTEGER NOT NULL REFERENCES runs(id), article_id TEXT NOT NULL,
         kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')""",
     "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+)
+# Таблицы дня 19 (§3.7) — пайплайн памятки: `searches` хранит, что и где
+# нашлось (`article_ids` — JSON-список в порядке поиска, ссылка на снимок —
+# `run_id`), `summaries` — сжатую памятку и её хеш (для проверки на шаге
+# сохранения), `saves` — куда и с каким хешем файла она легла.
+SCHEMA_V19 = (
+    """CREATE TABLE searches (
+        id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, run_id INTEGER NOT NULL REFERENCES runs(id),
+        query TEXT NOT NULL, limit_n INTEGER NOT NULL, article_ids TEXT NOT NULL)""",
+    """CREATE TABLE summaries (
+        id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, search_id INTEGER NOT NULL REFERENCES searches(id),
+        topic TEXT NOT NULL, text TEXT NOT NULL, text_hash TEXT NOT NULL, model TEXT NOT NULL,
+        items INTEGER NOT NULL, foreign_refs TEXT NOT NULL DEFAULT '')""",
+    """CREATE TABLE saves (
+        id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, summary_id INTEGER NOT NULL REFERENCES summaries(id),
+        path TEXT NOT NULL, file_hash TEXT NOT NULL, bytes INTEGER NOT NULL)""",
 )
 SETTING_INTERVAL = "interval_minutes"
 
@@ -176,6 +216,92 @@ SCHEDULE_ANNOTATIONS = ToolAnnotations(
     destructive_hint=False,
     idempotent_hint=True,
     open_world_hint=False,
+)
+
+# --- Памятка к столу (день 19) ----------------------------------------------
+# Ссылки между шагами пайплайна — id внутри базы сторожа, не тексты (§2.3):
+# `q…` — результат `faq_search`, `s…` — результат `faq_summarize`. Модель
+# передаёт id следующему шагу, шаг сам достаёт данные из базы.
+SEARCH_PREFIX = "q"
+SUMMARY_PREFIX = "s"
+
+# Поиск по словам (§2.5): токены — `[a-z0-9']+` в нижнем регистре, от 3 букв,
+# без короткого списка служебных английских слов (черновик; правки по
+# прогону — строкой в комментарии). Слово запроса совпадает, если оно —
+# начало слова статьи («poison» находит «poisoned»).
+_SEARCH_WORD_RE = re.compile(r"[a-z0-9']+")
+SEARCH_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "how", "does", "can", "that", "this",
+    "from", "are", "was", "were", "has", "have", "not", "but", "you",
+    "your", "when", "what", "who", "why", "his", "her", "its", "they",
+    "them", "their", "any", "all", "did", "yes", "get", "one",
+})
+SEARCH_QUESTION_WEIGHT = 3
+SEARCH_TEXT_WEIGHT = 1
+SEARCH_LIMIT_DEFAULT = 5
+SEARCH_LIMIT_MAX = 10
+NO_SNAPSHOT_ERROR = "снимков FAQ ещё нет — сторож делает первый снимок; попробуй через минуту"
+# Ответ модели клиента без пунктов, но по теме (§3.6) — единственный
+# допустимый ответ без «- »: сервер про игру не знает и промпт запрашивает
+# ровно эту строку.
+NO_ANSWER_LINE = "В найденных статьях нет ответа на тему"
+
+# Имя файла памятки (§2.6): только эти символы, до 40 знаков; пусто после
+# очистки — по номеру памятки.
+CHEATSHEET_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+CHEATSHEET_NAME_MAX = 40
+CHEATSHEET_DATE_FORMAT = "%Y-%m-%d"
+
+# Промпт сжатия — промпт сервера, а не агента (§3.6): сервер решает, о чём
+# просить, клиент — какой моделью. Каждое правило закрывает возможный сбой
+# памятки; правки по живому прогону — строкой в комментарии у константы.
+SUMMARY_PROMPT = (
+    "Ты составляешь памятку к игровому столу по официальному FAQ настольной игры {name}. "
+    "Пиши по-русски, только по статьям ниже, ничего не добавляй от себя. Игровые термины "
+    "оставляй по-английски (Poison, Baddie, Gearloc). Формат: от 3 до 8 пунктов, каждый "
+    "начинается с «- », один пункт — одно правило, в конце пункта — номер статьи-источника "
+    "в квадратных скобках, например [33000210161]. Не больше 200 слов. Без заголовка и "
+    "вступления. Если статьи не отвечают на тему — одна строка: «" + NO_ANSWER_LINE + "»."
+)
+SUMMARY_MAX_TOKENS = 1000     # страховка; длину держит «не больше 200 слов» (урок дня 9)
+
+# Описания — черновик; правки по прогону — строкой в комментарии у константы.
+SEARCH_DESCRIPTION = (
+    "Шаг 1 памятки к столу: поиск статей официального FAQ по игре {name} в последнем снимке "
+    "сторожа — по английским ключевым словам (FAQ английский). Возвращает id поиска (q…) и "
+    "найденные статьи. Для памятки передай id поиска в faq_summarize — сам статьи не "
+    "пересказывай. Для ответа на обычный вопрос о правилах — faq_questions и faq_article."
+)
+QUERY_DESCRIPTION = (
+    "Английские ключевые слова через пробел: «poison», «tink bots». Ищутся по началу слова "
+    "в вопросе и тексте статьи."
+)
+LIMIT_DESCRIPTION = f"Сколько статей взять, 1-{SEARCH_LIMIT_MAX}."
+SUMMARIZE_DESCRIPTION = (
+    "Шаг 2 памятки: сжимает статьи из результата faq_search в памятку по-русски со ссылками на "
+    "статьи. Принимает только id поиска (q…) — тексты передавать не нужно, сервер берёт их сам "
+    "из того же снимка. Сжатие делает модель клиента по просьбе сервера. Возвращает id памятки "
+    "(s…) и её текст."
+)
+SEARCH_ID_DESCRIPTION = "id поиска из первой строки ответа faq_search: q7."
+TOPIC_DESCRIPTION = "Тема памятки по-русски — станет её заголовком: «Яд (Poison)»."
+SAVE_DESCRIPTION = (
+    "Шаг 3 памятки: сохраняет памятку (id s… из faq_summarize) в Markdown-файл с источниками и "
+    "проверяет, что записан ровно её текст. Вызывай, когда игрок просит сохранить памятку."
+)
+SUMMARY_ID_DESCRIPTION = "id памятки из первой строки ответа faq_summarize: s3."
+NAME_DESCRIPTION = "Необязательное имя файла латиницей: «tink-bots». Пусто — по номеру памятки."
+
+# Аннотации честные (§3.1): все три пишут в базу (или файл), не разрушают
+# (не перезаписывают), мир закрытый — данные только из снимков сторожа.
+SEARCH_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False,
+)
+SUMMARIZE_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False,
+)
+SAVE_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False,
 )
 
 logger = logging.getLogger("toomanyrules.faq_watch")
@@ -287,7 +413,8 @@ class DbError(Exception):
 
 def check_db(path: Path) -> int:
     """Версия схемы существующей базы; 0 — нового пути или пустого файла.
-    Только чтение (`mode=ro`): отказ не должен оставить следов в файле."""
+    Только чтение (`mode=ro`): отказ не должен оставить следов в файле.
+    Версия 1 (день 18) принимается — `init_db()` домигрирует её до 2."""
     if not path.exists() or path.stat().st_size == 0:
         return 0
     try:
@@ -299,7 +426,7 @@ def check_db(path: Path) -> int:
         raise DbError(f"файл не открывается как база SQLite: {exc}") from exc
     if version == 0 and tables:
         raise DbError("версия схемы 0, но в базе уже есть таблицы — это не база сторожа")
-    if version not in (0, SCHEMA_VERSION):
+    if version not in (0, 1, SCHEMA_VERSION):
         raise DbError(f"версия схемы {version}, сервер знает только {SCHEMA_VERSION}")
     return version
 
@@ -325,14 +452,19 @@ def _transaction(conn: sqlite3.Connection) -> Iterator[None]:
 
 def init_db(path: Path, version: int) -> None:
     """Схема для новой базы (одной транзакцией, вместе с версией) и режим WAL:
-    инструменты читают, пока снимок пишет."""
+    инструменты читают, пока снимок пишет. Версия 1 (база дня 18) —
+    единственная миграция, добавочная: дописывает только три новые таблицы
+    (§3.7), таблицы дня 18 не трогает."""
     if version == SCHEMA_VERSION:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(_connect(path)) as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         with _transaction(conn):
-            for statement in SCHEMA:
+            if version == 0:
+                for statement in SCHEMA:
+                    conn.execute(statement)
+            for statement in SCHEMA_V19:
                 conn.execute(statement)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -495,6 +627,93 @@ def text_diff(old: str, new: str) -> list[str]:
     return shown
 
 
+# --- Памятка к столу: поиск, id, имя файла (день 19, §2.3, §2.5, §2.6) -----
+
+def _search_words(text: str) -> list[str]:
+    """Токены для поиска: `[a-z0-9']+` в нижнем регистре, от 3 букв, без
+    короткого списка служебных слов (§2.5)."""
+    return [
+        word for word in _SEARCH_WORD_RE.findall(text.lower())
+        if len(word) >= 3 and word not in SEARCH_STOPWORDS
+    ]
+
+
+def _score_article(
+    query_words: list[str], question_words: list[str], text_words: list[str]
+) -> tuple[int, dict[str, list[str]]]:
+    """Оценка статьи по словам запроса (§2.5): слово запроса совпадает, если
+    оно — начало слова статьи («poison» находит «poisoned»); 3 за совпадение
+    в вопросе, 1 — в тексте. Возвращает оценку и то, где какое слово
+    совпало — для строки ответа."""
+    score = 0
+    hits: dict[str, list[str]] = {}
+    for word in query_words:
+        in_question = any(article_word.startswith(word) for article_word in question_words)
+        in_text = any(article_word.startswith(word) for article_word in text_words)
+        if in_question:
+            score += SEARCH_QUESTION_WEIGHT
+            hits.setdefault(word, []).append("вопрос")
+        if in_text:
+            score += SEARCH_TEXT_WEIGHT
+            hits.setdefault(word, []).append("текст")
+    return score, hits
+
+
+def _require_search_ref(raw: str) -> int:
+    """Разбирает id поиска (`q…`) — отдельная проверка вида, а не JSON Schema
+    (§3.1): модель лучше исправляется по понятному тексту, чем по ошибке
+    валидации pydantic."""
+    tail = raw[len(SUMMARY_PREFIX):]
+    if raw.startswith(SUMMARY_PREFIX) and tail.isdigit():
+        raise ToolError(f"{raw} — id памятки, а нужен id поиска ({SEARCH_PREFIX}…) из faq_search")
+    tail = raw[len(SEARCH_PREFIX):]
+    if not (raw.startswith(SEARCH_PREFIX) and tail.isdigit()):
+        raise ToolError(f"«{raw}» не похоже на id поиска ({SEARCH_PREFIX}…) из faq_search")
+    return int(tail)
+
+
+def _require_summary_ref(raw: str) -> int:
+    """Разбирает id памятки (`s…`) — та же проверка вида, что у поиска."""
+    tail = raw[len(SEARCH_PREFIX):]
+    if raw.startswith(SEARCH_PREFIX) and tail.isdigit():
+        raise ToolError(f"{raw} — id поиска, а нужен id памятки ({SUMMARY_PREFIX}…) из faq_summarize")
+    tail = raw[len(SUMMARY_PREFIX):]
+    if not (raw.startswith(SUMMARY_PREFIX) and tail.isdigit()):
+        raise ToolError(f"«{raw}» не похоже на id памятки ({SUMMARY_PREFIX}…) из faq_summarize")
+    return int(tail)
+
+
+def _clean_cheatsheet_name(raw: str, summary_id: int) -> str:
+    """Имя файла из параметра `name` (§2.6): только `[a-z0-9-]`, до 40 знаков;
+    пусто после очистки — по номеру памятки."""
+    cleaned = "".join(ch for ch in raw.strip().lower() if ch in CHEATSHEET_NAME_CHARS)
+    cleaned = cleaned.strip("-")[:CHEATSHEET_NAME_MAX].strip("-")
+    return cleaned or f"cheatsheet-{SUMMARY_PREFIX}{summary_id}"
+
+
+def _summary_user_text(topic: str, articles: list[tuple[str, str, str, str]]) -> str:
+    """Вход сжатия (§3.4): «Тема: …», затем по статье — заголовок и текст, в
+    порядке поиска. `articles` — (номер, раздел, вопрос, текст)."""
+    parts = [f"Тема: {topic}"]
+    for article_id, section, question, text in articles:
+        parts.append(f"### {article_id} · {section} · {question}\n{text}")
+    return "\n\n".join(parts)
+
+
+def _summary_items(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("- ")]
+
+
+@dataclass(frozen=True)
+class SearchRecord:
+    """Строка `searches` (§3.7): что искали и на каком снимке."""
+    id: int
+    query: str
+    limit: int
+    run_id: int
+    article_ids: list[str]
+
+
 # --- Сторож ----------------------------------------------------------------
 
 class SnapshotError(Exception):
@@ -512,9 +731,12 @@ class Watch:
     как разбудить планировщик. Один на процесс; снимки делает только
     планировщик, инструменты читают базу и меняют интервал."""
 
-    def __init__(self, config: Config, db: Path) -> None:
+    def __init__(self, config: Config, db: Path, out_dir: Path) -> None:
         self.config = config
         self.db = db
+        # Каталог памяток (день 19, §2.6) — аргумент `--out`; создаётся, если
+        # его нет, до первого вызова `cheatsheet_save()`.
+        self.out_dir = out_dir
         self.interval = DEFAULT_INTERVAL_MIN
         self.interval_origin = ORIGIN_DEFAULT
         self.running: Running | None = None
@@ -1026,6 +1248,265 @@ class Watch:
         text = f"Расписание: раз в {minutes} мин (было {previous}). {last}, {upcoming}."
         return text, f"было {previous}; следующий снимок {self._due_text(due)}"
 
+    # --- памятка к столу (день 19) ---
+
+    def search(self, query: str, limit: int) -> tuple[str, str]:
+        """Ответ `faq_search` и строка для лога (§2.5, §3.3): ищет в
+        последнем удачном снимке — сеть не трогает, результат воспроизводим."""
+        with closing(_connect(self.db)) as conn:
+            ok_run, _ = self.attempts(conn)
+            if ok_run is None:
+                raise ToolError(NO_SNAPSHOT_ERROR)
+            rows = conn.execute(
+                "SELECT a.article_id, a.section, a.question, t.text FROM articles a "
+                "JOIN texts t ON t.hash = a.text_hash WHERE a.run_id = ? ORDER BY a.rowid",
+                (ok_run.id,),
+            ).fetchall()
+            total = len(rows)
+            query_words = _search_words(query)
+            scored: list[tuple[int, dict[str, list[str]], sqlite3.Row]] = []
+            for row in rows:
+                question_words = _search_words(row["question"])
+                text_words = _search_words(row["text"])
+                score, hits = _score_article(query_words, question_words, text_words)
+                if score > 0:
+                    scored.append((score, hits, row))
+            # Стабильная сортировка: при равной оценке порядок остаётся тем,
+            # в каком статьи лежат в снимке — «как на сайте» (§2.5).
+            scored.sort(key=lambda item: -item[0])
+            top = scored[:limit]
+            article_ids = [row["article_id"] for _, _, row in top]
+            with _transaction(conn):
+                conn.execute(
+                    "INSERT INTO searches (id, created_at, run_id, query, limit_n, article_ids) "
+                    "VALUES (NULL, ?, ?, ?, ?, ?)",
+                    (_iso(_now()), ok_run.id, query, limit, json.dumps(article_ids)),
+                )
+                search_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        ref = f"{SEARCH_PREFIX}{search_id}"
+        lines = [f"id: {ref}"]
+        if not top:
+            lines.append(
+                f"Поиск «{query}» в снимке #{ok_run.id} ({_fmt(ok_run.started_at)}): "
+                f"ничего не найдено среди {total}; попробуй другие английские слова."
+            )
+            return "\n".join(lines), f"{ref} — 0 из {total}"
+        lines.append(
+            f"Поиск «{query}» в снимке #{ok_run.id} ({_fmt(ok_run.started_at)}): "
+            f"{_articles_word(len(top))} из {total}."
+        )
+        lines.append("Строка: номер · раздел · вопрос · совпало.")
+        for _, hits, row in top:
+            matched = ", ".join(
+                f"{word} ({', '.join(sorted(set(where)))})" for word, where in hits.items()
+            )
+            lines.append(f"{row['article_id']} · {row['section']} · {row['question']} · {matched}")
+        lines.append(f"Для памятки передай id {ref} в faq_summarize.")
+        return "\n".join(lines), f"{ref} — {len(top)} из {total} (снимок #{ok_run.id})"
+
+    def _load_search(self, conn: sqlite3.Connection, search_id: int) -> SearchRecord:
+        row = conn.execute("SELECT * FROM searches WHERE id = ?", (search_id,)).fetchone()
+        if row is None:
+            raise ToolError(f"поиска {SEARCH_PREFIX}{search_id} нет")
+        return SearchRecord(
+            id=row["id"], query=row["query"], limit=row["limit_n"], run_id=row["run_id"],
+            article_ids=json.loads(row["article_ids"]),
+        )
+
+    def _search_articles(
+        self, conn: sqlite3.Connection, record: SearchRecord,
+    ) -> list[tuple[str, str, str, str]]:
+        """Тексты статей поиска — из того же снимка, на котором искали
+        (§2.3): снимка нет или в нём нет статьи — одна и та же ошибка,
+        «повтори поиск» (снимки не удаляются, поэтому в обычном прогоне она
+        не встречается)."""
+        missing = ToolError(
+            f"снимка #{record.run_id}, на котором искали {SEARCH_PREFIX}{record.id}, "
+            f"в базе нет — повтори поиск"
+        )
+        run = conn.execute("SELECT id FROM runs WHERE id = ? AND ok = 1", (record.run_id,)).fetchone()
+        if run is None:
+            raise missing
+        found: dict[str, tuple[str, str, str]] = {}
+        for row in conn.execute(
+            "SELECT a.article_id, a.section, a.question, t.text FROM articles a "
+            "JOIN texts t ON t.hash = a.text_hash WHERE a.run_id = ?", (record.run_id,),
+        ):
+            found[row["article_id"]] = (row["section"], row["question"], row["text"])
+        articles: list[tuple[str, str, str, str]] = []
+        for article_id in record.article_ids:
+            info = found.get(article_id)
+            if info is None:
+                raise missing
+            section, question, text = info
+            articles.append((article_id, section, question, text))
+        return articles
+
+    def summary_source(
+        self, search_id_raw: str,
+    ) -> tuple[SearchRecord, list[tuple[str, str, str, str]]]:
+        """Данные для сжатия по id поиска (§3.4): проверки входа — здесь, до
+        просьбы к модели клиента, чтобы неверный id не стоил вызова."""
+        search_id = _require_search_ref(search_id_raw)
+        with closing(_connect(self.db)) as conn:
+            record = self._load_search(conn, search_id)
+            articles = self._search_articles(conn, record)
+        if not articles:
+            raise ToolError(f"поиск {SEARCH_PREFIX}{record.id} ничего не нашёл — сжимать нечего")
+        return record, articles
+
+    def summarize(
+        self, search_id_raw: str, topic: str, result: CreateMessageResult,
+    ) -> tuple[str, str]:
+        """Ответ `faq_summarize` (§3.3): разбирает ответ модели клиента,
+        проверяет ссылки на статьи этого поиска, пишет памятку одной строкой.
+        Оборванный по лимиту ответ не записывается — правило трекера дня 13,
+        оборванный результат хуже отсутствия."""
+        record, articles = self.summary_source(search_id_raw)
+        if result.stop_reason == "maxTokens":
+            raise ToolError("памятка оборвана по лимиту — сократи limit поиска")
+        content = result.content
+        text = (content.text if isinstance(content, TextContent) else "").strip()
+        if not text:
+            raise ToolError("модель клиента вернула не памятку: (пустой ответ)")
+        items = _summary_items(text)
+        if not items and text != NO_ANSWER_LINE:
+            raise ToolError(f"модель клиента вернула не памятку: {text[:200]}")
+        article_ids = {article_id for article_id, *_ in articles}
+        foreign = sorted({m for m in re.findall(r"\[(\d+)\]", text) if m not in article_ids})
+        model = result.model or "?"
+        digest = text_hash(text)
+        with closing(_connect(self.db)) as conn, _transaction(conn):
+            conn.execute(
+                "INSERT INTO summaries (id, created_at, search_id, topic, text, text_hash, "
+                "model, items, foreign_refs) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (_iso(_now()), record.id, topic, text, digest, model, len(items), json.dumps(foreign)),
+            )
+            summary_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        ref = f"{SUMMARY_PREFIX}{summary_id}"
+        search_ref = f"{SEARCH_PREFIX}{record.id}"
+        lines = [
+            f"id: {ref}",
+            f"Памятка «{topic}» из поиска {search_ref} ({_articles_word(len(articles))}, "
+            f"снимок #{record.run_id}), модель клиента {model}, {len(items)} "
+            f"{_plural(len(items), 'пункт', 'пункта', 'пунктов')}.",
+            text,
+            f"Чтобы сохранить, передай id {ref} в cheatsheet_save.",
+        ]
+        if foreign:
+            lines.append("⚠️ ссылки вне поиска: " + ", ".join(foreign))
+        summary = f"{ref} — {len(items)} пунктов, модель {model}"
+        return "\n".join(lines), summary
+
+    def _load_summary(self, conn: sqlite3.Connection, summary_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM summaries WHERE id = ?", (summary_id,)).fetchone()
+        if row is None:
+            raise ToolError(f"памятки {SUMMARY_PREFIX}{summary_id} нет")
+        return row
+
+    def _unique_cheatsheet_path(self, stem: str) -> Path:
+        candidate = self.out_dir / f"{stem}.md"
+        number = 2
+        while candidate.exists():
+            candidate = self.out_dir / f"{stem}-{number}.md"
+            number += 1
+        return candidate
+
+    def _cheatsheet_content(
+        self, topic: str, text: str, record: SearchRecord, run: Run,
+        articles: list[tuple[str, str, str, str]], summary_ref: str, model: str,
+        summary_hash: str, search_ref: str,
+    ) -> str:
+        """Файл памятки (§2.6): заголовок, источники и строка происхождения
+        пишет код, из базы — модель пишет только пункты (уже в `text`)."""
+        lines = [f"# Памятка: {topic}", "", text, "", "---", ""]
+        lines.append(
+            f"Источники — официальный FAQ издателя «{self.config.category_name}», снимок "
+            f"#{record.run_id} от {_fmt(run.started_at)}:"
+        )
+        for article_id, section, question, _ in articles:
+            lines.append(f"- [{article_id}]({self._article_url(article_id)}) · {section} · {question}")
+        lines.append("")
+        lines.append(
+            f"Собрано {_fmt(_now())} · поиск {search_ref} («{record.query}», "
+            f"{_articles_word(len(articles))}) → памятка {summary_ref} (модель {model}, "
+            f"sha {summary_hash[:12]}…) → этот файл"
+        )
+        return "\n".join(lines)
+
+    def save_cheatsheet(self, summary_id_raw: str, name: str) -> tuple[str, str]:
+        """Ответ `cheatsheet_save` (§3.3, §3.5): хеш памятки сверяется с
+        записанным при сжатии, файл пишется атомарно внутри `--out`,
+        перечитывается и сверяется байт в байт."""
+        summary_id = _require_summary_ref(summary_id_raw)
+        with closing(_connect(self.db)) as conn:
+            summary_row = self._load_summary(conn, summary_id)
+            text = summary_row["text"]
+            if text_hash(text) != summary_row["text_hash"]:
+                raise ToolError(
+                    f"памятка {SUMMARY_PREFIX}{summary_id} изменена после сжатия — сохранять не буду"
+                )
+            record = self._load_search(conn, summary_row["search_id"])
+            articles = self._search_articles(conn, record)
+            run_row = conn.execute("SELECT * FROM runs WHERE id = ?", (record.run_id,)).fetchone()
+            run = _run(run_row)
+
+        topic = summary_row["topic"]
+        model = summary_row["model"]
+        items = summary_row["items"]
+        summary_ref = f"{SUMMARY_PREFIX}{summary_id}"
+        search_ref = f"{SEARCH_PREFIX}{record.id}"
+
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{_now().strftime(CHEATSHEET_DATE_FORMAT)}-{_clean_cheatsheet_name(name, summary_id)}"
+        path = self._unique_cheatsheet_path(stem)
+        # Проверка ещё раз, что путь остался внутри `--out` (§2.6): очистка
+        # имени уже не оставляет в нём «/» и «..», это защита сверх неё.
+        if self.out_dir.resolve() not in path.resolve().parents:
+            raise ToolError("путь файла вышел за пределы каталога памяток — сохранение отменено")
+
+        content = self._cheatsheet_content(
+            topic, text, record, run, articles, summary_ref, model,
+            summary_row["text_hash"], search_ref,
+        )
+        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+        try:
+            tmp.write_text(content, encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            if tmp.exists():
+                tmp.unlink()
+            raise ToolError(f"файл не записался: {type(exc).__name__}: {exc}") from exc
+
+        written = path.read_text(encoding="utf-8")
+        if text not in written:
+            path.unlink(missing_ok=True)
+            raise ToolError("файл записан, но текст памятки в нём не совпадает — файл удалён")
+
+        file_bytes = len(written.encode("utf-8"))
+        file_digest = text_hash(written)
+        with closing(_connect(self.db)) as conn, _transaction(conn):
+            conn.execute(
+                "INSERT INTO saves (id, created_at, summary_id, path, file_hash, bytes) "
+                "VALUES (NULL, ?, ?, ?, ?, ?)",
+                (_iso(_now()), summary_id, str(path), file_digest, file_bytes),
+            )
+
+        shown_path = display_path(path)
+        lines = [
+            f"файл: {shown_path}",
+            f"Памятка {summary_ref} «{topic}» сохранена: {file_bytes} байта, {items} "
+            f"{_plural(items, 'пункт', 'пункта', 'пунктов')}, {len(articles)} "
+            f"{_plural(len(articles), 'источник', 'источника', 'источников')}.",
+            f"Проверка: файл перечитан, текст памятки {summary_ref} записан без изменений "
+            f"(sha {summary_row['text_hash'][:12]}… совпадает с записанным при сжатии).",
+            f"Цепочка: поиск {search_ref} («{record.query}», снимок #{record.run_id}) → "
+            f"памятка {summary_ref} → файл.",
+        ]
+        return "\n".join(lines), f"{shown_path}, {file_bytes} байта, sha совпадает"
+
     def start_line(self, port: int) -> str:
         with closing(_connect(self.db)) as conn:
             total = conn.execute("SELECT count(*) FROM runs").fetchone()[0]
@@ -1059,11 +1540,11 @@ def build_server(watch: Watch) -> MCPServer:
         name=SERVER_NAME, version=SERVER_VERSION, log_level="WARNING",
         lifespan=scheduler_lifespan,
     )
-    name = watch.config.category_name
+    game_name = watch.config.category_name
 
     @server.tool(
         title="Сводка изменений FAQ",
-        description=CHANGES_DESCRIPTION.format(name=name),
+        description=CHANGES_DESCRIPTION.format(name=game_name),
         annotations=CHANGES_ANNOTATIONS,
         structured_output=False,
     )
@@ -1074,7 +1555,7 @@ def build_server(watch: Watch) -> MCPServer:
 
     @server.tool(
         title="Расписание сторожа FAQ",
-        description=SCHEDULE_DESCRIPTION.format(name=name),
+        description=SCHEDULE_DESCRIPTION.format(name=game_name),
         annotations=SCHEDULE_ANNOTATIONS,
         structured_output=False,
     )
@@ -1087,16 +1568,90 @@ def build_server(watch: Watch) -> MCPServer:
             f"faq_watch_schedule({interval_minutes})", lambda: watch.schedule(interval_minutes)
         )
 
+    @server.tool(
+        title="Поиск статей для памятки",
+        description=SEARCH_DESCRIPTION.format(name=game_name),
+        annotations=SEARCH_ANNOTATIONS,
+        structured_output=False,
+    )
+    async def faq_search(
+        query: Annotated[str, Field(min_length=1, max_length=200, description=QUERY_DESCRIPTION)],
+        limit: Annotated[
+            int, Field(ge=1, le=SEARCH_LIMIT_MAX, description=LIMIT_DESCRIPTION)
+        ] = SEARCH_LIMIT_DEFAULT,
+    ) -> str:
+        return _logged(f'faq_search("{query}", {limit})', lambda: watch.search(query, limit))
+
+    def summary_request(search_id: str, topic: str, ctx: Context) -> Sample:
+        # Детерминированная функция (§3.4): SDK выполняет её на каждом раунде
+        # просьбы, и просьба должна совпадать — всё берётся из базы по
+        # search_id, без времени и случайности. Проверки входа — здесь, до
+        # просьбы к модели клиента: неверный id не должен стоить вызова.
+        record, articles = watch.summary_source(search_id)
+        user_text = _summary_user_text(topic, articles)
+        # Строка «просьба к модели клиента» — только на первом раунде
+        # (`ctx.input_responses is None`): на повторе функция выполняется
+        # снова, но тело инструмента — только после ответа (§3.4, §3.8).
+        if ctx.input_responses is None:
+            logger.info(
+                "faq_summarize(%s, «%s»): просьба к модели клиента — %s, %d символов, "
+                "max_tokens %d",
+                f"{SEARCH_PREFIX}{record.id}", topic, _articles_word(len(articles)),
+                len(user_text), SUMMARY_MAX_TOKENS,
+            )
+        return Sample(
+            [SamplingMessage(role="user", content=TextContent(type="text", text=user_text))],
+            max_tokens=SUMMARY_MAX_TOKENS,
+            system_prompt=SUMMARY_PROMPT.format(name=watch.config.category_name),
+        )
+
+    @server.tool(
+        title="Сжатие статей в памятку",
+        description=SUMMARIZE_DESCRIPTION.format(name=game_name),
+        annotations=SUMMARIZE_ANNOTATIONS,
+        structured_output=False,
+    )
+    async def faq_summarize(
+        search_id: Annotated[
+            str, Field(min_length=1, max_length=20, description=SEARCH_ID_DESCRIPTION)
+        ],
+        topic: Annotated[str, Field(min_length=1, max_length=100, description=TOPIC_DESCRIPTION)],
+        summary: Annotated[CreateMessageResult, Resolve(summary_request)],
+    ) -> str:
+        return _logged(
+            f"faq_summarize({search_id})", lambda: watch.summarize(search_id, topic, summary)
+        )
+
+    @server.tool(
+        title="Сохранение памятки в файл",
+        description=SAVE_DESCRIPTION.format(name=game_name),
+        annotations=SAVE_ANNOTATIONS,
+        structured_output=False,
+    )
+    async def cheatsheet_save(
+        summary_id: Annotated[
+            str, Field(min_length=1, max_length=20, description=SUMMARY_ID_DESCRIPTION)
+        ],
+        name: Annotated[str, Field(max_length=60, description=NAME_DESCRIPTION)] = "",
+    ) -> str:
+        return _logged(
+            f"cheatsheet_save({summary_id})", lambda: watch.save_cheatsheet(summary_id, name)
+        )
+
     return server
 
 
 def _logged(call: str, work) -> str:
-    """Строка лога на вызов. Ошибка базы — `ToolError` с текстом (клиент
-    увидит `isError`); любое другое исключение — ошибка в коде, трассировку
-    пишет SDK."""
+    """Строка лога на вызов. `ToolError` — отказ инструмента (§3.3): текст
+    уходит клиенту как есть, здесь — только строка лога. Ошибка базы —
+    `ToolError` с текстом (клиент увидит `isError`); любое другое исключение
+    — ошибка в коде, трассировку пишет SDK."""
     started = time.perf_counter()
     try:
         text, summary = work()
+    except ToolError as exc:
+        logger.info("%s: отказ — %s, %.2f с", call, exc, time.perf_counter() - started)
+        raise
     except sqlite3.Error as exc:
         logger.warning("%s: отказ — база сторожа: %s", call, exc)
         raise ToolError(f"база сторожа не читается: {type(exc).__name__}: {exc}") from exc
@@ -1113,7 +1668,7 @@ def _interval(value: str) -> int:
     return int(value)
 
 
-def _args(argv: list[str] | None = None) -> tuple[Config, Path, int, int | None]:
+def _args(argv: list[str] | None = None) -> tuple[Config, Path, Path, int, int | None]:
     parser = argparse.ArgumentParser(
         description=(
             "Сторож FAQ: MCP-сервер (Streamable HTTP) с планировщиком снимков одной "
@@ -1127,6 +1682,9 @@ def _args(argv: list[str] | None = None) -> tuple[Config, Path, int, int | None]
         help="ожидаемое имя категории: сверяется с заголовком её страницы",
     )
     parser.add_argument("--db", required=True, help="путь к файлу базы; каталог создаётся")
+    parser.add_argument(
+        "--out", required=True, help="каталог для файлов памяток (день 19); создаётся, если его нет",
+    )
     parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT,
         help=f"порт на {HOST}, по умолчанию {DEFAULT_PORT}",
@@ -1148,7 +1706,9 @@ def _args(argv: list[str] | None = None) -> tuple[Config, Path, int, int | None]
         category=args.category,
         category_name=args.category_name,
     )
-    return config, Path(args.db).expanduser(), args.port, args.interval
+    return (
+        config, Path(args.db).expanduser(), Path(args.out).expanduser(), args.port, args.interval,
+    )
 
 
 def _port_free(port: int) -> str:
@@ -1166,7 +1726,7 @@ def _port_free(port: int) -> str:
 
 
 def main() -> None:
-    config, db, port, interval = _args()
+    config, db, out_dir, port, interval = _args()
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("[FAQ-сторож] %(message)s"))
     logger.addHandler(handler)
@@ -1186,8 +1746,9 @@ def main() -> None:
         logger.error("порт %s:%d занят (%s) — сервер не запущен", HOST, port, busy)
         sys.exit(1)
     init_db(db, version)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    watch = Watch(config, db)
+    watch = Watch(config, db, out_dir)
     watch.load_interval(interval)
     logger.info("%s", watch.start_line(port))
     try:

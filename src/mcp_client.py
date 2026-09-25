@@ -63,6 +63,21 @@
 # Ошибок на ожидаемых сбоях модуль не бросает: любой сбой — `ToolListing` или
 # `ToolCall` со стадией и текстом (§4.6), чтобы интерфейсу и агенту не нужно
 # было знать про типы ошибок SDK.
+#
+# С дня 19 (спецификация дня 19, §4) — MCP sampling: сервер посреди
+# `tools/call` может попросить модель у клиента. `call_tool()` получает
+# необязательный `sampler` — обычную синхронную функцию словарь → словарь
+# (модуль по-прежнему не знает LLM, как и раньше не знает Too Many Bones);
+# `Client` получает `sampling_callback`, только если `sampler` задан **и**
+# сервер разрешает сэмплинг (`McpServer.sampling`) — иначе клиент не
+# объявляет возможность `sampling`, и сервер, которому она нужна, откажет
+# сам. Обёртка переводит `CreateMessageRequestParams` в словарь, зовёт
+# `sampler` через `anyio.to_thread.run_sync()` (вызов модели синхронный и
+# долгий, цикл событий подключения он не блокирует) и переводит ответ
+# обратно в `CreateMessageResult`. Отказ без вызова модели (не текст в
+# просьбе, просьба с `tools`, или `sampler` вернул `ok=False`) — `ErrorData`:
+# SDK превращает его в `MCPError` на стороне клиента до второго раунда
+# `tools/call`, поэтому такой сбой к серверу не доходит вовсе.
 
 import importlib.metadata
 import json
@@ -70,17 +85,18 @@ import logging
 import os
 import shlex
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlsplit
 
 import anyio
+import anyio.to_thread
 import httpx2
 from dotenv import load_dotenv
-from mcp import Client, ListToolsResult, MCPError, StdioServerParameters
+from mcp import Client, ErrorData, ListToolsResult, MCPError, StdioServerParameters
 from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS
-from mcp.types import CallToolResult
+from mcp.types import INTERNAL_ERROR, INVALID_REQUEST, CallToolResult, CreateMessageResult, TextContent
 
 # Модуль сам читает окружение (замену командной строки и переменные для
 # сервера), поэтому сам и подхватывает `src/.env` — правило `agent.py`.
@@ -127,6 +143,11 @@ NO_ANSWER = "сервер не отвечает по адресу"
 ERROR_NO_ANSWER = NO_ANSWER + ": {reason}"
 ERROR_NOT_IN_GROUP = "инструмента нет в каталоге группы"
 
+# Отказы сэмплинга без вызова модели (день 19, §4.1): SDK превращает их в
+# `MCPError` на стороне клиента, до сервера они не доходят.
+ERROR_SAMPLING_TOOLS = "инструменты в сэмплинге не поддерживаются"
+ERROR_SAMPLING_TEXT_ONLY = "клиент принимает только текст"
+
 
 # --- Типы ------------------------------------------------------------------
 
@@ -147,6 +168,10 @@ class McpServer:
     # Поля дня 18 — в конце, с умолчаниями (§5.1):
     url: str = ""                   # Streamable HTTP: адрес сервера; "" — stdio по command
     url_env: str = ""               # переменная окружения, целиком заменяющая url; "" — замены нет
+    # Поле дня 19 — в конце, с умолчанием (§4.1): сэмплинг разрешается серверу
+    # явно, а не по умолчанию — иначе чужой сервер, подключённый днём 20,
+    # получил бы модель агента за наш счёт. `False` у всех, кроме сторожа.
+    sampling: bool = False
 
     @property
     def transport(self) -> str:
@@ -240,6 +265,10 @@ class ToolCall:
     connect_s: float = 0.0
     call_s: float = 0.0
     total_s: float = 0.0
+    # Поле дня 19 — в конце (§4.1): сколько просьб к модели клиента выполнил
+    # этот вызов. 0 — сервер не разрешён на сэмплинг, `sampler` не передан,
+    # или инструмент сэмплинг не запрашивал.
+    samples: int = 0
 
     @property
     def ok(self) -> bool:
@@ -416,6 +445,8 @@ class _Progress:
     call_s: float = 0.0
     text: str = ""
     is_error: bool = False
+    # Сэмплинг (день 19, §4.1): сколько просьб к модели клиента выполнено.
+    samples: int = 0
 
     def connected(self, client: Client) -> None:
         self.connect_s = time.perf_counter() - self.started
@@ -482,6 +513,28 @@ class _Progress:
                 "%s: ответ за %.2f с, %d символов", call, self.call_s, len(self.text),
             )
 
+    def sampled(self, request: dict, response: dict) -> None:
+        """Строка лога на одну просьбу сэмплинга (день 19, §4.1) — до ответа
+        `_run_sampling()` возвращает результат агента, здесь только факт
+        обмена: сколько сообщений ушло, что пришло."""
+        self.samples += 1
+        messages = request.get("messages") or []
+        chars = len(request.get("system") or "") + sum(
+            len(str(item.get("text") or "")) for item in messages
+        )
+        if response.get("ok"):
+            logger.info(
+                "%s sampling/createMessage: сообщений %d, %d символов, max_tokens %s → "
+                "%d символов (%s, %s)",
+                self.prefix, len(messages), chars, request.get("max_tokens"),
+                len(response.get("text") or ""), response.get("model") or "?",
+                response.get("finish_reason") or "endTurn",
+            )
+        else:
+            logger.warning(
+                "%s sampling/createMessage: отказ — %s", self.prefix, response.get("error") or "",
+            )
+
 
 def _arguments_str(arguments: dict) -> str:
     """Аргументы для лога: это не секреты, а номер статьи и имя раздела."""
@@ -530,14 +583,59 @@ async def _connect_and_list(
         # завершает процесс сам.
 
 
+def _build_sampling_callback(progress: _Progress, sampler: Callable[[dict], dict]):
+    """Оборачивает `sampler` (день 19, §4.1) в `sampling_callback` SDK:
+    `CreateMessageRequestParams` → словарь → `sampler` (в чужом потоке,
+    `anyio.to_thread.run_sync()`) → `CreateMessageResult`/`ErrorData`.
+
+    Отказ без вызова модели — `ErrorData`: SDK сам превращает его в
+    `MCPError` на стороне клиента, второго раунда `tools/call` не будет, и до
+    тела инструмента сбой не дойдёт (§2.9, §4.3). Поток не отменяется
+    (`abandon_on_cancel` не задаётся, умолчание SDK — `False`): истёкший
+    `fail_after` закроет подключение только после ответа модели, а не
+    оборвёт вызов на середине.
+    """
+
+    async def sampling_callback(_context, params) -> CreateMessageResult | ErrorData:
+        if params.tools or params.tool_choice:
+            return ErrorData(code=INVALID_REQUEST, message=ERROR_SAMPLING_TOOLS)
+        messages: list[dict] = []
+        for message in params.messages:
+            content = message.content
+            if not isinstance(content, TextContent):
+                return ErrorData(code=INVALID_REQUEST, message=ERROR_SAMPLING_TEXT_ONLY)
+            messages.append({"role": message.role, "text": content.text})
+        request = {
+            "system": params.system_prompt or "",
+            "messages": messages,
+            "max_tokens": params.max_tokens,
+        }
+        response = await anyio.to_thread.run_sync(sampler, request)
+        progress.sampled(request, response)
+        if not response.get("ok"):
+            return ErrorData(code=INTERNAL_ERROR, message=response.get("error") or "сбой сэмплинга")
+        return CreateMessageResult(
+            role="assistant",
+            content=TextContent(type="text", text=response.get("text") or ""),
+            model=response.get("model") or "",
+            stop_reason=response.get("finish_reason") or "endTurn",
+        )
+
+    return sampling_callback
+
+
 async def _connect_and_call(
     params: StdioServerParameters | str, progress: _Progress, timeout_s: float,
-    name: str, arguments: dict,
+    name: str, arguments: dict, sampler: Callable[[dict], dict] | None,
 ) -> None:
     # Тот же путь, что `_connect_and_list()`, но вместо листания — один
     # `tools/call`. Потолок `fail_after` — на всё подключение, как у списка.
+    # `sampling_callback` (день 19, §4.1) объявляет возможность sampling
+    # клиенту только когда `sampler` задан — вызывающий уже решил, разрешён
+    # ли сэмплинг серверу (`McpServer.sampling`).
+    sampling_callback = _build_sampling_callback(progress, sampler) if sampler is not None else None
     with anyio.fail_after(timeout_s):
-        async with Client(params) as client:
+        async with Client(params, sampling_callback=sampling_callback) as client:
             progress.connected(client)
             if client.server_capabilities.tools is None:
                 raise _NoToolsError()
@@ -698,6 +796,7 @@ def list_tools(server: McpServer, *, timeout_s: float) -> ToolListing:
 
 def call_tool(
     server: McpServer, name: str, arguments: dict, *, timeout_s: float,
+    sampler: Callable[[dict], dict] | None = None,
 ) -> ToolCall:
     """Одно полное подключение: запуск → согласование → tools/call → закрытие
     (день 17, §4.1).
@@ -705,6 +804,10 @@ def call_tool(
     Синхронная, исключений на ожидаемых сбоях не бросает — ровно как
     `list_tools()`. Сбой соединения или протокола — `error` со стадией; ответ
     сервера с `isError` — `is_error` и текст ошибки в `text`.
+
+    С дня 19 (§4.1) `sampler` — функция сэмплинга для этого вызова; решает,
+    пользоваться ли ею, сервер (`McpServer.sampling`): без разрешения клиент
+    не объявляет возможность sampling, даже если `sampler` передан.
     """
     at, prefix, launch = _start(server)
     if launch.error:
@@ -717,8 +820,9 @@ def call_tool(
     progress = _Progress(
         prefix=prefix, started=time.perf_counter(), after_connect=STAGE_CALL,
     )
+    active_sampler = sampler if (sampler is not None and server.sampling) else None
     stage, error, total_s = _run(
-        _connect_and_call, prefix, launch, progress, timeout_s, name, arguments,
+        _connect_and_call, prefix, launch, progress, timeout_s, name, arguments, active_sampler,
     )
     return ToolCall(
         server=server.name,
@@ -737,6 +841,7 @@ def call_tool(
         connect_s=progress.connect_s,
         call_s=progress.call_s,
         total_s=total_s,
+        samples=progress.samples,
     )
 
 
@@ -748,13 +853,21 @@ class McpToolBox:
 
     Отвечает протоколу `agent.ToolBox` структурно и его не импортирует: обмен
     идёт словарями, как у хранилищ `storage.py`. Один на процесс и общий для
-    всех агентов — состояния у него нет, кроме описания сервера и потолка
+    всех агентов — состояния у него нет, кроме описания сервера и потолков
     времени. Исключений на ожидаемых сбоях не бросает, как и функции выше.
+
+    С дня 19 (§4.2) у вызова свой потолок — `call_timeout_s`, отдельно от
+    потолка каталога (`timeout_s`): вызов с сэмплингом ждёт ответа модели
+    клиента, а каталог — нет, и общий потолок держал бы ход лишнюю минуту,
+    если сторож завис.
     """
 
-    def __init__(self, server: McpServer, *, timeout_s: float) -> None:
+    def __init__(
+        self, server: McpServer, *, timeout_s: float, call_timeout_s: float | None = None,
+    ) -> None:
         self._server = server
         self._timeout_s = timeout_s
+        self._call_timeout_s = call_timeout_s if call_timeout_s is not None else timeout_s
 
     @property
     def name(self) -> str:
@@ -784,12 +897,17 @@ class McpToolBox:
         ]
         return {"ok": True, "error": "", "elapsed": listing.total_s, "tools": tools}
 
-    def call(self, name: str, arguments: dict) -> dict:
+    def call(self, name: str, arguments: dict, sample: Callable[[dict], dict] | None = None) -> dict:
         """Вызов инструмента: `{"ok", "is_error", "error", "stage", "text",
-        "elapsed"}`. `error` и `stage` — сбой соединения или протокола (до
-        ответа не дошли); `is_error` — сервер ответил ошибкой инструмента, её
-        текст — в `text`."""
-        call = call_tool(self._server, name, arguments, timeout_s=self._timeout_s)
+        "elapsed", "samples"}`. `error` и `stage` — сбой соединения или
+        протокола (до ответа не дошли); `is_error` — сервер ответил ошибкой
+        инструмента, её текст — в `text`.
+
+        С дня 19 (§4.2) `sample` уходит в `call_tool()` как `sampler` —
+        пользуется ли им сервер, решает `McpServer.sampling`, не этот метод."""
+        call = call_tool(
+            self._server, name, arguments, timeout_s=self._call_timeout_s, sampler=sample,
+        )
         return {
             "ok": call.ok,
             "is_error": call.is_error,
@@ -797,6 +915,7 @@ class McpToolBox:
             "stage": call.stage,
             "text": call.text,
             "elapsed": call.total_s,
+            "samples": call.samples,
         }
 
 
@@ -866,10 +985,11 @@ class McpToolBoxGroup:
             result["warning"] = "; ".join(failures + warnings)
         return result
 
-    def call(self, name: str, arguments: dict) -> dict:
+    def call(self, name: str, arguments: dict, sample: Callable[[dict], dict] | None = None) -> dict:
         """Вызов — серверу инструмента по карте, которую пополняют каталоги.
         Имени нет в карте — ответ без подключения (агент и так не отправляет
-        имена вне каталога хода, это защита)."""
+        имена вне каталога хода, это защита). `sample` (день 19, §4.2) уходит
+        тому же серверу — пользуется ли им сервер инструмента, решает он сам."""
         box = self._routes.get(name)
         if box is None:
             return {
@@ -879,5 +999,6 @@ class McpToolBoxGroup:
                 "stage": "",
                 "text": "",
                 "elapsed": 0.0,
+                "samples": 0,
             }
-        return box.call(name, arguments)
+        return box.call(name, arguments, sample)

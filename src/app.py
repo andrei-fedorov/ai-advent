@@ -174,12 +174,14 @@ from presets import (
     BGG_MCP,
     BRANCH_QUESTION,
     BRANCH_STEPS,
+    CHEATSHEET_SCENARIO,
     COMPARISON_SCENARIO,
     CONTROL_QUESTIONS,
     DEFAULT_INVARIANTS,
     DEFAULT_PRESET,
     DEFAULT_PROFILE,
     DEFAULT_STRATEGY,
+    FAQ_CHEATSHEETS_DIR,
     FAQ_MCP,
     FAQ_TIMEOUT_S,
     FAQ_WATCH,
@@ -198,11 +200,14 @@ from presets import (
     PROFILE_VARIANTS,
     ROUTE_SCENARIO,
     ROUTING_SCENARIO,
+    SAMPLING_MAX_CHARS,
+    SAMPLING_MAX_TOKENS,
     STRATEGIES,
     TASK_SCENARIO,
     TOOL_MAX_ROUNDS,
     TOOL_RESULT_MAX_CHARS,
     TOOLS_SCENARIO,
+    WATCH_CALL_TIMEOUT_S,
     WATCH_SCENARIO,
     WATCH_TIMEOUT_S,
     make_invariants,
@@ -327,7 +332,9 @@ MCP_LAUNCH = resolve_launch(BGG_MCP, os.environ)
 # инструмента → сервер», которую каталоги только пополняют.
 TOOLBOX = McpToolBoxGroup((
     McpToolBox(FAQ_MCP, timeout_s=FAQ_TIMEOUT_S),
-    McpToolBox(FAQ_WATCH, timeout_s=WATCH_TIMEOUT_S),
+    # `call_timeout_s` (день 19, §8.2): вызов сторожа теперь может включать
+    # сэмплинг — ждать модель клиента, а не только читать локальную базу.
+    McpToolBox(FAQ_WATCH, timeout_s=WATCH_TIMEOUT_S, call_timeout_s=WATCH_CALL_TIMEOUT_S),
 ))
 FAQ_LAUNCH = resolve_launch(FAQ_MCP, os.environ)
 (logger.warning if FAQ_LAUNCH.error else logger.info)(
@@ -338,11 +345,14 @@ FAQ_LAUNCH = resolve_launch(FAQ_MCP, os.environ)
     SDK_VERSION,
 )
 # Сторож FAQ (день 18, §7.1) — сервер, который запускает не приложение: только
-# адрес, откуда он и как его запустить.
+# адрес, откуда он и как его запустить. День 19 дописывает: инструменты
+# сторожа теперь включают и пайплайн памятки, а сжатие идёт сэмплингом моделью
+# агента (§7.3).
 WATCH_LAUNCH = resolve_launch(FAQ_WATCH, os.environ)
 (logger.warning if WATCH_LAUNCH.error else logger.info)(
     "MCP при старте: сервер %s — %s (%s)%s, Streamable HTTP; запускается "
-    "отдельно (./run.sh faq-watch); агенту — вместе с %s",
+    "отдельно (./run.sh faq-watch); агенту — вместе с %s; инструменты "
+    "сторожа и памятки; сэмплинг — моделью агента",
     FAQ_WATCH.name, WATCH_LAUNCH.command_line, WATCH_LAUNCH.origin,
     f" — ⚠️ {WATCH_LAUNCH.error}" if WATCH_LAUNCH.error else "",
     FAQ_MCP.name,
@@ -463,6 +473,9 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
         service += _route_call_lines(last_call)
         # Трекер задачи (день 13) — тем же правилом.
         service += _task_tracker_lines(last_call)
+        # Сэмплинг (день 19) — сделанные до сбоя раунда > 1 вызовы уже
+        # оплачены и сохранены, показать их больше негде.
+        service += _sampling_lines(last_call)
         if service:
             lines += ["", *service]
         # Раунды и вызовы инструментов до сбоя (день 17, §5.5) — оплачены, и
@@ -530,6 +543,7 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
     lines += _memory_call_lines(last_call.get("memory_call"))
     lines += _route_call_lines(last_call)
     lines += _task_tracker_lines(last_call)
+    lines += _sampling_lines(last_call)
     return "\n".join(lines)
 
 
@@ -756,6 +770,36 @@ def _task_tracker_lines(last_call: dict) -> list[str]:
         f"{_fmt_cost(call['cost_usd'])}, {call['elapsed']:.2f} s"
     )
     return [line]
+
+
+def _sampling_lines(last_call: dict) -> list[str]:
+    """Сэмплинг этого хода (день 19, §6.2, §7.2) — строкой рядом со
+    служебными работами. В отличие от них сэмплингов за ход бывает
+    несколько (по одному на `faq_summarize`), поэтому строка суммирует, а не
+    показывает один вызов; нет ни одного — строки нет вовсе (переключатель
+    «нет данных» здесь не нужен: сэмплинг идёт внутри вызова инструмента, а
+    не как отдельная фаза хода)."""
+    calls = last_call.get("sampling_calls") or []
+    if not calls:
+        return []
+    failed = [c for c in calls if not c["ok"]]
+    tokens = sum(c["total_tokens"] or 0 for c in calls)
+    cost = _sum_cost(calls)
+    line = (
+        f"- **🧪 Сэмплинг:** {len(calls)} {_calls_word(len(calls))}"
+        + (f" (не удались: {len(failed)})" if failed else "")
+        + f", {_fmt_int(tokens)} токенов, {_fmt_cost(cost)}, "
+        f"{sum(c['elapsed'] for c in calls):.2f} s — модель агента по "
+        f"просьбе сервера"
+    )
+    return [line]
+
+
+def _sum_cost(calls: list[dict]) -> float | None:
+    """Сумма `cost_usd` списка служебных вызовов; `None`, если ни у одного
+    нет цены (модель вне таблицы цен)."""
+    known = [c["cost_usd"] for c in calls if c["cost_usd"] is not None]
+    return sum(known) if known else None
 
 
 _LEVEL_MARKERS = {"ok": "🟢", "warn": "🟡", "danger": "🔴", "over": "🔴"}
@@ -1186,6 +1230,10 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             "вызовы инстр.": turn["tool_calls"],
             "схемы ток.": turn["tools_tokens"],
             "инстр. с": f"{turn['tool_elapsed']:.2f}",
+            # Колонки дня 19 — в конце (§7.2): цена сэмплинга этого хода —
+            # своя пара колонок, как у остальных служебных работ.
+            "сэмпл. ток.": turn["sampling_tokens"],
+            "сэмпл. $": _fmt_cost(turn["sampling_cost_usd"]),
         }
         for turn in turns
     ]
@@ -1200,7 +1248,8 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
                  "время роутера, s", "этап", "переход", "задача", "трекер",
                  "время трекера, s", "инварианты", "конфликт", "страж",
                  "время стража, s", "отказ", "сход", "раунды",
-                 "вызовы инстр.", "схемы ток.", "инстр. с"],
+                 "вызовы инстр.", "схемы ток.", "инстр. с",
+                 "сэмпл. ток.", "сэмпл. $"],
     )
 
 
@@ -1215,7 +1264,8 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"{totals['errors']}, служебных: {totals['service_calls']}, "
         f"разборов памяти: {totals['memory_calls']}, роутера профиля: "
         f"{totals['route_calls']}, трекера задачи: {totals['tracker_calls']}, "
-        f"стража инвариантов: {totals['guard_calls']})\n"
+        f"стража инвариантов: {totals['guard_calls']}, сэмплинга: "
+        f"{totals['sampling_calls']})\n"
         f"- **🔢 Токены:** prompt={totals['prompt_tokens']} / "
         f"completion={totals['completion_tokens']} / "
         f"total={totals['total_tokens']}\n"
@@ -1254,6 +1304,14 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"{_fmt_int(totals['guard_tokens'])} токенов, "
         f"{_fmt_cost(totals['guard_cost_usd'])} — цена сверки каждого хода с "
         f"ограничениями; в экономию стратегии не входит\n"
+        # Строка дня 19 (§6.3, §7.2): сэмплинг — модель агента по просьбе
+        # сервера, единственная служебная работа внутри основного запроса;
+        # своя цена, не входит ни в одну из строк выше.
+        f"- **🧪 Сэмплинг:** {totals['sampling_calls']} "
+        f"{_calls_word(totals['sampling_calls'])}, "
+        f"{_fmt_int(totals['sampling_tokens'])} токенов, "
+        f"{_fmt_cost(totals['sampling_cost_usd'])} — модель агента по "
+        f"просьбе сервера (MCP sampling)\n"
         f"- **💲 Стоимость:** {_fmt_cost(totals['cost_usd'])}"
     )
 
@@ -2059,9 +2117,63 @@ def _md_cell(text: str) -> str:
     return " ".join(str(text).split()).replace("|", "\\|")
 
 
+# --- Цепочка пайплайна памятки (день 19, §7.1, п. 3) -----------------------
+_PIPELINE_TOOLS = ("faq_search", "faq_summarize", "cheatsheet_save")
+_PIPELINE_INPUT_ARG = {"faq_summarize": "search_id", "cheatsheet_save": "summary_id"}
+
+
+def _first_line_ref(text: str) -> str:
+    """Первая строка ответа — id (`id: q7`) или путь (`файл: …`), §3.2."""
+    first = text.splitlines()[0] if text else ""
+    for prefix in ("id: ", "файл: "):
+        if first.startswith(prefix):
+            return first[len(prefix):].strip()
+    return ""
+
+
+def _cheatsheet_chain_md(calls: list[dict]) -> str:
+    """Строка «Цепочка»: какие id выданы и приняты вызовами пайплайна этого
+    хода — по журналу вызовов, без обращения к серверу (§2.3, §7.1). Ход без
+    инструментов пайплайна — `""`."""
+    pipeline = [call for call in calls if call["name"] in _PIPELINE_TOOLS]
+    if not pipeline:
+        return ""
+    issued: set[str] = set()
+    parts: list[str] = []
+    for call in pipeline:
+        name = call["name"]
+        ok = call["status"] == "ок"
+        output_ref = _first_line_ref(call["text"]) if ok else ""
+        if name == "faq_search":
+            parts.append(f"faq_search → {output_ref or '—'}")
+            if output_ref:
+                issued.add(output_ref)
+            continue
+        try:
+            arguments = json.loads(call["arguments"] or "{}")
+        except ValueError:
+            arguments = {}
+        input_ref = str(arguments.get(_PIPELINE_INPUT_ARG[name]) or "")
+        if not ok:
+            mark = "⚠️"
+        elif not input_ref:
+            mark = "?"
+        elif input_ref in issued:
+            mark = "✓"
+        else:
+            mark = "из прошлых ходов"
+        parts.append(f"{name}({input_ref or '—'} {mark}) → {output_ref or '—'}")
+        if name == "faq_summarize" and call["samples"]:
+            parts.append(f"сэмплинг {call['samples']}")
+        if output_ref and name == "faq_summarize":
+            issued.add(output_ref)
+    return "Цепочка: " + " · ".join(parts)
+
+
 def _tools_md(state: dict) -> str:
-    """Блок «Инструменты последнего хода» (день 17, §8.3): каталог хода,
-    вызовы, раунды и предупреждения — из ответа агента (`last_call`)."""
+    """Блок «Инструменты последнего хода» (день 17, §8.3; день 19 — колонка
+    «сэмпл.» и строка «Цепочка», §7.1): каталог хода, вызовы, раунды и
+    предупреждения — из ответа агента (`last_call`)."""
     tools = state["tools"]
     if tools is None:
         return "У агента нет инструментов MCP — запрос как на дне 16."
@@ -2105,9 +2217,12 @@ def _tools_md(state: dict) -> str:
         lines.append(head)
 
     if calls:
+        # Сэмплинги хода — в том же порядке, что вызовы их сделали (§7.1,
+        # п. 4): каждый вызов забирает из списка ровно `samples` штук.
+        sampling_calls = iter(last["sampling_calls"])
         table = [
-            "| № | раунд | инструмент | аргументы | результат | время |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| № | раунд | инструмент | аргументы | результат | сэмпл. | время |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
         ]
         for number, call in enumerate(calls, start=1):
             result = (
@@ -2116,12 +2231,20 @@ def _tools_md(state: dict) -> str:
             )
             if call["truncated"]:
                 result += " · ✂️ обрезан"
+            used = [next(sampling_calls) for _ in range(call["samples"])]
+            sampling_cell = (
+                f"{len(used)}, {_fmt_cost(sum(c['cost_usd'] or 0.0 for c in used))}"
+                if used else "—"
+            )
             table.append(
                 f"| {number} | {call['round']} | `{call['name']}` | "
                 f"`{_md_cell(call['arguments']) or '—'}` | {_md_cell(result)} | "
-                f"{call['elapsed']:.2f} с |"
+                f"{sampling_cell} | {call['elapsed']:.2f} с |"
             )
         lines.append("\n".join(table))
+        chain = _cheatsheet_chain_md(calls)
+        if chain:
+            lines.append(chain)
     if rounds:
         lines.append(
             "Раунды: " + " · ".join(
@@ -2501,6 +2624,9 @@ def _new_agent(preset_name: str) -> Agent:
         tools=TOOLBOX,
         tool_max_rounds=TOOL_MAX_ROUNDS,
         tool_result_max_chars=TOOL_RESULT_MAX_CHARS,
+        # Потолки сэмплинга — из `presets.py` (день 19, §8.2).
+        sampling_max_tokens=SAMPLING_MAX_TOKENS,
+        sampling_max_chars=SAMPLING_MAX_CHARS,
     )
 
 
@@ -2588,6 +2714,8 @@ def _restore_agents() -> int:
             tools=TOOLBOX,
             tool_max_rounds=TOOL_MAX_ROUNDS,
             tool_result_max_chars=TOOL_RESULT_MAX_CHARS,
+            sampling_max_tokens=SAMPLING_MAX_TOKENS,
+            sampling_max_chars=SAMPLING_MAX_CHARS,
         )
         restored += 1
     logger.info(
@@ -4439,6 +4567,15 @@ _WATCH_SCENARIO_LABELS: list[str] = [
 ]
 
 
+# --- Сценарий дня 19: подписи для gr.Examples (§8.3) -----------------------
+# Тексты — `presets.CHEATSHEET_SCENARIO`.
+_CHEATSHEET_SCENARIO_LABELS: list[str] = [
+    "П1 · памятка про яд",
+    "П2 · боты Тинка в файл",
+    "П3 · только найти",
+]
+
+
 # Чат и дебаг-панель — ровно пополам; кнопки компактнее дефолтных.
 APP_CSS = """
 button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8px !important; min-height: 28px !important; }
@@ -4447,14 +4584,16 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 18, неделя 4 — **планировщик и фоновые задачи**. Сторож FAQ "
-        "(`src/faq_watch.py`) — отдельный MCP-сервер по Streamable HTTP, "
-        "который работает сам по себе: **по расписанию** снимает официальный "
-        "FAQ издателя в SQLite и **после каждого снимка сам выдаёт сводку** "
-        "изменений в свой терминал. Агент спрашивает у него агрегированную "
-        "сводку за период (`faq_changes`) и меняет расписание "
-        "(`faq_watch_schedule`); сводку можно получить и кнопкой в блоке "
-        "наверху дебаг-панели. Инструменты FAQ дня 17 — как раньше."
+        "День 19, неделя 4 — **композиция MCP-инструментов**: памятка к "
+        "столу. Одна просьба игрока — и агент сам проводит три инструмента "
+        "сторожа по очереди: `faq_search` находит статьи в последнем снимке "
+        "FAQ, `faq_summarize` сжимает их в памятку по-русски — **моделью "
+        "агента, по просьбе сервера** (MCP sampling, у сервера нет ни ключа, "
+        "ни модели), `cheatsheet_save` сохраняет памятку в Markdown-файл. "
+        "Данные между шагами идут **по ссылке** (id `q…`/`s…`), а не "
+        "текстом — каждый шаг сам достаёт из базы то, что записал "
+        "предыдущий, и сервер проверяет каждую передачу. Сторож и FAQ — как "
+        "на днях 17-18."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -4604,14 +4743,14 @@ with gr.Blocks(title="TooManyRules") as demo:
                 placeholder="Например: из каких фаз состоит ход игрока?",
                 lines=2,
             )
-            # Сценарий дня 18 (§7.3, §8.3) — у поля ввода, в кадре. Клик кладёт
+            # Сценарий дня 19 (§8.3, §12) — у поля ввода, в кадре. Клик кладёт
             # текст в поле, отправляет человек.
             gr.Examples(
-                examples=[[text] for text in WATCH_SCENARIO],
+                examples=[[text] for text in CHEATSHEET_SCENARIO],
                 inputs=[question_input],
-                example_labels=_WATCH_SCENARIO_LABELS,
-                examples_per_page=len(WATCH_SCENARIO),
-                label="Сценарий дня 18 (сторож FAQ должен быть запущен: ./run.sh faq-watch)",
+                example_labels=_CHEATSHEET_SCENARIO_LABELS,
+                examples_per_page=len(CHEATSHEET_SCENARIO),
+                label="Сценарий дня 19 (сторож FAQ должен быть запущен: ./run.sh faq-watch)",
             )
             with gr.Row():
                 send_btn = gr.Button("Отправить", size="sm", variant="primary", scale=2)
@@ -4823,7 +4962,7 @@ with gr.Blocks(title="TooManyRules") as demo:
             # Свёрнуто: сценарии прошлых дней. У дня 16 сценария в чате не
             # было, сценарий дня 18 стоит у поля ввода (правило «на экране —
             # текущий день»).
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17)", open=False):
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-18)", open=False):
                 gr.Examples(
                     examples=[
                         ["Из каких фаз состоит ход игрока?"],
@@ -4946,26 +5085,67 @@ with gr.Blocks(title="TooManyRules") as demo:
                     ),
                 )
 
+                # Сценарий дня 18 (§7.3, §8.3): Н1-Н4. С дня 19 свёрнут вместе
+                # с остальными прошлыми днями.
+                gr.Examples(
+                    examples=[[text] for text in WATCH_SCENARIO],
+                    inputs=[question_input],
+                    example_labels=_WATCH_SCENARIO_LABELS,
+                    examples_per_page=len(WATCH_SCENARIO),
+                    label="Сценарий дня 18 (сторож FAQ должен быть запущен: ./run.sh faq-watch)",
+                )
+
 
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # Сторож FAQ (день 18, §7.2) — развёрнут в кадр, над блоком дня
-            # 17. Каталог по кнопке — те же функции, что у дней 16-17; сводка
-            # сторожа — `faq_changes` кнопкой; оба — вне `_view()` (свои
-            # выходы `WATCH_MCP_OUTPUTS`, `WATCH_DIGEST_OUTPUTS`). Вызовы
-            # агента последнего хода переехали сюда из блока дня 17 — те же
-            # компоненты и выходы `_view()`, другой аккордеон.
-            with gr.Accordion("Сторож FAQ (день 18)", open=True):
+            # Памятка к столу (день 19, §7.1) — развёрнут в кадр, над блоком
+            # дня 18. Описание — статичный Markdown; «Инструменты последнего
+            # хода» и JSON результатов переехали сюда из блока дня 18 — те же
+            # компоненты и выходы `_view()` (правило дня 18, §7.2: блок
+            # вызовов агента живёт в блоке текущего дня), внутри markdown
+            # дописана строка «Цепочка» и колонка «сэмпл.» — без новых
+            # выходов `_view()`.
+            with gr.Accordion("Памятка к столу: пайплайн MCP (день 19)", open=True):
+                gr.Markdown(
+                    "Три шага одной просьбы: **найти** (`faq_search` — по "
+                    "английским словам в последнем снимке сторожа) → "
+                    "**сжать** (`faq_summarize` — по-русски, со ссылками; "
+                    "сжимает **модель агента по просьбе сервера**, MCP "
+                    "sampling — у сервера нет ни ключа, ни модели) → "
+                    "**сохранить** (`cheatsheet_save` — файл в "
+                    f"`{display_path(FAQ_CHEATSHEETS_DIR)}`). "
+                    "Данные между шагами идут **по ссылке** (id `q…`/`s…`), "
+                    "а не текстом — каждый шаг сам достаёт из базы то, что "
+                    "записал предыдущий, а сервер проверяет каждую передачу. "
+                    "Инструменты живут на сервере сторожа (`./run.sh "
+                    "faq-watch`); каталог сторожа и его сводка — кнопками в "
+                    "блоке «Сторож FAQ» ниже."
+                )
+                gr.Markdown("#### Инструменты последнего хода агента (все серверы)")
+                tools_md = gr.Markdown("")
+                with gr.Accordion(
+                    "Результаты инструментов последнего хода (JSON)", open=False
+                ):
+                    tools_json = gr.JSON(
+                        value=[],
+                        label="Что ушло модели сообщениями tool",
+                        max_height=420,
+                    )
+            # Сторож FAQ (день 18, §7.2) — с дня 19 свёрнут. Каталог по
+            # кнопке — те же функции, что у дней 16-17; сводка сторожа —
+            # `faq_changes` кнопкой; оба — вне `_view()` (свои выходы
+            # `WATCH_MCP_OUTPUTS`, `WATCH_DIGEST_OUTPUTS`).
+            with gr.Accordion("Сторож FAQ (день 18)", open=False):
                 gr.Markdown(_mcp_server_md(
                     FAQ_WATCH, WATCH_LAUNCH, WATCH_AGENT_LINE,
                     source_label="категория FAQ на сайте издателя",
                     server_line=(
                         "Сервер — `src/faq_watch.py` этого репозитория: SDK mcp "
                         "v2 (`MCPServer`), планировщик снимков в `lifespan`, "
-                        "SQLite; сайт читает только планировщик, два инструмента "
-                        "отвечают из базы. Сводку каждого снимка сервер сам "
-                        "пишет в свой терминал."
+                        "SQLite; сайт читает только планировщик, инструменты "
+                        "сторожа и памятки отвечают из базы. Сводку каждого "
+                        "снимка сервер сам пишет в свой терминал."
                     ),
                     db=FAQ_WATCH_DB,
                 ))
@@ -5005,16 +5185,6 @@ with gr.Blocks(title="TooManyRules") as demo:
                     )
                 watch_digest_status_md = gr.Markdown(WATCH_DIGEST_INITIAL)
                 watch_digest_md = gr.Markdown("")
-                gr.Markdown("#### Инструменты последнего хода агента (все серверы)")
-                tools_md = gr.Markdown("")
-                with gr.Accordion(
-                    "Результаты инструментов последнего хода (JSON)", open=False
-                ):
-                    tools_json = gr.JSON(
-                        value=[],
-                        label="Что ушло модели сообщениями tool",
-                        max_height=420,
-                    )
             # Свой сервер FAQ (день 17, §8.3) — с дня 18 свёрнут. Каталог по
             # кнопке — те же компоненты и функции, что у дня 16, вне `_view()`
             # (свои выходы `FAQ_MCP_OUTPUTS`).
