@@ -78,12 +78,35 @@
 # просьбе, просьба с `tools`, или `sampler` вернул `ok=False`) — `ErrorData`:
 # SDK превращает его в `MCPError` на стороне клиента до второго раунда
 # `tools/call`, поэтому такой сбой к серверу не доходит вовсе.
+#
+# С дня 20 (спецификация дня 20, §6) — **автозапуск HTTP-сервера** и первое
+# состояние модуля. Сервер FAQ издателя (`faq_watch.py`) — долгий процесс по
+# HTTP: фоновой докачке копии нужен процесс, который живёт дольше одного
+# вызова. «FAQ доступен всегда» обеспечивает `ensure_started()`: адрес молчит
+# (TCP-подключение, не MCP) — модуль запускает командную строку
+# `McpServer.autostart`, ждёт, пока порт ответит, и записывает процесс в
+# реестр. Сервер, который уже отвечает по адресу (запущен человеком или чужой
+# на порту), модуль не трогает. **Реестр запущенных процессов и время
+# последнего запуска — осознанное исключение** из «состояния между
+# вызовами нет»: процесс, запущенный модулем, модуль и останавливает
+# (`atexit`: SIGTERM, до 5 с ожидания, SIGKILL). Реестр — под замком:
+# `ensure_started()` зовут старт приложения и каталоги ходов разных вкладок.
+# На случай, когда `atexit` не выполнится, сервер сам следит за родителем
+# (`--parent-pid` в командной строке автозапуска). Процесс получает тот же
+# белый список окружения SDK, что stdio-серверы: ключ DeepSeek из `src/.env`
+# ему не уходит. У `McpToolBoxGroup` с дня 20 два метода для панели:
+# `server_of()` и `statuses()`; каталог и вызов группы не меняются.
 
+import atexit
 import importlib.metadata
 import json
 import logging
 import os
 import shlex
+import signal
+import socket
+import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -95,7 +118,7 @@ import anyio.to_thread
 import httpx2
 from dotenv import load_dotenv
 from mcp import Client, ErrorData, ListToolsResult, MCPError, StdioServerParameters
-from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS
+from mcp.client.stdio import DEFAULT_INHERITED_ENV_VARS, get_default_environment
 from mcp.types import INTERNAL_ERROR, INVALID_REQUEST, CallToolResult, CreateMessageResult, TextContent
 
 # Модуль сам читает окружение (замену командной строки и переменные для
@@ -148,6 +171,25 @@ ERROR_NOT_IN_GROUP = "инструмента нет в каталоге груп
 ERROR_SAMPLING_TOOLS = "инструменты в сэмплинге не поддерживаются"
 ERROR_SAMPLING_TEXT_ONLY = "клиент принимает только текст"
 
+# Автозапуск HTTP-сервера (день 20, §6.1). Про конкретный сервер константы
+# не знают: сколько ждать порт — параметр `ensure_started()` из `presets.py`.
+AUTOSTART_RETRY_S = 60          # запуски одного сервера — не чаще раза в столько секунд
+AUTOSTART_WAIT_S = 10           # сколько ждать ответа порта по умолчанию
+AUTOSTART_PROBE_S = 0.5         # таймаут TCP-проверки «адрес молчит»
+AUTOSTART_POLL_S = 0.1          # как часто проверять порт после запуска
+AUTOSTART_STOP_WAIT_S = 5       # сколько ждать выхода после SIGTERM
+
+# Состояния автозапуска — словами, для лога и панели.
+AUTOSTART_ANSWERS = "отвечает"
+AUTOSTART_STARTED = "запущен приложением"
+AUTOSTART_NOT_STARTED = "не запущен"
+AUTOSTART_PAUSED = "пауза"
+
+ERROR_NO_AUTOSTART = "автозапуска нет"
+ERROR_URL_REPLACED = "адрес заменён, своей командной строки нет"
+ERROR_PORT_MISMATCH = "--port {port} не совпадает с адресом"
+ERROR_NO_PORT = "в командной строке нет --port"
+
 
 # --- Типы ------------------------------------------------------------------
 
@@ -172,6 +214,14 @@ class McpServer:
     # явно, а не по умолчанию — иначе чужой сервер, подключённый днём 20,
     # получил бы модель агента за наш счёт. `False` у всех, кроме сторожа.
     sampling: bool = False
+    # Поля дня 20 — в конце, с умолчаниями (§6.1): командная строка
+    # автозапуска HTTP-сервера (`()` — не запускать) и переменная окружения,
+    # слова которой дописываются к ней (`shlex.split`, позже заданный
+    # аргумент перекрывает прежний). Адрес заменён через `url_env` — автозапуск
+    # только при заданной `autostart_env`: иначе экземпляр со своим адресом
+    # поднял бы сервер автора с базой автора.
+    autostart: tuple[str, ...] = ()
+    autostart_env: str = ""
 
     @property
     def transport(self) -> str:
@@ -854,6 +904,274 @@ def call_tool(
     )
 
 
+# --- Автозапуск HTTP-сервера (день 20, §6.1) -------------------------------
+
+@dataclass(frozen=True)
+class Autostart:
+    """Чем будет запущен HTTP-сервер при данном окружении — результат чистой
+    функции `resolve_autostart()`, как `Launch` у `resolve_launch()`."""
+    argv: tuple[str, ...]           # () — запускать нечего или нельзя
+    command_line: str               # для лога и панели
+    origin: str                     # «по умолчанию» | «+ <autostart_env>»
+    error: str = ""                 # почему не запускать; "" — можно
+
+
+@dataclass(frozen=True)
+class AutostartStatus:
+    """Что с HTTP-сервером после `ensure_started()`: `state` — одно из
+    `AUTOSTART_*`; у «запущен приложением» — pid и время до ответа порта, у
+    «не запущен» — причина, у «пауза» — до какого времени."""
+    server: str
+    state: str
+    at: str                         # момент проверки, ISO до секунд
+    pid: int = 0
+    wait_s: float = 0.0
+    reason: str = ""
+    retry_at: str = ""              # ISO до секунд; "" — паузы нет
+    by_app: bool = False            # «отвечает» процесс, который запустило приложение
+
+    def text(self) -> str:
+        """Одной строкой — для лога старта приложения и панели."""
+        if self.state == AUTOSTART_STARTED:
+            return f"{AUTOSTART_STARTED} за {self.wait_s:.1f} с (pid {self.pid})"
+        if self.state == AUTOSTART_ANSWERS:
+            return AUTOSTART_ANSWERS + (f" (запущен приложением, pid {self.pid})" if self.by_app else "")
+        if self.state == AUTOSTART_PAUSED:
+            return f"{AUTOSTART_PAUSED} до {_clock(self.retry_at)} — {self.reason}"
+        return f"{AUTOSTART_NOT_STARTED}: {self.reason}"
+
+
+def _clock(iso: str) -> str:
+    return datetime.fromisoformat(iso).strftime("%H:%M:%S") if iso else ""
+
+
+def _last_flag_value(argv: tuple[str, ...], flag: str) -> str | None:
+    """Значение последнего `flag` в командной строке — и `--port 8766`, и
+    `--port=8766`: как у `argparse`, позже заданный перекрывает прежний."""
+    value = None
+    for index, arg in enumerate(argv):
+        if arg == flag and index + 1 < len(argv):
+            value = argv[index + 1]
+        elif arg.startswith(flag + "="):
+            value = arg[len(flag) + 1:]
+    return value
+
+
+def resolve_autostart(server: McpServer, environ: Mapping[str, str]) -> Autostart:
+    """Командная строка автозапуска при данном окружении — чистая функция
+    (§6.1). Слова `autostart_env` дописываются к `autostart`; адрес заменён
+    через `url_env` — автозапуск только с `autostart_env`; порт последнего
+    `--port` должен совпасть с портом адреса."""
+    if not server.autostart:
+        return Autostart((), "", ORIGIN_DEFAULT, ERROR_NO_AUTOSTART)
+    extra_line = environ.get(server.autostart_env, "") if server.autostart_env else ""
+    url_replaced = bool(server.url_env and environ.get(server.url_env, ""))
+    if url_replaced and not extra_line.strip():
+        return Autostart((), "", ORIGIN_DEFAULT, ERROR_URL_REPLACED)
+    try:
+        extra = tuple(shlex.split(extra_line))
+    except ValueError as exc:
+        return Autostart((), extra_line, f"+ {server.autostart_env}", ERROR_BAD_COMMAND.format(reason=exc))
+    argv = tuple(server.autostart) + extra
+    origin = f"+ {server.autostart_env}" if extra else ORIGIN_DEFAULT
+    command_line = shlex.join(argv)
+    launch = resolve_launch(server, environ)
+    if launch.error:
+        return Autostart((), command_line, origin, launch.error)
+    port = _last_flag_value(argv, "--port")
+    if port is None:
+        return Autostart((), command_line, origin, ERROR_NO_PORT)
+    if port != str(_url_port(launch.command_line)):
+        return Autostart((), command_line, origin, ERROR_PORT_MISMATCH.format(port=port))
+    return Autostart(argv, command_line, origin)
+
+
+def _url_port(url: str) -> int:
+    parts = urlsplit(url)
+    return parts.port or (443 if parts.scheme == "https" else 80)
+
+
+def port_answers(url: str, timeout_s: float = AUTOSTART_PROBE_S) -> bool:
+    """Отвечает ли что-нибудь на хосте и порту адреса — TCP-подключение, не
+    MCP (§6.1): чужой сервер на порту тоже «отвечает», и автозапуска не
+    будет, а сбой каталога покажет его честно."""
+    parts = urlsplit(url)
+    try:
+        with socket.create_connection((parts.hostname, _url_port(url)), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+@dataclass
+class _Started:
+    process: subprocess.Popen
+    started: float
+
+
+# Реестр запущенных модулем процессов по имени сервера, время последнего
+# запуска и последний статус — состояние модуля (§6.1), под замком.
+_AUTOSTART_LOCK = threading.Lock()
+_AUTOSTARTED: dict[str, _Started] = {}
+_AUTOSTART_LAUNCHED_AT: dict[str, float] = {}
+_AUTOSTART_LAST: dict[str, AutostartStatus] = {}
+
+
+def last_autostart(server_name: str) -> AutostartStatus | None:
+    """Последний статус автозапуска сервера — для панели (чтение без
+    замка: подмена значения словаря атомарна)."""
+    return _AUTOSTART_LAST.get(server_name)
+
+
+def ensure_started(
+    server: McpServer, environ: Mapping[str, str], *, wait_s: float = AUTOSTART_WAIT_S,
+) -> AutostartStatus:
+    """Адрес HTTP-сервера молчит — запустить `autostart` и дождаться ответа
+    порта (§6.1). Сервер, который уже отвечает, не трогается. Запуски одного
+    сервера — не чаще раза в `AUTOSTART_RETRY_S` (§2.6): сервер, который
+    падает сразу (чужая база, занятый порт) или падает снова и снова, не
+    перезапускается на каждом ходе. Исключений не бросает. Статус пишется в
+    лог и запоминается для панели."""
+    prefix = _server_prefix(server)
+    with _AUTOSTART_LOCK:
+        status = _ensure_started(server, environ, wait_s, prefix)
+        _AUTOSTART_LAST[server.name] = status
+    return status
+
+
+def _ensure_started(
+    server: McpServer, environ: Mapping[str, str], wait_s: float, prefix: str,
+) -> AutostartStatus:
+    at = datetime.now().isoformat(timespec="seconds")
+    launch = resolve_launch(server, environ)
+    if launch.transport != TRANSPORT_HTTP:
+        return AutostartStatus(server.name, AUTOSTART_NOT_STARTED, at, reason="не HTTP-сервер")
+    own = _AUTOSTARTED.get(server.name)
+    if own is not None and own.process.poll() is not None:
+        # Свой процесс вышел посреди сессии — сервер поднимется снова.
+        logger.warning(
+            "%s автозапуск: процесс pid %d вышел с кодом %s", prefix, own.process.pid,
+            own.process.returncode,
+        )
+        del _AUTOSTARTED[server.name]
+        own = None
+    if not launch.error and port_answers(launch.command_line):
+        return AutostartStatus(
+            server.name, AUTOSTART_ANSWERS, at, pid=own.process.pid if own else 0,
+            by_app=own is not None,
+        )
+    if own is not None:
+        # Свой процесс жив, а порт молчит (завис или так и не поднялся) —
+        # остановить, чтобы не держать в реестре два процесса одного сервера.
+        logger.warning(
+            "%s автозапуск: pid %d жив, но порт молчит — останавливаю", prefix, own.process.pid,
+        )
+        own.process.kill()
+        own.process.wait()
+        del _AUTOSTARTED[server.name]
+    launched_at = _AUTOSTART_LAUNCHED_AT.get(server.name)
+    if launched_at is not None and time.time() - launched_at < AUTOSTART_RETRY_S:
+        retry_at = datetime.fromtimestamp(launched_at + AUTOSTART_RETRY_S).isoformat(timespec="seconds")
+        reason = (
+            f"адрес молчит, прошлый запуск — "
+            f"{datetime.fromtimestamp(launched_at).strftime('%H:%M:%S')}"
+        )
+        logger.info("%s автозапуск: %s — следующая попытка не раньше %s", prefix, reason, _clock(retry_at))
+        return AutostartStatus(
+            server.name, AUTOSTART_PAUSED, at, reason=reason, retry_at=retry_at,
+        )
+    plan = resolve_autostart(server, environ)
+    if plan.error:
+        # Запускать нечего или нельзя — это не попытка, паузы нет.
+        logger.info("%s автозапуск: адрес молчит — %s: %s", prefix, AUTOSTART_NOT_STARTED, plan.error)
+        return AutostartStatus(server.name, AUTOSTART_NOT_STARTED, at, reason=plan.error)
+    return _launch_http(server, launch.command_line, plan, wait_s, prefix, at)
+
+
+def _launch_http(
+    server: McpServer, url: str, plan: Autostart, wait_s: float, prefix: str, at: str,
+) -> AutostartStatus:
+    logger.info(
+        "%s автозапуск: адрес молчит — запускаю %s (%s)", prefix, plan.command_line, plan.origin,
+    )
+    started = time.perf_counter()
+    _AUTOSTART_LAUNCHED_AT[server.name] = time.time()
+    try:
+        # Белый список окружения SDK — тот же, что у stdio-серверов: ключ
+        # DeepSeek процесс сервера не получает. stdout и stderr наследуются
+        # (строки сервера — в терминал приложения), группа процессов — та же:
+        # Ctrl+C в терминале приложения доходит и до сервера.
+        process = subprocess.Popen(
+            list(plan.argv), env=get_default_environment(), stdin=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        return _autostart_failed(server, prefix, at, f"{type(exc).__name__}: {exc}")
+    deadline = started + wait_s
+    while time.perf_counter() < deadline:
+        code = process.poll()
+        if code is not None:
+            # Коды сервера дня 18: 1 — порт занят, 2 — чужая база.
+            return _autostart_failed(server, prefix, at, f"процесс вышел с кодом {code}")
+        if port_answers(url, AUTOSTART_POLL_S):
+            waited = time.perf_counter() - started
+            _AUTOSTARTED[server.name] = _Started(process, time.time())
+            logger.info(
+                "%s автозапуск: порт ответил через %.1f с, pid %d", prefix, waited, process.pid,
+            )
+            return AutostartStatus(
+                server.name, AUTOSTART_STARTED, at, pid=process.pid, wait_s=waited,
+            )
+        time.sleep(AUTOSTART_POLL_S)
+    # Порт не ответил, а процесс жив: он остаётся в реестре и будет остановлен
+    # при выходе приложения — сервер может ещё подняться, и следующий ход его
+    # увидит.
+    _AUTOSTARTED[server.name] = _Started(process, time.time())
+    return _autostart_failed(
+        server, prefix, at, f"порт не ответил за {wait_s:g} с (pid {process.pid} оставлен)",
+    )
+
+
+def _autostart_failed(server: McpServer, prefix: str, at: str, reason: str) -> AutostartStatus:
+    retry_at = datetime.fromtimestamp(_AUTOSTART_LAUNCHED_AT[server.name] + AUTOSTART_RETRY_S)
+    logger.warning(
+        "%s автозапуск: %s — %s; следующая попытка не раньше %s",
+        prefix, reason, AUTOSTART_NOT_STARTED, retry_at.strftime("%H:%M:%S"),
+    )
+    return AutostartStatus(server.name, AUTOSTART_NOT_STARTED, at, reason=reason)
+
+
+@atexit.register
+def _stop_autostarted() -> None:
+    """Выход приложения — остановить **только то, что запустил модуль**
+    (§6.1): SIGTERM, до `AUTOSTART_STOP_WAIT_S` ожидания, потом SIGKILL.
+    Процессы, которые приложение не запускало, не трогаются."""
+    with _AUTOSTART_LOCK:
+        items = list(_AUTOSTARTED.items())
+        _AUTOSTARTED.clear()
+    for name, own in items:
+        process = own.process
+        if process.poll() is not None:
+            continue
+        prefix = f"[MCP {name}]"
+        started = time.perf_counter()
+        try:
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=AUTOSTART_STOP_WAIT_S)
+            logger.info(
+                "%s остановка: pid %d — SIGTERM, вышел через %.1f с", prefix, process.pid,
+                time.perf_counter() - started,
+            )
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            logger.warning(
+                "%s остановка: pid %d — SIGTERM без ответа за %d с, SIGKILL", prefix, process.pid,
+                AUTOSTART_STOP_WAIT_S,
+            )
+        except OSError as exc:
+            logger.warning("%s остановка: pid %d — %s", prefix, process.pid, exc)
+
+
 # --- Адаптер для агента (день 17, §4.2) ------------------------------------
 
 class McpToolBox:
@@ -873,20 +1191,35 @@ class McpToolBox:
 
     def __init__(
         self, server: McpServer, *, timeout_s: float, call_timeout_s: float | None = None,
+        autostart_wait_s: float = AUTOSTART_WAIT_S,
     ) -> None:
         self._server = server
         self._timeout_s = timeout_s
         self._call_timeout_s = call_timeout_s if call_timeout_s is not None else timeout_s
+        # Сколько ждать порт после автозапуска (день 20, §6.1) — только у
+        # сервера с `autostart`.
+        self._autostart_wait_s = autostart_wait_s
 
     @property
     def name(self) -> str:
         """Короткое имя сервера — для логов агента и строки каталога."""
         return self._server.name
 
+    @property
+    def server(self) -> McpServer:
+        """Описание сервера — для строки «Серверы» панели (день 20, §6.2)."""
+        return self._server
+
     def catalog(self) -> dict:
         """Каталог инструментов: `{"ok", "error", "elapsed", "tools": [{"name",
         "description", "input_schema"}, …]}`. `input_schema` — `inputSchema`
-        из ответа как пришла (из `pages`, по именам полей протокола)."""
+        из ответа как пришла (из `pages`, по именам полей протокола).
+
+        С дня 20 (§6.1) у сервера с `autostart` сначала `ensure_started()`:
+        сервер, упавший посреди сессии, поднимается снова. Сбой запуска каталог
+        не отменяет — дальше сбой соединения, как на дне 18."""
+        if self._server.autostart:
+            ensure_started(self._server, os.environ, wait_s=self._autostart_wait_s)
         listing = list_tools(self._server, timeout_s=self._timeout_s)
         if not listing.ok:
             return {
@@ -939,8 +1272,8 @@ class McpToolBoxGroup:
     с инструментами остальных, а сбой уходит в необязательный ключ
     `"warning"` каталога; ни одного — каталог не получен, как у одного сервера.
 
-    Единственное состояние — карта «имя инструмента → сервер», которую
-    удачные каталоги только пополняют: каталог дописывает свои имена в копию
+    Состояние — карта «имя инструмента → сервер», которую
+    удачные каталоги только пополняют, каталог дописывает свои имена в копию
     карты и подменяет её одним присваиванием, читается она без замка. Имена
     не удаляются (правка по ревью дня 18): иначе каталог хода другого агента,
     снятый, пока сторож лежит, выкинул бы из карты инструмент, законный по
@@ -952,10 +1285,14 @@ class McpToolBoxGroup:
     def __init__(self, boxes: tuple[McpToolBox, ...]) -> None:
         self._boxes = boxes
         self._routes: dict[str, McpToolBox] = {}
+        # Итог последнего каталога по серверу (день 20, §6.2) — **процесса**,
+        # а не вкладки: группа одна на процесс. Только для панели; подменяется
+        # одним присваиванием, читается без замка.
+        self._last: dict[str, dict] = {}
 
     @property
     def name(self) -> str:
-        """Имена серверов через «+» — для логов агента и строки каталога: «faq+watch»."""
+        """Имена серверов через «+» — для логов агента и строки каталога: «watch+wiki+files»."""
         return "+".join(box.name for box in self._boxes)
 
     def catalog(self) -> dict:
@@ -970,9 +1307,17 @@ class McpToolBoxGroup:
         warnings: list[str] = []
         elapsed = 0.0
         received = 0
+        last: dict[str, dict] = {}
         for box in self._boxes:
             catalog = box.catalog()
             elapsed += catalog.get("elapsed") or 0.0
+            last[box.name] = {
+                "ok": bool(catalog.get("ok")),
+                "tools": len(catalog.get("tools") or []),
+                "error": catalog.get("error") or "",
+                "elapsed": catalog.get("elapsed") or 0.0,
+                "at": datetime.now().isoformat(timespec="seconds"),
+            }
             if not catalog.get("ok"):
                 failures.append(f"{box.name}: {catalog.get('error') or 'причина не названа'}")
                 continue
@@ -986,6 +1331,7 @@ class McpToolBoxGroup:
                     continue
                 routes[tool["name"]] = box
                 tools.append(tool)
+        self._last = {**self._last, **last}
         if not received:
             return {"ok": False, "error": "; ".join(failures), "elapsed": elapsed, "tools": []}
         self._routes = {**self._routes, **routes}
@@ -993,6 +1339,28 @@ class McpToolBoxGroup:
         if failures or warnings:
             result["warning"] = "; ".join(failures + warnings)
         return result
+
+    def server_of(self, name: str) -> str:
+        """Имя сервера инструмента по карте маршрутов (день 20, §6.2); "" —
+        инструмента в карте нет. Для колонки «сервер» панели; агенту не
+        нужен."""
+        box = self._routes.get(name)
+        return box.name if box is not None else ""
+
+    def statuses(self) -> tuple[dict, ...]:
+        """По серверу группы, в порядке `boxes` (день 20, §6.2): имя,
+        транспорт, итог последнего каталога процесса (`None` — каталога ещё
+        не было) и последний статус автозапуска (`None` — у сервера его нет
+        или ещё не проверялся)."""
+        return tuple(
+            {
+                "name": box.name,
+                "transport": box.server.transport,
+                "catalog": self._last.get(box.name),
+                "autostart": last_autostart(box.name) if box.server.autostart else None,
+            }
+            for box in self._boxes
+        )
 
     def call(self, name: str, arguments: dict, sample: Callable[[dict], dict] | None = None) -> dict:
         """Вызов — серверу инструмента по карте, которую пополняют каталоги.

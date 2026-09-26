@@ -1,19 +1,22 @@
 # TooManyRules — сторож FAQ: свой долгоживущий MCP-сервер по Streamable HTTP
 # (день 18, неделя 4; день 19 — пайплайн памятки к столу: поиск, сжатие
-# моделью клиента через MCP sampling, сохранение в файл).
+# моделью клиента через MCP sampling; день 20 — «FAQ издателя: копия и
+# сайт»).
 #
 # **Отдельная программа, а не модуль приложения** (спецификация дня 18, §3.1),
-# как `faq_server.py`, но запускает её не `mcp_client`, а человек:
-# `./run.sh faq-watch` (командная строка — `presets.FAQ_WATCH_ARGV`).
-# Приложение её не импортирует, в графе зависимостей приложения её нет. Сама
-# она импортирует `faq_server.py` — чтение сайта и разбор страниц; это ребро
+# как `faq_server.py`, но живёт долго: запускает её человек (`./run.sh
+# faq-watch`, командная строка — `presets.FAQ_WATCH_ARGV`) или, с дня 20,
+# приложение, если порт молчит (`mcp_client.ensure_started()`). Приложение её
+# не импортирует, в графе зависимостей приложения её нет. Сама она
+# импортирует `faq_server.py` — чтение сайта и разбор страниц; это ребро
 # между двумя серверами, вне графа приложения. Серверную часть SDK `mcp`
-# импортируют две программы — `faq_server.py` и эта; клиентскую — только
-# `mcp_client.py`.
+# импортируют программы-серверы (`faq_server.py`, эта, с дня 20 —
+# `wiki_server.py` и `file_server.py`); клиентскую — только `mcp_client.py`.
 #
-# Что делает (§2.1):
-# 1. по расписанию (по умолчанию раз в сутки) снимает FAQ целиком — список
-#    вопросов и тексты всех статей — и сохраняет снимок в SQLite;
+# Что делает (§2.1; как изменил день 20 — ниже):
+# 1. снимает FAQ целиком — список вопросов и тексты всех статей — и сохраняет
+#    снимок в SQLite: на дне 18 по расписанию, с дня 20 — по запросу, когда
+#    копия пуста или устарела, а по расписанию — только если его включили;
 # 2. сравнивает снимок с прошлым удачным и после каждого снимка сам пишет
 #    сводку в свой терминал (stderr) и события в базу;
 # 3. по вызову `faq_changes` отдаёт агрегированную сводку за период — из базы,
@@ -22,15 +25,38 @@
 #    новому расписанию — потом, в фоне;
 # 5. (день 19) `faq_search` находит статьи в последнем снимке по английским
 #    ключевым словам, `faq_summarize` сжимает найденное в памятку по-русски
-#    (модель клиента, через MCP sampling), `cheatsheet_save` сохраняет памятку
-#    в Markdown-файл. Данные между тремя шагами передаются по ссылке — id
-#    `q…`/`s…`, а не текстом: каждый шаг сам достаёт из базы то, что записал
-#    предыдущий, и проверяет, что переданный id — того вида и с той же базы
-#    (спецификация дня 19, §2.3).
+#    (модель клиента, через MCP sampling); сохранение в файл с дня 20 — на
+#    сервере файлов. Между поиском и сжатием данные передаются по ссылке — id
+#    `q…`, а не текстом: сжатие само достаёт из базы то, что записал поиск, и
+#    проверяет, что переданный id — того вида и с той же базы (спецификация
+#    дня 19, §2.3).
 #
 # Сервер знает портал Freshdesk, но не конкретную игру: адрес портала, id
 # категории, её имя и путь к базе приходят аргументами командной строки.
-# День 19 добавляет `--out` — каталог для файлов памяток.
+#
+# **День 20 (спецификация дня 20, §3)** — «FAQ издателя: копия и сайт».
+# Сервер — единственный источник FAQ издателя у агента, и FAQ доступен всегда:
+# 1. **копия** — последний удачный снимок в SQLite. Хорошая (удачный снимок
+#    не старше `--max-age-min`) — `faq_search` и новый `faq_article` отвечают
+#    из неё; плохая (пустая или устаревшая) — **с сайта**, а копия
+#    **докачивается в фоне**: инструмент ставит флаг «нужен снимок», будит
+#    исполнитель снимков и снимка не ждёт. Выбор «копия или сайт» делает код,
+#    а не модель: откуда данные, видно по строке `источник:` ответа;
+# 2. планировщик дня 18 стал **исполнителем снимков** с двумя источниками
+#    работы — запрос снимка и расписание; **расписание выключено по
+#    умолчанию** (`schedule_enabled` в `settings`), включают его `--interval`
+#    или `faq_watch_schedule(N)`, выключает `faq_watch_schedule(0)`;
+# 3. сервер обычно поднимает приложение (`mcp_client.ensure_started()`),
+#    если порт молчит, с `--parent-pid`: родитель сменился — сервер
+#    останавливается сам, как по Ctrl+C. Ручной запуск (`./run.sh faq-watch`)
+#    остаётся, аргумента `--parent-pid` у него нет;
+# 4. `cheatsheet_save` и `--out` ушли на сервер файлов (`file_server.py`,
+#    `save_markdown`): `faq_summarize` теперь отдаёт ещё и готовый Markdown
+#    памятки — данные в сервер файлов идут по значению. Таблица `saves`
+#    остаётся историей дня 19, новых строк в неё нет;
+# 5. база — версия 3: поиск по сайту записывается вместе с прочитанными
+#    текстами (`search_articles`), чтобы `faq_summarize` работал по ссылке `q…`
+#    тем же путём, что по копии.
 #
 # Процесс живёт долго и держит своё состояние — базу и расписание; подключения
 # клиента при этом короткие (одно на вызов), поэтому `stateless_http=True`:
@@ -41,9 +67,7 @@
 # Единственное место работы с базой сторожа (`sqlite3` из стандартной
 # библиотеки). Правило «диск трогает только `storage.py`» — про приложение, а
 # это отдельная программа со своими данными; база — данные сервера, приложение
-# её не открывает. День 19 добавляет второй вид файлов — памятки в `--out`:
-# запись атомарная (временный файл + `os.replace`, как у хранилищ
-# приложения), файлы не перезаписываются.
+# её не открывает. Файлов, кроме базы, сервер с дня 20 не пишет.
 #
 # Логи — только stderr, с префиксом `[FAQ-сторож]`. Строк на каждый запрос к
 # сайту нет: логгер `faq_server` здесь не настроен, и его INFO не выходит.
@@ -67,6 +91,7 @@ import logging
 import os
 import re
 import socket
+import signal
 import sqlite3
 import sys
 import time
@@ -86,7 +111,7 @@ from pydantic import Field
 from faq_server import ARTICLE_PATH, Article, Config, Site, read_article, read_sections
 
 SERVER_NAME = "toomanyrules-faq-watch"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 
 # --- Сеть ------------------------------------------------------------------
 # Адрес — только 127.0.0.1, аргумента хоста нет (§15): наружу сервер не
@@ -94,16 +119,27 @@ SERVER_VERSION = "1.1.0"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
-# --- Расписание (§2.4) -----------------------------------------------------
+# --- Расписание (§2.4; день 20 — §3.3) -------------------------------------
 # Нижняя граница — вежливость к чужому сайту: полный снимок — 89 запросов.
+# С дня 20 расписание выключено по умолчанию; интервал по умолчанию — только
+# на случай, когда базу включили без явного интервала.
 DEFAULT_INTERVAL_MIN = 1440
 MIN_INTERVAL_MIN = 5
 MAX_INTERVAL_MIN = 10080
-# После неудачной попытки — повтор через `min(интервал, RETRY_MIN)`.
+# После неудачной попытки — повтор через `min(интервал, RETRY_MIN)`. При
+# выключенном расписании интервалом в этой формуле считается `RETRY_MIN`
+# (день 20, §2.5): иначе недоступный сайт опрашивался бы на каждом вопросе.
 RETRY_MIN = 15
-# Планировщик спит не дольше этого и каждый раз заново сверяет стенные часы
-# со сроком: на ноутбуке, который засыпал, монотонные часы во сне стоят.
+# Исполнитель снимков спит не дольше этого и каждый раз заново сверяет
+# стенные часы со сроком: на ноутбуке, который засыпал, монотонные часы во
+# сне стоят. С той же частотой сервер сверяет родителя (`--parent-pid`).
 SCHEDULER_TICK_S = 60
+
+# --- Копия FAQ (день 20, §3.2) ---------------------------------------------
+# Копия хорошая, если последний удачный снимок начат не раньше этого числа
+# минут назад. Минуты, а не дни: для видео нужна копия, устаревшая за пару
+# минут (`--max-age-min 2`).
+DEFAULT_MAX_AGE_MIN = 10080
 
 # --- Сводка (§3.6) ---------------------------------------------------------
 DAYS_DEFAULT = 7
@@ -143,12 +179,15 @@ ORIGIN_DB = "из базы"
 ORIGIN_DEFAULT = "по умолчанию"
 ORIGIN_ARG = "из --interval"
 
-# --- База (§3.9, день 19 §3.7) ----------------------------------------------
+# --- База (§3.9, день 19 §3.7, день 20 §3.7) ---------------------------------
 # Версия схемы — `PRAGMA user_version`. 0 у пустой базы: схема создаётся
-# целиком; 1 — база дня 18: добавляются только три новые таблицы; своя версия
-# (2) — работаем; любая другая — чужая база, сервер не стартует. Миграция
-# 1 → 2 — единственная, добавочная: таблицы дня 18 не меняются.
-SCHEMA_VERSION = 2
+# целиком; 1 — база дня 18: добавляются таблицы дня 19 и дня 20; 2 — база дня
+# 19: `searches` пересобирается (у поиска по сайту нет снимка — `run_id`
+# допускает NULL, новая колонка `source`), добавляется `search_articles`;
+# своя версия (3) — работаем; любая другая — чужая база, сервер не стартует.
+# Миграция односторонняя: сервер дня 19 базу версии 3 не откроет (честный
+# отказ дня 18).
+SCHEMA_VERSION = 3
 SCHEMA = (
     """CREATE TABLE runs (
         id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT NOT NULL,
@@ -165,14 +204,10 @@ SCHEMA = (
         kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')""",
     "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 )
-# Таблицы дня 19 (§3.7) — пайплайн памятки: `searches` хранит, что и где
-# нашлось (`article_ids` — JSON-список в порядке поиска, ссылка на снимок —
-# `run_id`), `summaries` — сжатую памятку и её хеш (для проверки на шаге
-# сохранения), `saves` — куда и с каким хешем файла она легла.
+# Таблицы дня 19 (§3.7) — пайплайн памятки: `summaries` хранит сжатую памятку
+# и её хеш, `saves` — куда и с каким хешем файла она легла (с дня 20 —
+# история: сохраняет сервер файлов).
 SCHEMA_V19 = (
-    """CREATE TABLE searches (
-        id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, run_id INTEGER NOT NULL REFERENCES runs(id),
-        query TEXT NOT NULL, limit_n INTEGER NOT NULL, article_ids TEXT NOT NULL)""",
     """CREATE TABLE summaries (
         id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, search_id INTEGER NOT NULL REFERENCES searches(id),
         topic TEXT NOT NULL, text TEXT NOT NULL, text_hash TEXT NOT NULL, model TEXT NOT NULL,
@@ -181,30 +216,97 @@ SCHEMA_V19 = (
         id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, summary_id INTEGER NOT NULL REFERENCES summaries(id),
         path TEXT NOT NULL, file_hash TEXT NOT NULL, bytes INTEGER NOT NULL)""",
 )
+# `searches` в редакции дня 20 (§3.7): что и где нашлось. `article_ids` —
+# JSON-список в порядке поиска; у поиска по копии — ссылка на снимок
+# (`run_id`), у поиска по сайту `run_id` — NULL, а прочитанные тексты лежат в
+# `search_articles` (тексты — в `texts` по хешу, как у снимков).
+SEARCHES_TABLE = """CREATE TABLE {name} (
+    id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, run_id INTEGER REFERENCES runs(id),
+    source TEXT NOT NULL DEFAULT 'копия', query TEXT NOT NULL, limit_n INTEGER NOT NULL,
+    article_ids TEXT NOT NULL)"""
+SEARCH_ARTICLES_TABLE = """CREATE TABLE search_articles (
+    search_id INTEGER NOT NULL REFERENCES searches(id), position INTEGER NOT NULL,
+    article_id TEXT NOT NULL, section TEXT NOT NULL, question TEXT NOT NULL,
+    url TEXT NOT NULL, text_hash TEXT NOT NULL REFERENCES texts(hash),
+    PRIMARY KEY (search_id, position))"""
+# Миграция 2 → 3: `ALTER TABLE` в SQLite `NOT NULL` не снимает, поэтому
+# `searches` пересобирается — новая таблица, копия строк с `source='копия'`,
+# старая удаляется, новая переименовывается.
+MIGRATE_V2_V3 = (
+    SEARCHES_TABLE.format(name="searches_v3"),
+    "INSERT INTO searches_v3 (id, created_at, run_id, source, query, limit_n, article_ids) "
+    "SELECT id, created_at, run_id, 'копия', query, limit_n, article_ids FROM searches",
+    "DROP TABLE searches",
+    "ALTER TABLE searches_v3 RENAME TO searches",
+    SEARCH_ARTICLES_TABLE,
+)
 SETTING_INTERVAL = "interval_minutes"
+# Включено ли расписание (день 20, §3.3): "1" / "0". Нет ключа — выключено,
+# даже если интервал сохранён: иначе у автора после обновления продолжились
+# бы снимки по старому расписанию дней 18-19.
+SETTING_SCHEDULE = "schedule_enabled"
 
-# --- Описания инструментов (§3.7) ------------------------------------------
-# Описание инструмента и есть промпт (правило дня 17). Черновик спецификации;
-# каждое изменение по сбою живого прогона — строкой в комментарии у константы.
+SOURCE_COPY = "копия"
+SOURCE_SITE = "сайт"
+
+# --- Описания инструментов (день 20, §3.6) ----------------------------------
+# Описание инструмента и есть промпт (правило дня 17). Черновик спецификации
+# дня 20; каждое изменение по сбою живого прогона — строкой в комментарии у
+# константы. Упоминаний `faq_questions` дня 17 больше нет: этого инструмента у
+# агента нет.
+#
+# Правка `SEARCH_DESCRIPTION` по живому прогону (26.09.2026, `deepseek-flash`,
+# сценарий О1-О6 одним диалогом): после длинного О2 модель ответила на О4 и
+# О5 без вызовов — по истории и из общих знаний (О5 — неверно), хотя на
+# свежем агенте те же вопросы шли в FAQ. Добавлено «Вызывай перед каждым
+# ответом … даже если ответ кажется известным или уже звучал в разговоре» —
+# урок дня 17 (`QUESTIONS_DESCRIPTION` в `faq_server.py`).
+SEARCH_DESCRIPTION = (
+    "Официальный FAQ издателя по игре {name} — разъяснения и эррата от авторов игры, на "
+    "английском. Первый шаг для любого вопроса о правилах, спорного случая или эрраты: поиск "
+    "статей по английским ключевым словам (тему игрока переведи сам). Вызывай перед каждым "
+    "ответом на вопрос о правилах — даже если ответ кажется известным или уже звучал в "
+    "разговоре: FAQ разбирает как раз частые ошибки. Ищет в копии FAQ, а если "
+    "копия не готова — на сайте; откуда ответ, сказано в строке «источник». Возвращает id "
+    "поиска (q…) и статьи. Текст статьи — faq_article(номер); памятку по найденному — "
+    "faq_summarize(id поиска). При расхождении с другими источниками прав FAQ издателя."
+)
+QUERY_DESCRIPTION = (
+    "Английские ключевые слова через пробел: «poison», «tink bots». Ищутся по началу слова "
+    "в вопросе и тексте статьи."
+)
+ARTICLE_DESCRIPTION = (
+    "Текст одной статьи официального FAQ издателя по игре {name} по номеру из faq_search: "
+    "вопрос, раздел, ответ издателя и ссылка. Отвечая игроку, перескажи по-русски и дай ссылку."
+)
+ARTICLE_ID_DESCRIPTION = "Номер статьи из ответа faq_search: 33000210161."
+SUMMARIZE_DESCRIPTION = (
+    "Памятка к столу по одному поиску FAQ: сжимает статьи из результата faq_search в пункты "
+    "по-русски со ссылками. Принимает только id поиска (q…) — тексты сервер берёт сам. "
+    "Сжатие делает модель клиента по просьбе сервера. Возвращает id памятки (s…), пункты и "
+    "готовый Markdown — чтобы сохранить, передай его в save_markdown как есть."
+)
+SEARCH_ID_DESCRIPTION = "id поиска из первой строки ответа faq_search: q7."
+TOPIC_DESCRIPTION = "Тема памятки по-русски — станет её заголовком: «Яд (Poison)»."
 CHANGES_DESCRIPTION = (
-    "Сводка изменений официального FAQ издателя по игре {name} за последние дни: что сторож "
-    "FAQ заметил, сравнивая снимки, которые он делает по расписанию (новые, изменённые, "
-    "перенесённые и удалённые статьи), какие статьи по датам сайта изменены за период, и "
-    "состояние самого сторожа. Вызывай, когда игрок спрашивает, что нового или что "
-    "изменилось в FAQ, в разъяснениях или эррате издателя. Для вопросов о самих правилах — "
-    "faq_questions и faq_article. Отвечая, перескажи по-русски и дай ссылки на статьи."
+    "Что изменилось в официальном FAQ издателя по игре {name}: что сервер заметил, сравнивая "
+    "копии FAQ при обновлениях (новые, изменённые, перенесённые, удалённые статьи), какие "
+    "статьи по датам сайта изменены за период, и состояние копии. Вызывай, когда игрок "
+    "спрашивает, что нового в FAQ или эррате. Для вопросов о самих правилах — faq_search."
 )
 DAYS_DESCRIPTION = "За сколько последних дней: от 1 до 365. «За месяц» — 30, «за неделю» — 7."
 SCHEDULE_DESCRIPTION = (
-    "Меняет, как часто сторож проверяет FAQ по игре {name}: интервал в минутах, от 5 до "
-    "10080 (неделя). Сохраняется и после перезапуска сервера. Вызывай только по прямой "
-    "просьбе игрока изменить частоту проверок — не для того, чтобы узнать новости FAQ."
+    "Включает или выключает регулярную проверку FAQ по игре {name}: интервал в минутах от 5 "
+    "до 10080, 0 — выключить. Без расписания копия FAQ обновляется сама, когда нужна и "
+    "устарела. Вызывай только по прямой просьбе игрока проверять FAQ регулярно или перестать."
 )
-INTERVAL_DESCRIPTION = "Интервал между проверками в минутах: 60 — раз в час, 1440 — раз в сутки."
+INTERVAL_DESCRIPTION = "Минуты между проверками: 60 — раз в час, 1440 — раз в сутки, 0 — выключить."
 
-# Аннотации честные (§3.3): мир закрытый — инструменты работают с базой, а не
-# с сайтом. Сводка только читает; расписание пишет, но не разрушает, и повтор
-# с тем же значением ничего не меняет.
+# Аннотации честные (§3.1). Сводка только читает базу; расписание пишет, но не
+# разрушает, и повтор с тем же значением ничего не меняет. Поиск и статья с
+# дня 20 могут читать сайт — мир открытый; статья только читает (запрос
+# снимка — побочный эффект сервера, а не результат инструмента), поиск и
+# сжатие пишут записи в базу.
 CHANGES_ANNOTATIONS = ToolAnnotations(
     read_only_hint=True,
     destructive_hint=False,
@@ -217,9 +319,18 @@ SCHEDULE_ANNOTATIONS = ToolAnnotations(
     idempotent_hint=True,
     open_world_hint=False,
 )
+SEARCH_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True,
+)
+ARTICLE_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
+)
+SUMMARIZE_ANNOTATIONS = ToolAnnotations(
+    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False,
+)
 
 # --- Памятка к столу (день 19) ----------------------------------------------
-# Ссылки между шагами пайплайна — id внутри базы сторожа, не тексты (§2.3):
+# Ссылки между шагами пайплайна — id внутри базы сервера, не тексты (§2.3):
 # `q…` — результат `faq_search`, `s…` — результат `faq_summarize`. Модель
 # передаёт id следующему шагу, шаг сам достаёт данные из базы.
 SEARCH_PREFIX = "q"
@@ -228,7 +339,8 @@ SUMMARY_PREFIX = "s"
 # Поиск по словам (§2.5): токены — `[a-z0-9']+` в нижнем регистре, от 3 букв,
 # без короткого списка служебных английских слов (черновик; правки по
 # прогону — строкой в комментарии). Слово запроса совпадает, если оно —
-# начало слова статьи («poison» находит «poisoned»).
+# начало слова статьи («poison» находит «poisoned»). Поиск по сайту (день 20,
+# §3.4) сравнивает слова только с вопросами — тексты статей ещё не прочитаны.
 _SEARCH_WORD_RE = re.compile(r"[a-z0-9']+")
 SEARCH_STOPWORDS = frozenset({
     "the", "and", "for", "with", "how", "does", "can", "that", "this",
@@ -240,17 +352,16 @@ SEARCH_QUESTION_WEIGHT = 3
 SEARCH_TEXT_WEIGHT = 1
 SEARCH_LIMIT_DEFAULT = 5
 SEARCH_LIMIT_MAX = 10
-NO_SNAPSHOT_ERROR = "снимков FAQ ещё нет — сторож делает первый снимок; попробуй через минуту"
+LIMIT_DESCRIPTION = f"Сколько статей взять, 1-{SEARCH_LIMIT_MAX}."
 # Ответ модели клиента без пунктов, но по теме (§3.6) — единственный
 # допустимый ответ без «- »: сервер про игру не знает и промпт запрашивает
 # ровно эту строку.
 NO_ANSWER_LINE = "В найденных статьях нет ответа на тему"
-
-# Имя файла памятки (§2.6): только эти символы, до 40 знаков; пусто после
-# очистки — по номеру памятки.
-CHEATSHEET_NAME_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
-CHEATSHEET_NAME_MAX = 40
-CHEATSHEET_DATE_FORMAT = "%Y-%m-%d"
+# Ограда Markdown памятки в ответе `faq_summarize` (день 20, §3.5): в тексте
+# памятки не бывает ни `~~~`, ни тройных обратных кавычек. Её же разбирает
+# панель приложения.
+MARKDOWN_FENCE_OPEN = "~~~markdown"
+MARKDOWN_FENCE_CLOSE = "~~~"
 
 # Промпт сжатия — промпт сервера, а не агента (§3.6): сервер решает, о чём
 # просить, клиент — какой моделью. Каждое правило закрывает возможный сбой
@@ -264,45 +375,6 @@ SUMMARY_PROMPT = (
     "вступления. Если статьи не отвечают на тему — одна строка: «" + NO_ANSWER_LINE + "»."
 )
 SUMMARY_MAX_TOKENS = 1000     # страховка; длину держит «не больше 200 слов» (урок дня 9)
-
-# Описания — черновик; правки по прогону — строкой в комментарии у константы.
-SEARCH_DESCRIPTION = (
-    "Шаг 1 памятки к столу: поиск статей официального FAQ по игре {name} в последнем снимке "
-    "сторожа — по английским ключевым словам (FAQ английский). Возвращает id поиска (q…) и "
-    "найденные статьи. Для памятки передай id поиска в faq_summarize — сам статьи не "
-    "пересказывай. Для ответа на обычный вопрос о правилах — faq_questions и faq_article."
-)
-QUERY_DESCRIPTION = (
-    "Английские ключевые слова через пробел: «poison», «tink bots». Ищутся по началу слова "
-    "в вопросе и тексте статьи."
-)
-LIMIT_DESCRIPTION = f"Сколько статей взять, 1-{SEARCH_LIMIT_MAX}."
-SUMMARIZE_DESCRIPTION = (
-    "Шаг 2 памятки: сжимает статьи из результата faq_search в памятку по-русски со ссылками на "
-    "статьи. Принимает только id поиска (q…) — тексты передавать не нужно, сервер берёт их сам "
-    "из того же снимка. Сжатие делает модель клиента по просьбе сервера. Возвращает id памятки "
-    "(s…) и её текст."
-)
-SEARCH_ID_DESCRIPTION = "id поиска из первой строки ответа faq_search: q7."
-TOPIC_DESCRIPTION = "Тема памятки по-русски — станет её заголовком: «Яд (Poison)»."
-SAVE_DESCRIPTION = (
-    "Шаг 3 памятки: сохраняет памятку (id s… из faq_summarize) в Markdown-файл с источниками и "
-    "проверяет, что записан ровно её текст. Вызывай, когда игрок просит сохранить памятку."
-)
-SUMMARY_ID_DESCRIPTION = "id памятки из первой строки ответа faq_summarize: s3."
-NAME_DESCRIPTION = "Необязательное имя файла латиницей: «tink-bots». Пусто — по номеру памятки."
-
-# Аннотации честные (§3.1): все три пишут в базу (или файл), не разрушают
-# (не перезаписывают), мир закрытый — данные только из снимков сторожа.
-SEARCH_ANNOTATIONS = ToolAnnotations(
-    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False,
-)
-SUMMARIZE_ANNOTATIONS = ToolAnnotations(
-    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False,
-)
-SAVE_ANNOTATIONS = ToolAnnotations(
-    read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False,
-)
 
 logger = logging.getLogger("toomanyrules.faq_watch")
 
@@ -331,10 +403,6 @@ def _count(count: int, one: str, few: str, many: str) -> str:
 
 def _articles_word(count: int) -> str:
     return _count(count, "статья", "статьи", "статей")
-
-
-def _bytes_word(count: int) -> str:
-    return _count(count, "байт", "байта", "байт")
 
 
 def _events_word(count: int) -> str:
@@ -391,6 +459,23 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:HASH_CHARS]
 
 
+def _span(minutes: float) -> str:
+    """Промежуток словами (день 20, §2.4): «3 мин», «5 ч», «7 дн.». Порог
+    задаётся минутами и показывается ровно: 10080 — «7 дн.», 2 — «2 мин»."""
+    minutes = max(0, int(minutes))
+    if minutes >= 1440 and (minutes % 1440 == 0 or minutes >= 2880):
+        return f"{minutes // 1440} дн."
+    if minutes >= 60 and (minutes % 60 == 0 or minutes >= 120):
+        return f"{minutes // 60} ч"
+    return f"{minutes} мин"
+
+
+def is_fresh(started_at: datetime, now: datetime, max_age_min: int) -> bool:
+    """Чистая часть «копия хорошая» (день 20, §3.2): удачный снимок начат не
+    раньше `max_age_min` минут назад."""
+    return now - started_at <= timedelta(minutes=max_age_min)
+
+
 def next_due(
     last_ok: datetime | None, failed_after: datetime | None, interval_min: int, now: datetime
 ) -> datetime:
@@ -418,7 +503,8 @@ class DbError(Exception):
 def check_db(path: Path) -> int:
     """Версия схемы существующей базы; 0 — нового пути или пустого файла.
     Только чтение (`mode=ro`): отказ не должен оставить следов в файле.
-    Версия 1 (день 18) принимается — `init_db()` домигрирует её до 2."""
+    Версии 1 (день 18) и 2 (день 19) принимаются — `init_db()` домигрирует
+    их до 3."""
     if not path.exists() or path.stat().st_size == 0:
         return 0
     try:
@@ -430,7 +516,7 @@ def check_db(path: Path) -> int:
         raise DbError(f"файл не открывается как база SQLite: {exc}") from exc
     if version == 0 and tables:
         raise DbError("версия схемы 0, но в базе уже есть таблицы — это не база сторожа")
-    if version not in (0, 1, SCHEMA_VERSION):
+    if version not in (0, 1, 2, SCHEMA_VERSION):
         raise DbError(f"версия схемы {version}, сервер знает только {SCHEMA_VERSION}")
     return version
 
@@ -455,10 +541,12 @@ def _transaction(conn: sqlite3.Connection) -> Iterator[None]:
 
 
 def init_db(path: Path, version: int) -> None:
-    """Схема для новой базы (одной транзакцией, вместе с версией) и режим WAL:
-    инструменты читают, пока снимок пишет. Версия 1 (база дня 18) —
-    единственная миграция, добавочная: дописывает только три новые таблицы
-    (§3.7), таблицы дня 18 не трогает."""
+    """Схема для новой базы и миграции — одной транзакцией вместе с версией —
+    и режим WAL: инструменты читают, пока снимок пишет. Версия 1 (база дня
+    18) — добавляются таблицы дней 19-20 (`searches` сразу в редакции дня 20);
+    версия 2 (база дня 19) — `searches` пересобирается, `search_articles`
+    добавляется (день 20, §3.7). Таблицы дня 18 и строки `settings` не
+    трогаются."""
     if version == SCHEMA_VERSION:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -468,8 +556,14 @@ def init_db(path: Path, version: int) -> None:
             if version == 0:
                 for statement in SCHEMA:
                     conn.execute(statement)
-            for statement in SCHEMA_V19:
-                conn.execute(statement)
+            if version in (0, 1):
+                conn.execute(SEARCHES_TABLE.format(name="searches"))
+                for statement in SCHEMA_V19:
+                    conn.execute(statement)
+                conn.execute(SEARCH_ARTICLES_TABLE)
+            if version == 2:
+                for statement in MIGRATE_V2_V3:
+                    conn.execute(statement)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -631,7 +725,7 @@ def text_diff(old: str, new: str) -> list[str]:
     return shown
 
 
-# --- Памятка к столу: поиск, id, имя файла (день 19, §2.3, §2.5, §2.6) -----
+# --- Памятка к столу: поиск и id (день 19, §2.3, §2.5) ----------------------
 
 def _search_words(text: str) -> list[str]:
     """Токены для поиска: `[a-z0-9']+` в нижнем регистре, от 3 букв, без
@@ -678,26 +772,6 @@ def _require_search_ref(raw: str) -> int:
     return int(tail)
 
 
-def _require_summary_ref(raw: str) -> int:
-    """Разбирает id памятки (`s…`) — та же проверка вида, что у поиска."""
-    raw = raw.strip().lower()
-    tail = raw[len(SEARCH_PREFIX):]
-    if raw.startswith(SEARCH_PREFIX) and tail.isdigit():
-        raise ToolError(f"{raw} — id поиска, а нужен id памятки ({SUMMARY_PREFIX}…) из faq_summarize")
-    tail = raw[len(SUMMARY_PREFIX):]
-    if not (raw.startswith(SUMMARY_PREFIX) and tail.isdigit()):
-        raise ToolError(f"«{raw}» не похоже на id памятки ({SUMMARY_PREFIX}…) из faq_summarize")
-    return int(tail)
-
-
-def _clean_cheatsheet_name(raw: str, summary_id: int) -> str:
-    """Имя файла из параметра `name` (§2.6): только `[a-z0-9-]`, до 40 знаков;
-    пусто после очистки — по номеру памятки."""
-    cleaned = "".join(ch for ch in raw.strip().lower() if ch in CHEATSHEET_NAME_CHARS)
-    cleaned = cleaned.strip("-")[:CHEATSHEET_NAME_MAX].strip("-")
-    return cleaned or f"cheatsheet-{SUMMARY_PREFIX}{summary_id}"
-
-
 def _summary_user_text(topic: str, articles: list[tuple[str, str, str, str]]) -> str:
     """Вход сжатия (§3.4): «Тема: …», затем по статье — заголовок и текст, в
     порядке поиска. `articles` — (номер, раздел, вопрос, текст)."""
@@ -719,14 +793,62 @@ def _is_no_answer(text: str) -> bool:
     return text.strip().strip(" .«»\"'").strip() == NO_ANSWER_LINE
 
 
+def _site_down(exc: ToolError) -> bool:
+    """Сбой чтения сайта FAQ — сеть, ответ не 200, разметка, чужое имя
+    категории (день 20, §2.4): тогда ответ идёт из устаревшей копии, если она
+    есть. 404 статьи и статья чужой категории — не сбой сайта, а ответ сайта:
+    их текст уходит модели как есть."""
+    text = str(exc)
+    return not (text.startswith("статьи ") or text.startswith("статья "))
+
+
+def _modified_shown(raw: str) -> str:
+    """«Modified on: Tue, 13 Nov, 2018 at 8:35 AM» → «Tue, 13 Nov, 2018 at 8:35
+    AM»: в ответе `faq_article` у строки своя подпись."""
+    text = " ".join(raw.split())
+    if text.startswith(MODIFIED_PREFIX):
+        text = text[len(MODIFIED_PREFIX):].strip()
+    return text or "—"
+
+
 @dataclass(frozen=True)
 class SearchRecord:
-    """Строка `searches` (§3.7): что искали и на каком снимке."""
+    """Строка `searches` (§3.7): что искали и где — на каком снимке
+    (`source='копия'`) или на сайте (`source='сайт'`, `run_id` — `None`)."""
     id: int
+    created_at: datetime
     query: str
     limit: int
-    run_id: int
+    run_id: int | None
+    source: str
     article_ids: list[str]
+
+
+@dataclass(frozen=True)
+class CopyState:
+    """Состояние копии FAQ (день 20, §3.2): последний удачный снимок, его
+    возраст и порог, идёт ли снимок, неудачная попытка после него и срок
+    следующей попытки (`None` — снимков сейчас не ждём)."""
+    last_ok: "Run | None"
+    age: timedelta | None
+    max_age_min: int
+    fresh: bool
+    running: "Running | None"
+    failed: "Run | None"
+    next_at: datetime | None
+
+    @property
+    def threshold(self) -> str:
+        return _span(self.max_age_min)
+
+    def stale_reason(self) -> str:
+        """Почему копия плохая — для запроса снимка и строки лога."""
+        if self.last_ok is None:
+            return "копия пуста"
+        return (
+            f"копия устарела (возраст {_span(self.age.total_seconds() / 60)}, "
+            f"порог {self.threshold})"
+        )
 
 
 # --- Сторож ----------------------------------------------------------------
@@ -742,62 +864,98 @@ class Running:
 
 
 class Watch:
-    """Состояние процесса сторожа: где база, какой интервал, идёт ли снимок и
-    как разбудить планировщик. Один на процесс; снимки делает только
-    планировщик, инструменты читают базу и меняют интервал."""
+    """Состояние процесса сервера: где база, расписание, порог свежести копии,
+    идёт ли снимок, нужен ли снимок и как разбудить исполнитель снимков. Один
+    на процесс; снимки делает только исполнитель, инструменты читают базу
+    (или сайт), просят снимок и меняют расписание."""
 
-    def __init__(self, config: Config, db: Path, out_dir: Path) -> None:
+    def __init__(
+        self, config: Config, db: Path, max_age_min: int = DEFAULT_MAX_AGE_MIN,
+        parent_pid: int | None = None,
+    ) -> None:
         self.config = config
         self.db = db
-        # Каталог памяток (день 19, §2.6) — аргумент `--out`; создаётся, если
-        # его нет, до первого вызова `cheatsheet_save()`.
-        self.out_dir = out_dir
+        # Порог свежести копии (день 20, §3.2) — аргумент `--max-age-min`.
+        self.max_age_min = max_age_min
+        # Родитель, за которым следит сервер (день 20, §3.3) — аргумент
+        # `--parent-pid` автозапуска; у ручного запуска его нет.
+        self.parent_pid = parent_pid
         self.interval = DEFAULT_INTERVAL_MIN
         self.interval_origin = ORIGIN_DEFAULT
+        # Расписание (день 20, §3.3) — выключено по умолчанию.
+        self.schedule_enabled = False
         self.running: Running | None = None
+        # Запрос снимка (день 20, §2.5): причина — «копия пуста» / «копия
+        # устарела (…)»; "" — снимок не нужен. Ставят `faq_search` и
+        # `faq_article`, снимает начало снимка. Только в памяти процесса.
+        self.refresh_reason = ""
         # Срок «не раньше» после попытки, которой нет в `runs` (§2.4, правка
         # по ревью): сайт прочитан, но база снимок не приняла, или после
         # чтения упал код. Срок из базы тогда остался в прошлом, и без этого
-        # поля планировщик перечитывал бы сайт на каждом шаге проверки часов.
+        # поля исполнитель перечитывал бы сайт на каждом шаге проверки часов.
         # Только в памяти процесса: запись попытки его снимает, перезапуск —
         # тоже.
         self.not_before: datetime | None = None
-        # Событие создаётся в цикле событий — при старте планировщика.
+        # Событие создаётся в цикле событий — при старте исполнителя.
         self.wake: anyio.Event | None = None
 
     # --- расписание ---
 
-    def load_interval(self, from_arg: int | None) -> None:
-        """Кто задал интервал последним, тот и прав (§2.4): явный `--interval`
-        перекрывает сохранённый и сохраняется сам; без него — из базы или
-        умолчание."""
+    def load_schedule(self, from_arg: int | None) -> None:
+        """Кто задал расписание последним, тот и прав (§2.4, день 20 §3.3):
+        явный `--interval` включает расписание и сохраняется; без него —
+        интервал и включение из базы. Нет ключа `schedule_enabled` (базы дней
+        18-19) — выключено, даже если интервал сохранён."""
         if from_arg is not None:
-            self.save_interval(from_arg)
+            self.save_schedule(from_arg, True)
             self.interval_origin = ORIGIN_ARG
             return
         with closing(_connect(self.db)) as conn:
-            row = conn.execute(
-                "SELECT value FROM settings WHERE key = ?", (SETTING_INTERVAL,)
-            ).fetchone()
-        if row is not None and str(row["value"]).isdigit():
-            value = int(row["value"])
-            if MIN_INTERVAL_MIN <= value <= MAX_INTERVAL_MIN:
-                self.interval, self.interval_origin = value, ORIGIN_DB
+            rows = {
+                row["key"]: str(row["value"])
+                for row in conn.execute(
+                    "SELECT key, value FROM settings WHERE key IN (?, ?)",
+                    (SETTING_INTERVAL, SETTING_SCHEDULE),
+                )
+            }
+        self.schedule_enabled = rows.get(SETTING_SCHEDULE) == "1"
+        value = rows.get(SETTING_INTERVAL)
+        if value is not None and value.isdigit():
+            if MIN_INTERVAL_MIN <= int(value) <= MAX_INTERVAL_MIN:
+                self.interval, self.interval_origin = int(value), ORIGIN_DB
                 return
             logger.warning(
                 "интервал в базе вне %d-%d мин: %s — действует умолчание",
-                MIN_INTERVAL_MIN, MAX_INTERVAL_MIN, row["value"],
+                MIN_INTERVAL_MIN, MAX_INTERVAL_MIN, value,
             )
         self.interval, self.interval_origin = DEFAULT_INTERVAL_MIN, ORIGIN_DEFAULT
 
-    def save_interval(self, minutes: int) -> None:
+    def save_schedule(self, minutes: int | None, enabled: bool) -> None:
+        """Сохранить включение расписания и, если задан, интервал — одной
+        транзакцией."""
+        values = [(SETTING_SCHEDULE, "1" if enabled else "0")]
+        if minutes is not None:
+            values.append((SETTING_INTERVAL, str(minutes)))
         with closing(_connect(self.db)) as conn, _transaction(conn):
-            conn.execute(
+            conn.executemany(
                 "INSERT INTO settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (SETTING_INTERVAL, str(minutes)),
+                values,
             )
-        self.interval = minutes
+        self.schedule_enabled = enabled
+        if minutes is not None:
+            self.interval = minutes
+
+    def schedule_text(self) -> str:
+        """Расписание словами — для строки старта и ответов."""
+        if not self.schedule_enabled:
+            return "расписание выключено — снимки по запросу, когда копия пуста или старше порога"
+        return f"раз в {self.interval} мин ({self.interval_origin})"
+
+    def _retry_interval(self) -> int:
+        """Интервал для формулы повтора после неудачи: при выключенном
+        расписании — `RETRY_MIN` (день 20, §2.5)."""
+        return self.interval if self.schedule_enabled else RETRY_MIN
 
     def attempts(self, conn: sqlite3.Connection) -> tuple[Run | None, Run | None]:
         """Последний удачный снимок и неудачная попытка после него (если
@@ -808,60 +966,142 @@ class Watch:
         failed = _run(last) if last is not None and not last["ok"] else None
         return ok_run, failed
 
-    def next_due(self, conn: sqlite3.Connection | None = None) -> datetime:
+    def plan(self, conn: sqlite3.Connection | None = None) -> tuple[datetime | None, str]:
+        """Срок следующего снимка и его причина (день 20, §3.3) — из двух
+        источников работы: запрос снимка и расписание, если оно включено.
+        `(None, "")` — снимков сейчас не ждём.
+
+        Запрос — сразу, но после неудачной попытки не раньше её времени +
+        `min(интервал, RETRY_MIN)`: пауза — вежливость к сайту, ответ
+        пользователю в это время всё равно идёт с сайта. Расписание — формула
+        дня 18 (`next_due()`)."""
         if conn is None:
             with closing(_connect(self.db)) as own:
-                return self.next_due(own)
+                return self.plan(own)
         ok_run, failed = self.attempts(conn)
-        due = next_due(
-            ok_run.started_at if ok_run else None,
-            failed.started_at if failed else None,
-            self.interval,
-            _now(),
-        )
+        now = _now()
+        candidates: list[tuple[datetime, str]] = []
+        if self.refresh_reason:
+            due = (
+                failed.started_at + timedelta(minutes=min(self._retry_interval(), RETRY_MIN))
+                if failed else now
+            )
+            candidates.append((due, f"по запросу: {self.refresh_reason}"))
+        if self.schedule_enabled:
+            due = next_due(
+                ok_run.started_at if ok_run else None,
+                failed.started_at if failed else None,
+                self.interval,
+                now,
+            )
+            candidates.append((due, "по расписанию"))
+        if not candidates:
+            return None, ""
+        due, reason = min(candidates, key=lambda item: item[0])
         if self.not_before is not None and self.not_before > due:
-            return self.not_before
-        return due
+            due = self.not_before
+        return due, reason
 
     def _hold_off(self) -> datetime:
         """Срок «не раньше» после попытки, которой нет в базе:
         `min(интервал, RETRY_MIN)` от сейчас — как повтор после неудачи."""
-        self.not_before = _now() + timedelta(minutes=min(self.interval, RETRY_MIN))
+        self.not_before = _now() + timedelta(minutes=min(self._retry_interval(), RETRY_MIN))
         return self.not_before
 
-    def _due_text(self, due: datetime) -> str:
+    def _due_text(self, due: datetime | None) -> str:
         if self.running is not None:
             return f"идёт сейчас (снимок #{self.running.number}, начат {_fmt(self.running.started_at)})"
+        if due is None:
+            return "по запросу, когда копия пуста или устарела (расписание выключено)"
         if due <= _now():
             return "сейчас — срок уже прошёл"
         return _fmt(due)
 
-    # --- планировщик (§3.4) ---
+    # --- копия FAQ и запрос снимка (день 20, §2.4-§2.5) ---
+
+    def copy_state(self, conn: sqlite3.Connection, now: datetime) -> CopyState:
+        """Хорошая ли копия: последний удачный снимок, возраст, порог, идёт ли
+        снимок, неудачная попытка после него и срок следующей попытки."""
+        ok_run, failed = self.attempts(conn)
+        age = now - ok_run.started_at if ok_run is not None else None
+        due, _ = self.plan(conn)
+        return CopyState(
+            last_ok=ok_run,
+            age=age,
+            max_age_min=self.max_age_min,
+            fresh=ok_run is not None and is_fresh(ok_run.started_at, now, self.max_age_min),
+            running=self.running,
+            failed=failed,
+            next_at=due,
+        )
+
+    def request_refresh(self, reason: str) -> bool:
+        """Запрос снимка без ожидания (§2.5): флаг и побудка исполнителя.
+        Пока идёт снимок, запрос ничего не делает — копия и так станет
+        свежей. Возвращает, поставлен ли флаг."""
+        if self.running is not None:
+            return False
+        self.refresh_reason = reason
+        if self.wake is not None:
+            self.wake.set()
+        return True
+
+    def _refresh_tail(self) -> str:
+        """Хвост строки `источник:` у ответа с сайта — что с докачкой."""
+        if self.running is not None:
+            return (
+                f" (снимок #{self.running.number} начат "
+                f"{self.running.started_at.astimezone().strftime('%H:%M')})"
+            )
+        due, _ = self.plan()
+        if due is not None and due > _now():
+            return f" (следующая попытка не раньше {due.astimezone().strftime('%H:%M')})"
+        return ""
+
+    async def watch_parent(self) -> None:
+        """Родитель сменился (приложение убито без выхода) — остановиться, как
+        по Ctrl+C (день 20, §3.3): SIGINT себе, uvicorn выходит штатно, и
+        идущий снимок в базу не попадает."""
+        if self.parent_pid is None:
+            return
+        while True:
+            await anyio.sleep(SCHEDULER_TICK_S)
+            if os.getppid() != self.parent_pid:
+                logger.info("родитель %d завершился — останавливаюсь", self.parent_pid)
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+
+    # --- исполнитель снимков (§3.4, день 20 §3.3) ---
 
     async def scheduler(self) -> None:
         """Один цикл: снимки не перекрываются, срок — из базы по стенным
-        часам, смена интервала будит цикл раньше конца сна."""
+        часам, запрос снимка и смена расписания будят цикл раньше конца сна."""
         self.wake = anyio.Event()
         while True:
             try:
-                due = self.next_due()
-                while _now() < due and not self.wake.is_set():
-                    wait_s = min(SCHEDULER_TICK_S, max(0.0, (due - _now()).total_seconds()))
+                due, _ = self.plan()
+                while (due is None or _now() < due) and not self.wake.is_set():
+                    wait_s = SCHEDULER_TICK_S if due is None else min(
+                        SCHEDULER_TICK_S, max(0.0, (due - _now()).total_seconds())
+                    )
                     with anyio.move_on_after(wait_s):
                         await self.wake.wait()
+                    due, _ = self.plan()
                 self.wake = anyio.Event()
-                # Интервал мог смениться за время сна — пересчитать срок.
-                due = self.next_due()
-                if _now() >= due:
-                    await self.snapshot(due)
+                # Запрос или расписание могли смениться за время сна —
+                # пересчитать срок.
+                due, reason = self.plan()
+                if due is not None and _now() >= due:
+                    self.refresh_reason = ""
+                    await self.snapshot(reason)
             except Exception:
-                # Сторож не падает от одной ошибки: трассировка — в stderr.
+                # Сервер не падает от одной ошибки: трассировка — в stderr.
                 # Ошибка могла случиться после чтения сайта, а попытки в базе
                 # нет — поэтому снимок не раньше `_hold_off()`, а не на
                 # следующем шаге проверки часов. Сон — на случай, если падает
                 # само чтение срока из базы: без него цикл крутился бы вхолостую.
                 logger.exception(
-                    "планировщик: ошибка в коде сервера — снимок не раньше %s",
+                    "исполнитель снимков: ошибка в коде сервера — снимок не раньше %s",
                     _fmt(self._hold_off()),
                 )
                 await anyio.sleep(SCHEDULER_TICK_S)
@@ -934,7 +1174,7 @@ class Watch:
         with closing(_connect(self.db)) as conn:
             return (conn.execute("SELECT max(id) FROM runs").fetchone()[0] or 0) + 1
 
-    async def snapshot(self, due: datetime) -> None:
+    async def snapshot(self, why: str) -> None:
         """Одна попытка снимка. Исключений наружу не выпускает, кроме отмены:
         неудача чтения сайта — строка `runs` с `ok=0` и причиной; база не
         приняла запись — строка лога и срок «не раньше» (`_hold_off()`)."""
@@ -942,9 +1182,7 @@ class Watch:
         started_at = _now()
         started = time.perf_counter()
         self.running = Running(number, started_at)
-        logger.info(
-            "снимок #%d: начат (срок %s, раз в %d мин)", number, _fmt(due), self.interval
-        )
+        logger.info("снимок #%d: начат (%s)", number, why)
         site = Site(self.config)
         reason = ""
         result = None
@@ -993,9 +1231,12 @@ class Watch:
         self.not_before = None
 
         if reason:
+            due, _ = self.plan()
             logger.warning(
                 "снимок #%d: сбой через %.1f с — %s; повтор %s",
-                number, elapsed, reason, _fmt(self.next_due()),
+                number, elapsed, reason,
+                _fmt(due) if due is not None
+                else f"по следующему запросу, не раньше чем через {min(self._retry_interval(), RETRY_MIN)} мин",
             )
             return
         head = (
@@ -1021,7 +1262,7 @@ class Watch:
                 logger.info("%s — %s: изменений нет", head, since)
         for warning in warnings:
             logger.warning("  ⚠️ %s", warning)
-        logger.info("следующий снимок: %s", _fmt(self.next_due()))
+        logger.info("следующий снимок: %s", self._due_text(self.plan()[0]))
 
     @staticmethod
     def _record_failure(
@@ -1117,12 +1358,37 @@ class Watch:
             ok_runs = [run for run in runs if run.ok]
             last_ok = ok_runs[-1] if ok_runs else None
             first_ok = ok_runs[0] if ok_runs else None
-            due = self.next_due(conn)
+            state = self.copy_state(conn, now)
 
+            # Строка состояния (день 20, §3.5) — про копию и докачку, а не
+            # про «наблюдение по расписанию».
             lines = [
-                f"Сторож FAQ «{self.config.category_name}» ({self.config.category_url})",
+                f"FAQ издателя «{self.config.category_name}» ({self.config.category_url})",
             ]
-            status = f"Расписание: раз в {self.interval} мин. Снимков за {days} дн.: {len(in_period)}"
+            schedule = (
+                f"расписание: раз в {self.interval} мин" if self.schedule_enabled
+                else "расписание выключено"
+            )
+            if last_ok is None:
+                copy = (
+                    "Копии ещё нет: снимков не было; первый снимок начнётся по первому вопросу к FAQ"
+                    if not runs else "Копии ещё нет: удачных снимков не было"
+                )
+            else:
+                copy = (
+                    f"Копия: снимок #{last_ok.id} от {_fmt(last_ok.started_at)}, "
+                    f"{_articles_word(last_ok.articles)}, возраст "
+                    f"{_span(state.age.total_seconds() / 60)}, порог {state.threshold}"
+                    + ("" if state.fresh else " — устарела, обновится по следующему вопросу к FAQ")
+                )
+            if self.running is not None:
+                schedule += (
+                    f"; идёт снимок #{self.running.number} (начат {_fmt(self.running.started_at)})"
+                )
+            elif state.next_at is not None:
+                schedule += f"; следующий снимок: {self._due_text(state.next_at)}"
+            lines.append(f"{copy}; {schedule}.")
+            status = f"Снимков за {days} дн.: {len(in_period)}"
             failures = [run for run in in_period if not run.ok]
             if failures:
                 last_failure = failures[-1]
@@ -1135,16 +1401,6 @@ class Watch:
             else:
                 status += "."
             lines.append(status)
-            if last_ok is None:
-                lines.append(
-                    f"Удачных снимков ещё нет. Следующий: {self._due_text(due)}."
-                )
-            else:
-                lines.append(
-                    f"Последний удачный снимок: {_fmt(last_ok.started_at)}, "
-                    f"{_articles_word(last_ok.articles)}. Следующий: {self._due_text(due)}. "
-                    f"Наблюдение ведётся с {_fmt(first_ok.started_at)}."
-                )
 
             # По датам сайта — последний удачный снимок, граница — до суток.
             # Собирается первой: часть короткая, и её место в бюджете
@@ -1236,46 +1492,130 @@ class Watch:
         summary = f"{_events_word(len(events))}, {len(dated)} по датам сайта"
         return "\n".join(lines), summary
 
+    def _schedule_label(self) -> str:
+        return f"раз в {self.interval} мин" if self.schedule_enabled else "выключено"
+
     def schedule(self, minutes: int) -> tuple[str, str]:
-        """Ответ `faq_watch_schedule` и строка для лога (§3.7): интервал
-        сохраняется в базе, планировщик просыпается и пересчитывает срок."""
-        previous = self.interval
-        self.save_interval(minutes)
-        self.interval_origin = ORIGIN_DB
+        """Ответ `faq_watch_schedule` и строка для лога (§3.7, день 20 §3.3):
+        `0` выключает расписание, `N` от 5 включает его с этим интервалом; и
+        то и другое сохраняется в базе, исполнитель просыпается и
+        пересчитывает срок. 1-4 — отказ: схема пускает их (`ge=0`), потому
+        что 0 — законное значение."""
+        if 0 < minutes < MIN_INTERVAL_MIN:
+            raise ToolError(
+                f"интервал — от {MIN_INTERVAL_MIN} минут, или 0 — выключить; пришло {minutes}"
+            )
+        previous = self._schedule_label()
+        if minutes == 0:
+            self.save_schedule(None, False)
+        else:
+            self.save_schedule(minutes, True)
+            self.interval_origin = ORIGIN_DB
         if self.wake is not None:
             self.wake.set()
         with closing(_connect(self.db)) as conn:
             ok_run, _ = self.attempts(conn)
-            due = self.next_due(conn)
+            due, _ = self.plan(conn)
         last = (
             f"Последний удачный снимок — {_fmt(ok_run.started_at)}"
             if ok_run else "Удачных снимков ещё нет"
         )
+        if minutes == 0:
+            text = (
+                f"Расписание выключено (было: {previous}). Копия FAQ обновляется сама, когда "
+                f"нужна и устарела. {last}."
+            )
+            return text, f"было: {previous}; выключено"
         if self.running is not None:
             upcoming = (
                 f"снимок #{self.running.number} идёт сейчас; следующий — по новому "
                 f"расписанию после него"
             )
-        elif due <= _now():
+        elif due is not None and due <= _now():
             upcoming = "срок по новому расписанию уже прошёл — снимок начинается сейчас"
         else:
-            upcoming = f"следующий — {_fmt(due)}"
-        text = f"Расписание: раз в {minutes} мин (было {previous}). {last}, {upcoming}."
-        return text, f"было {previous}; следующий снимок {self._due_text(due)}"
+            upcoming = f"следующий — {self._due_text(due)}"
+        text = f"Расписание: раз в {minutes} мин (было: {previous}). {last}, {upcoming}."
+        return text, f"было: {previous}; следующий снимок {self._due_text(due)}"
 
-    # --- памятка к столу (день 19) ---
+    # --- источник ответа: копия или сайт (день 20, §2.4, §3.5) ---
 
-    def search(self, query: str, limit: int) -> tuple[str, str]:
-        """Ответ `faq_search` и строка для лога (§2.5, §3.3): ищет в
-        последнем удачном снимке — сеть не трогает, результат воспроизводим."""
+    def _copy_source(self, state: CopyState) -> str:
+        run = state.last_ok
+        return (
+            f"источник: {SOURCE_COPY} — снимок #{run.id} от {_fmt(run.started_at)} (возраст "
+            f"{_span(state.age.total_seconds() / 60)}, порог {state.threshold})"
+        )
+
+    def _site_source(self, state: CopyState) -> str:
+        """Строка `источник:` ответа с сайта — считается после чтения сайта,
+        когда фоновый снимок уже начат."""
+        if state.last_ok is None:
+            head = "копия пуста"
+        else:
+            head = (
+                f"копия устарела (снимок #{state.last_ok.id} от "
+                f"{state.last_ok.started_at.astimezone().strftime(DATE_FORMAT)}, порог "
+                f"{state.threshold})"
+            )
+        return f"источник: {SOURCE_SITE} — {head}, докачивается в фоне{self._refresh_tail()}"
+
+    @staticmethod
+    def _site_error(exc: ToolError) -> str:
+        text = str(exc)
+        prefix = "сайт FAQ недоступен: "
+        return text[len(prefix):] if text.startswith(prefix) else text
+
+    def _stale_source(self, state: CopyState, exc: ToolError) -> str:
+        run = state.last_ok
+        return (
+            f"источник: {SOURCE_COPY} — снимок #{run.id} от "
+            f"{run.started_at.astimezone().strftime(DATE_FORMAT)} (устарела); сайт недоступен: "
+            f"{self._site_error(exc)}"
+        )
+
+    def _unavailable(self, exc: ToolError, state: CopyState, missing: str = "") -> ToolError:
+        """Сайт не отвечает, а в копии ответа нет (§2.4)."""
+        if state.last_ok is None:
+            return ToolError(f"FAQ недоступен: сайт не отвечает ({self._site_error(exc)}), копии ещё нет")
+        return ToolError(
+            f"FAQ недоступен: сайт не отвечает ({self._site_error(exc)}), а в копии (снимок "
+            f"#{state.last_ok.id}) {missing}"
+        )
+
+    # --- поиск (день 19; день 20 — копия или сайт) ---
+
+    async def search(self, query: str, limit: int) -> tuple[str, str]:
+        """Ответ `faq_search` и строка для лога (§2.4, §3.4): хорошая копия —
+        поиск в ней, как на дне 19; плохая — запрос снимка и поиск по вопросам
+        на сайте; сайт не ответил — устаревшая копия с пометкой, копии нет —
+        отказ."""
         with closing(_connect(self.db)) as conn:
-            ok_run, _ = self.attempts(conn)
-            if ok_run is None:
-                raise ToolError(NO_SNAPSHOT_ERROR)
+            state = self.copy_state(conn, _now())
+        if state.fresh:
+            return self._search_copy(query, limit, state.last_ok, self._copy_source(state))
+        requested = self.request_refresh(state.stale_reason())
+        need = " · нужен снимок" if requested else ""
+        try:
+            found = await self._read_site_search(query, limit)
+        except ToolError as exc:
+            if state.last_ok is None:
+                raise self._unavailable(exc, state) from exc
+            text, summary = self._search_copy(
+                query, limit, state.last_ok, self._stale_source(state, exc)
+            )
+            return text, f"{summary}, сайт недоступен{need}"
+        text, summary = self._record_site_search(query, limit, state, *found)
+        return text, f"{summary}{need}"
+
+    def _search_copy(self, query: str, limit: int, run: Run, source: str) -> tuple[str, str]:
+        """Поиск в снимке `run` (день 19, §2.5) — сеть не трогает, результат
+        воспроизводим."""
+        with closing(_connect(self.db)) as conn:
             rows = conn.execute(
                 "SELECT a.article_id, a.section, a.question, t.text FROM articles a "
                 "JOIN texts t ON t.hash = a.text_hash WHERE a.run_id = ? ORDER BY a.rowid",
-                (ok_run.id,),
+                (run.id,),
             ).fetchall()
             total = len(rows)
             query_words = _search_words(query)
@@ -1293,49 +1633,231 @@ class Watch:
             article_ids = [row["article_id"] for _, _, row in top]
             with _transaction(conn):
                 conn.execute(
-                    "INSERT INTO searches (id, created_at, run_id, query, limit_n, article_ids) "
-                    "VALUES (NULL, ?, ?, ?, ?, ?)",
-                    (_iso(_now()), ok_run.id, query, limit, json.dumps(article_ids)),
+                    "INSERT INTO searches (id, created_at, run_id, source, query, limit_n, "
+                    "article_ids) VALUES (NULL, ?, ?, ?, ?, ?, ?)",
+                    (_iso(_now()), run.id, SOURCE_COPY, query, limit, json.dumps(article_ids)),
                 )
                 search_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         ref = f"{SEARCH_PREFIX}{search_id}"
-        lines = [f"id: {ref}"]
+        lines = [f"id: {ref}", source]
+        where = f"в снимке #{run.id} ({_fmt(run.started_at)})"
         if not top:
             lines.append(
-                f"Поиск «{query}» в снимке #{ok_run.id} ({_fmt(ok_run.started_at)}): "
-                f"ничего не найдено среди {total}; попробуй другие английские слова."
+                f"Поиск «{query}» {where}: ничего не найдено среди {total}; попробуй другие "
+                f"английские слова."
             )
-            return "\n".join(lines), f"{ref} — 0 из {total}"
-        lines.append(
-            f"Поиск «{query}» в снимке #{ok_run.id} ({_fmt(ok_run.started_at)}): "
-            f"{_articles_word(len(top))} из {total}."
-        )
+            return "\n".join(lines), f"{ref} — 0 из {total}, из копии #{run.id}"
+        lines.append(f"Поиск «{query}» {where}: {_articles_word(len(top))} из {total}.")
         lines.append("Строка: номер · раздел · вопрос · совпало.")
         for _, hits, row in top:
-            matched = ", ".join(
-                f"{word} ({', '.join(sorted(set(where)))})" for word, where in hits.items()
+            lines.append(
+                f"{row['article_id']} · {row['section']} · {row['question']} · {_hits_text(hits)}"
             )
-            lines.append(f"{row['article_id']} · {row['section']} · {row['question']} · {matched}")
-        lines.append(f"Для памятки передай id {ref} в faq_summarize.")
-        return "\n".join(lines), f"{ref} — {len(top)} из {total} (снимок #{ok_run.id})"
+        lines.append(
+            f"Текст статьи — faq_article(номер). Для памятки передай id {ref} в faq_summarize."
+        )
+        return "\n".join(lines), f"{ref} — {len(top)} из {total}, из копии #{run.id}"
+
+    async def _read_site_search(
+        self, query: str, limit: int,
+    ) -> tuple[int, list[tuple[dict[str, list[str]], str, str, str]], dict[str, Article], int]:
+        """Поиск по сайту (§3.4): вопросы всех разделов (`read_sections()`,
+        7 запросов), слова запроса сравниваются только с вопросами, тексты
+        первых `limit` найденных статей читаются параллельно (потолок `Site` —
+        4). Возвращает число статей, найденные (совпало, номер, раздел,
+        вопрос), прочитанные статьи и число запросов. Сбой сайта — `ToolError`."""
+        async with Site(self.config) as site:
+            sections, _ = await read_sections(site, self.config)
+            listed: dict[str, tuple[str, str]] = {}
+            for section in sections:
+                for article_id, question in section.articles:
+                    listed.setdefault(article_id, (section.name, question))
+            query_words = _search_words(query)
+            scored: list[tuple[int, dict[str, list[str]], str, str, str]] = []
+            for article_id, (section, question) in listed.items():
+                score, hits = _score_article(query_words, _search_words(question), [])
+                if score > 0:
+                    scored.append((score, hits, article_id, section, question))
+            scored.sort(key=lambda item: -item[0])
+            top = [(hits, article_id, section, question) for _, hits, article_id, section, question in scored[:limit]]
+
+            found: dict[str, Article] = {}
+
+            async def one(article_id: str) -> None:
+                found[article_id] = await read_article(site, self.config, article_id)
+
+            try:
+                async with asyncio.TaskGroup() as group:
+                    for _, article_id, _, _ in top:
+                        group.create_task(one(article_id))
+            except ExceptionGroup as errors:
+                first = errors.exceptions[0]
+                while isinstance(first, ExceptionGroup):
+                    first = first.exceptions[0]
+                raise first from None
+            return len(listed), top, found, site.requests
+
+    def _record_site_search(
+        self, query: str, limit: int, state: CopyState, total: int,
+        top: list[tuple[dict[str, list[str]], str, str, str]], found: dict[str, Article],
+        requests: int,
+    ) -> tuple[str, str]:
+        """Поиск по сайту — в базу одной транзакцией вместе с прочитанными
+        текстами (§3.7): `faq_summarize` потом работает по ссылке `q…` тем же
+        путём, что по копии. Номер, раздел и вопрос — из списка, текст — со
+        страницы, как у снимка."""
+        article_ids = [article_id for _, article_id, _, _ in top]
+        with closing(_connect(self.db)) as conn, _transaction(conn):
+            conn.execute(
+                "INSERT INTO searches (id, created_at, run_id, source, query, limit_n, "
+                "article_ids) VALUES (NULL, ?, NULL, ?, ?, ?, ?)",
+                (_iso(_now()), SOURCE_SITE, query, limit, json.dumps(article_ids)),
+            )
+            search_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            for position, (_, article_id, section, question) in enumerate(top):
+                article = found[article_id]
+                digest = text_hash(article.text)
+                conn.execute(
+                    "INSERT OR IGNORE INTO texts (hash, text) VALUES (?, ?)", (digest, article.text),
+                )
+                conn.execute(
+                    "INSERT INTO search_articles (search_id, position, article_id, section, "
+                    "question, url, text_hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (search_id, position, article_id, section, question, article.url, digest),
+                )
+
+        ref = f"{SEARCH_PREFIX}{search_id}"
+        lines = [f"id: {ref}", self._site_source(state)]
+        where = f"Поиск «{query}» по вопросам FAQ на сайте"
+        stale = "копия пуста" if state.last_ok is None else "копия устарела"
+        summary_tail = f"с сайта ({stale}), {_requests_word(requests)}"
+        if not top:
+            lines.append(
+                f"{where}: по вопросам ничего не найдено среди {total}; копия докачивается — "
+                f"через минуту поиск пойдёт и по текстам статей."
+            )
+            return "\n".join(lines), f"{ref} — 0 из {total}, {summary_tail}"
+        lines.append(f"{where}: {_articles_word(len(top))} из {total}.")
+        lines.append("Строка: номер · раздел · вопрос · совпало.")
+        for hits, article_id, section, question in top:
+            lines.append(f"{article_id} · {section} · {question} · {_hits_text(hits)}")
+        lines.append(
+            f"Текст статьи — faq_article(номер). Для памятки передай id {ref} в faq_summarize."
+        )
+        return "\n".join(lines), f"{ref} — {len(top)} из {total}, {summary_tail}"
+
+    # --- статья (день 20, §3.1, §3.4) ---
+
+    async def article(self, article_id: str) -> tuple[str, str]:
+        """Ответ `faq_article` и строка для лога: хорошая копия со статьёй —
+        из копии; статьи в хорошей копии нет — с сайта (новая статья); копия
+        плохая — запрос снимка и сайт; сайт не ответил — устаревшая копия с
+        пометкой или отказ. 404 и статья чужой категории — отказ сайта как
+        есть. В базу статья с сайта не пишется: копию обновит снимок."""
+        with closing(_connect(self.db)) as conn:
+            state = self.copy_state(conn, _now())
+            row = None
+            if state.last_ok is not None:
+                row = conn.execute(
+                    "SELECT a.section, a.question, a.modified_raw, t.text FROM articles a "
+                    "JOIN texts t ON t.hash = a.text_hash WHERE a.run_id = ? AND a.article_id = ?",
+                    (state.last_ok.id, article_id),
+                ).fetchone()
+        if state.fresh and row is not None:
+            text = self._article_text(
+                self._copy_source(state), row["question"], row["section"],
+                self._article_url(article_id), row["modified_raw"], row["text"],
+            )
+            return text, f"из копии #{state.last_ok.id}"
+
+        need = ""
+        if state.fresh:
+            run = state.last_ok
+            source = (
+                f"источник: {SOURCE_SITE} — в копии нет (снимок #{run.id} от "
+                f"{_fmt(run.started_at)}): статья прочитана с сайта"
+            )
+            label = "с сайта (в копии нет)"
+        else:
+            if self.request_refresh(state.stale_reason()):
+                need = " · нужен снимок"
+            source = ""
+            label = "с сайта (" + ("копия пуста" if state.last_ok is None else "копия устарела") + ")"
+        try:
+            async with Site(self.config) as site:
+                found = await read_article(site, self.config, article_id)
+                requests = site.requests
+        except ToolError as exc:
+            if not _site_down(exc) or state.fresh:
+                raise
+            if row is None:
+                raise self._unavailable(exc, state, f"статьи {article_id} нет") from exc
+            text = self._article_text(
+                self._stale_source(state, exc), row["question"], row["section"],
+                self._article_url(article_id), row["modified_raw"], row["text"],
+            )
+            return text, f"из устаревшей копии #{state.last_ok.id}, сайт недоступен{need}"
+        if not source:
+            source = self._site_source(state)
+        if self.running is not None:
+            label = label[:-1] + f"; снимок #{self.running.number} идёт)"
+        text = self._article_text(
+            source, found.question, found.section, found.url, found.modified, found.text,
+        )
+        return text, f"{label}, {_requests_word(requests)}{need}"
+
+    @staticmethod
+    def _article_text(
+        source: str, question: str, section: str, url: str, modified: str, text: str,
+    ) -> str:
+        """Формат `faq_article` дня 17 плюс строка `источник:` и дата
+        изменения (день 20, §3.5)."""
+        return "\n".join([
+            source,
+            f"Вопрос: {question}",
+            f"Раздел: {section or '—'}",
+            f"Ссылка: {url}",
+            f"Изменена на сайте: {_modified_shown(modified)}",
+            "Ответ издателя:",
+            text or "(текст статьи пуст)",
+        ])
+
+    # --- памятка к столу (день 19; день 20 — поиск по сайту и Markdown) ---
 
     def _load_search(self, conn: sqlite3.Connection, search_id: int) -> SearchRecord:
         row = conn.execute("SELECT * FROM searches WHERE id = ?", (search_id,)).fetchone()
         if row is None:
             raise ToolError(f"поиска {SEARCH_PREFIX}{search_id} нет")
         return SearchRecord(
-            id=row["id"], query=row["query"], limit=row["limit_n"], run_id=row["run_id"],
-            article_ids=json.loads(row["article_ids"]),
+            id=row["id"], created_at=datetime.fromisoformat(row["created_at"]),
+            query=row["query"], limit=row["limit_n"], run_id=row["run_id"],
+            source=row["source"], article_ids=json.loads(row["article_ids"]),
         )
 
     def _search_articles(
         self, conn: sqlite3.Connection, record: SearchRecord,
     ) -> list[tuple[str, str, str, str]]:
-        """Тексты статей поиска — из того же снимка, на котором искали
-        (§2.3): снимка нет или в нём нет статьи — одна и та же ошибка,
-        «повтори поиск» (снимки не удаляются, поэтому в обычном прогоне она
-        не встречается)."""
+        """Тексты статей поиска. Поиск по копии — из того же снимка, на
+        котором искали (§2.3): снимка нет или в нём нет статьи — одна и та же
+        ошибка, «повтори поиск» (снимки не удаляются, поэтому в обычном
+        прогоне она не встречается). Поиск по сайту (день 20, §3.7) — из
+        `search_articles`, то, что поиск прочитал; не совпало с найденным — та
+        же ошибка."""
+        if record.source == SOURCE_SITE:
+            rows = conn.execute(
+                "SELECT sa.article_id, sa.section, sa.question, t.text FROM search_articles sa "
+                "JOIN texts t ON t.hash = sa.text_hash WHERE sa.search_id = ? ORDER BY sa.position",
+                (record.id,),
+            ).fetchall()
+            if [row["article_id"] for row in rows] != record.article_ids:
+                raise ToolError(
+                    f"тексты поиска {SEARCH_PREFIX}{record.id} в базе не совпадают с найденным — "
+                    f"повтори поиск"
+                )
+            return [
+                (row["article_id"], row["section"], row["question"], row["text"]) for row in rows
+            ]
         missing = ToolError(
             f"снимка #{record.run_id}, на котором искали {SEARCH_PREFIX}{record.id}, "
             f"в базе нет — повтори поиск"
@@ -1362,7 +1884,9 @@ class Watch:
         self, search_id_raw: str,
     ) -> tuple[SearchRecord, list[tuple[str, str, str, str]]]:
         """Данные для сжатия по id поиска (§3.4): проверки входа — здесь, до
-        просьбы к модели клиента, чтобы неверный id не стоил вызова."""
+        просьбы к модели клиента, чтобы неверный id не стоил вызова.
+        Детерминирована: `Resolve` выполняется на каждом раунде просьбы, и
+        сайт здесь не читается — поиск по сайту уже записал тексты."""
         search_id = _require_search_ref(search_id_raw)
         with closing(_connect(self.db)) as conn:
             record = self._load_search(conn, search_id)
@@ -1371,13 +1895,51 @@ class Watch:
             raise ToolError(f"поиск {SEARCH_PREFIX}{record.id} ничего не нашёл — сжимать нечего")
         return record, articles
 
+    def _origin(self, record: SearchRecord, run: Run | None) -> tuple[str, str]:
+        """Откуда тексты памятки — строка `источник:` и строка источников
+        Markdown (день 20, §3.5)."""
+        search_ref = f"{SEARCH_PREFIX}{record.id}"
+        if record.source == SOURCE_SITE or run is None:
+            read_at = _fmt(record.created_at)
+            return (
+                f"источник: {SOURCE_SITE} — прочитано {read_at} (поиск {search_ref})",
+                f"прочитано с сайта {read_at} (поиск {search_ref})",
+            )
+        return (
+            f"источник: {SOURCE_COPY} — снимок #{run.id} от {_fmt(run.started_at)}",
+            f"снимок #{run.id} от {_fmt(run.started_at)}",
+        )
+
+    def _cheatsheet_markdown(
+        self, topic: str, text: str, record: SearchRecord, sources: str,
+        articles: list[tuple[str, str, str, str]], summary_ref: str, model: str,
+        summary_hash: str,
+    ) -> str:
+        """Markdown памятки для сохранения (день 20, §3.5) — формат файла дня
+        19 без «→ этот файл»: заголовок, источники и строку происхождения
+        пишет код из базы, модель — только пункты (уже в `text`)."""
+        lines = [f"# Памятка: {topic}", "", text, "", "---", ""]
+        lines.append(
+            f"Источники — официальный FAQ издателя «{self.config.category_name}», {sources}:"
+        )
+        for article_id, section, question, _ in articles:
+            lines.append(f"- [{article_id}]({self._article_url(article_id)}) · {section} · {question}")
+        lines.append("")
+        lines.append(
+            f"Собрано {_fmt(_now())} · поиск {SEARCH_PREFIX}{record.id} («{record.query}», "
+            f"{_articles_word(len(articles))}) → памятка {summary_ref} (модель {model}, "
+            f"sha {summary_hash[:12]}…)"
+        )
+        return "\n".join(lines)
+
     def summarize(
         self, search_id_raw: str, topic: str, result: CreateMessageResult,
     ) -> tuple[str, str]:
         """Ответ `faq_summarize` (§3.3): разбирает ответ модели клиента,
-        проверяет ссылки на статьи этого поиска, пишет памятку одной строкой.
-        Оборванный по лимиту ответ не записывается — правило трекера дня 13,
-        оборванный результат хуже отсутствия."""
+        проверяет ссылки на статьи этого поиска, пишет памятку одной строкой,
+        и (день 20, §3.5) отдаёт готовый Markdown для `save_markdown` сервера
+        файлов. Оборванный по лимиту ответ не записывается — правило трекера
+        дня 13, оборванный результат хуже отсутствия."""
         record, articles = self.summary_source(search_id_raw)
         if result.stop_reason == "maxTokens":
             raise ToolError("памятка оборвана по лимиту — сократи limit поиска")
@@ -1392,153 +1954,76 @@ class Watch:
         foreign = sorted({m for m in re.findall(r"\[(\d+)\]", text) if m not in article_ids})
         model = result.model or "?"
         digest = text_hash(text)
-        with closing(_connect(self.db)) as conn, _transaction(conn):
-            conn.execute(
-                "INSERT INTO summaries (id, created_at, search_id, topic, text, text_hash, "
-                "model, items, foreign_refs) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (_iso(_now()), record.id, topic, text, digest, model, len(items), json.dumps(foreign)),
+        with closing(_connect(self.db)) as conn:
+            run_row = (
+                conn.execute("SELECT * FROM runs WHERE id = ?", (record.run_id,)).fetchone()
+                if record.run_id is not None else None
             )
-            summary_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            with _transaction(conn):
+                conn.execute(
+                    "INSERT INTO summaries (id, created_at, search_id, topic, text, text_hash, "
+                    "model, items, foreign_refs) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (_iso(_now()), record.id, topic, text, digest, model, len(items),
+                     json.dumps(foreign)),
+                )
+                summary_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         ref = f"{SUMMARY_PREFIX}{summary_id}"
         search_ref = f"{SEARCH_PREFIX}{record.id}"
+        source_line, sources = self._origin(record, _run(run_row) if run_row is not None else None)
+        markdown = self._cheatsheet_markdown(
+            topic, text, record, sources, articles, ref, model, digest,
+        )
         lines = [
             f"id: {ref}",
-            f"Памятка «{topic}» из поиска {search_ref} ({_articles_word(len(articles))}, "
-            f"снимок #{record.run_id}), модель клиента {model}, {len(items)} "
+            source_line,
+            f"Памятка «{topic}» из поиска {search_ref} ({_articles_word(len(articles))}), "
+            f"модель клиента {model}, {len(items)} "
             f"{_plural(len(items), 'пункт', 'пункта', 'пунктов')}.",
             text,
-            f"Чтобы сохранить, передай id {ref} в cheatsheet_save.",
         ]
         if foreign:
             lines.append("⚠️ ссылки вне поиска: " + ", ".join(foreign))
+        lines += [
+            "Чтобы сохранить в файл, передай Markdown между ~~~ в save_markdown как есть:",
+            MARKDOWN_FENCE_OPEN,
+            markdown,
+            MARKDOWN_FENCE_CLOSE,
+        ]
         # Время в строке лога — только тело инструмента: раунды — разные
         # HTTP-запросы, и сервер без состояния не знает, когда начался первый;
         # время сэмплинга — в логах клиента и агента (§3.8).
         summary = (
             f"{ref} — {_count(len(items), 'пункт', 'пункта', 'пунктов')}, модель {model}, "
-            f"без сэмплинга"
+            f"Markdown {len(markdown)} символов"
         )
         return "\n".join(lines), summary
 
-    def _load_summary(self, conn: sqlite3.Connection, summary_id: int) -> sqlite3.Row:
-        row = conn.execute("SELECT * FROM summaries WHERE id = ?", (summary_id,)).fetchone()
-        if row is None:
-            raise ToolError(f"памятки {SUMMARY_PREFIX}{summary_id} нет")
-        return row
-
-    def _unique_cheatsheet_path(self, stem: str) -> Path:
-        candidate = self.out_dir / f"{stem}.md"
-        number = 2
-        while candidate.exists():
-            candidate = self.out_dir / f"{stem}-{number}.md"
-            number += 1
-        return candidate
-
-    def _cheatsheet_content(
-        self, topic: str, text: str, record: SearchRecord, run: Run,
-        articles: list[tuple[str, str, str, str]], summary_ref: str, model: str,
-        summary_hash: str, search_ref: str,
-    ) -> str:
-        """Файл памятки (§2.6): заголовок, источники и строка происхождения
-        пишет код, из базы — модель пишет только пункты (уже в `text`)."""
-        lines = [f"# Памятка: {topic}", "", text, "", "---", ""]
-        lines.append(
-            f"Источники — официальный FAQ издателя «{self.config.category_name}», снимок "
-            f"#{record.run_id} от {_fmt(run.started_at)}:"
-        )
-        for article_id, section, question, _ in articles:
-            lines.append(f"- [{article_id}]({self._article_url(article_id)}) · {section} · {question}")
-        lines.append("")
-        lines.append(
-            f"Собрано {_fmt(_now())} · поиск {search_ref} («{record.query}», "
-            f"{_articles_word(len(articles))}) → памятка {summary_ref} (модель {model}, "
-            f"sha {summary_hash[:12]}…) → этот файл"
-        )
-        return "\n".join(lines)
-
-    def save_cheatsheet(self, summary_id_raw: str, name: str) -> tuple[str, str]:
-        """Ответ `cheatsheet_save` (§3.3, §3.5): хеш памятки сверяется с
-        записанным при сжатии, файл пишется атомарно внутри `--out`,
-        перечитывается и сверяется байт в байт."""
-        summary_id = _require_summary_ref(summary_id_raw)
-        with closing(_connect(self.db)) as conn:
-            summary_row = self._load_summary(conn, summary_id)
-            text = summary_row["text"]
-            if text_hash(text) != summary_row["text_hash"]:
-                raise ToolError(
-                    f"памятка {SUMMARY_PREFIX}{summary_id} изменена после сжатия — сохранять не буду"
-                )
-            record = self._load_search(conn, summary_row["search_id"])
-            articles = self._search_articles(conn, record)
-            run_row = conn.execute("SELECT * FROM runs WHERE id = ?", (record.run_id,)).fetchone()
-            run = _run(run_row)
-
-        topic = summary_row["topic"]
-        model = summary_row["model"]
-        items = summary_row["items"]
-        summary_ref = f"{SUMMARY_PREFIX}{summary_id}"
-        search_ref = f"{SEARCH_PREFIX}{record.id}"
-
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"{_now().strftime(CHEATSHEET_DATE_FORMAT)}-{_clean_cheatsheet_name(name, summary_id)}"
-        path = self._unique_cheatsheet_path(stem)
-        # Проверка ещё раз, что путь остался внутри `--out` (§2.6): очистка
-        # имени уже не оставляет в нём «/» и «..», это защита сверх неё.
-        if self.out_dir.resolve() not in path.resolve().parents:
-            raise ToolError("путь файла вышел за пределы каталога памяток — сохранение отменено")
-
-        content = self._cheatsheet_content(
-            topic, text, record, run, articles, summary_ref, model,
-            summary_row["text_hash"], search_ref,
-        )
-        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-        try:
-            tmp.write_text(content, encoding="utf-8")
-            os.replace(tmp, path)
-        except OSError as exc:
-            if tmp.exists():
-                tmp.unlink()
-            raise ToolError(f"файл не записался: {type(exc).__name__}: {exc}") from exc
-
-        written = path.read_text(encoding="utf-8")
-        if text not in written:
-            path.unlink(missing_ok=True)
-            raise ToolError("файл записан, но текст памятки в нём не совпадает — файл удалён")
-
-        file_bytes = len(written.encode("utf-8"))
-        file_digest = text_hash(written)
-        with closing(_connect(self.db)) as conn, _transaction(conn):
-            conn.execute(
-                "INSERT INTO saves (id, created_at, summary_id, path, file_hash, bytes) "
-                "VALUES (NULL, ?, ?, ?, ?, ?)",
-                (_iso(_now()), summary_id, str(path), file_digest, file_bytes),
-            )
-
-        shown_path = display_path(path)
-        lines = [
-            f"файл: {shown_path}",
-            f"Памятка {summary_ref} «{topic}» сохранена: {_bytes_word(file_bytes)}, {items} "
-            f"{_plural(items, 'пункт', 'пункта', 'пунктов')}, {len(articles)} "
-            f"{_plural(len(articles), 'источник', 'источника', 'источников')}.",
-            f"Проверка: файл перечитан, текст памятки {summary_ref} записан без изменений "
-            f"(sha {summary_row['text_hash'][:12]}… совпадает с записанным при сжатии).",
-            f"Цепочка: поиск {search_ref} («{record.query}», снимок #{record.run_id}) → "
-            f"памятка {summary_ref} → файл.",
-        ]
-        return "\n".join(lines), f"{shown_path}, {_bytes_word(file_bytes)}, sha совпадает"
-
     def start_line(self, port: int) -> str:
+        """Строка старта (день 20, §3.8): адрес, база, копия, порог свежести,
+        расписание и родитель."""
+        now = _now()
         with closing(_connect(self.db)) as conn:
             total = conn.execute("SELECT count(*) FROM runs").fetchone()[0]
-            ok_run, _ = self.attempts(conn)
-            due = self.next_due(conn)
-        last = f", последний удачный {_fmt(ok_run.started_at)}" if ok_run else ", удачных нет"
+            state = self.copy_state(conn, now)
+        if state.last_ok is None:
+            copy = f"копия: пусто (попыток снимка: {total})"
+        else:
+            copy = (
+                f"копия: снимок #{state.last_ok.id} от {_fmt(state.last_ok.started_at)}, возраст "
+                f"{_span(state.age.total_seconds() / 60)}" + ("" if state.fresh else " — устарела")
+            )
+        parent = f" · родитель {self.parent_pid}" if self.parent_pid is not None else ""
         return (
-            f"слушаю http://{HOST}:{port}/mcp · база {display_path(self.db)} "
-            f"(снимков: {total}{last}) · раз в {self.interval} мин ({self.interval_origin}) · "
-            f"следующий снимок {'сразу' if due <= _now() else _fmt(due)}"
+            f"слушаю http://{HOST}:{port}/mcp · база {display_path(self.db)} · {copy} · копия "
+            f"считается свежей {state.threshold} (--max-age-min {self.max_age_min}) · "
+            f"{self.schedule_text()}{parent}"
         )
+
+
+def _hits_text(hits: dict[str, list[str]]) -> str:
+    """«poison (вопрос, текст)» — где совпало каждое слово запроса."""
+    return ", ".join(f"{word} ({', '.join(sorted(set(where)))})" for word, where in hits.items())
 
 
 # --- Сервер ----------------------------------------------------------------
@@ -1546,10 +2031,12 @@ class Watch:
 def build_server(watch: Watch) -> MCPServer:
     @asynccontextmanager
     async def scheduler_lifespan(_server: MCPServer):
-        # Вход — task group с планировщиком, выход (Ctrl+C) — её отмена.
-        # Снимок, прерванный отменой, в базу не попадает (§3.3).
+        # Вход — task group с исполнителем снимков и (день 20, §3.3)
+        # сторожем родителя, выход (Ctrl+C) — её отмена. Снимок, прерванный
+        # отменой, в базу не попадает (§3.3).
         async with anyio.create_task_group() as group:
             group.start_soon(watch.scheduler)
+            group.start_soon(watch.watch_parent)
             try:
                 yield None
             finally:
@@ -1582,7 +2069,7 @@ def build_server(watch: Watch) -> MCPServer:
     )
     async def faq_watch_schedule(
         interval_minutes: Annotated[
-            int, Field(ge=MIN_INTERVAL_MIN, le=MAX_INTERVAL_MIN, description=INTERVAL_DESCRIPTION)
+            int, Field(ge=0, le=MAX_INTERVAL_MIN, description=INTERVAL_DESCRIPTION)
         ],
     ) -> str:
         return _logged(
@@ -1590,7 +2077,7 @@ def build_server(watch: Watch) -> MCPServer:
         )
 
     @server.tool(
-        title="Поиск статей для памятки",
+        title="Поиск в FAQ издателя",
         description=SEARCH_DESCRIPTION.format(name=game_name),
         annotations=SEARCH_ANNOTATIONS,
         structured_output=False,
@@ -1601,7 +2088,25 @@ def build_server(watch: Watch) -> MCPServer:
             int, Field(ge=1, le=SEARCH_LIMIT_MAX, description=LIMIT_DESCRIPTION)
         ] = SEARCH_LIMIT_DEFAULT,
     ) -> str:
-        return _logged(f'faq_search("{query}", {limit})', lambda: watch.search(query, limit))
+        return await _logged_async(
+            f'faq_search("{query}", {limit})', watch.search(query, limit),
+        )
+
+    @server.tool(
+        title="Статья FAQ издателя",
+        description=ARTICLE_DESCRIPTION.format(name=game_name),
+        annotations=ARTICLE_ANNOTATIONS,
+        structured_output=False,
+    )
+    async def faq_article(
+        # Шаблон в схеме здесь уместен (§3.1): чужого вида ссылок, как у
+        # `q…`/`s…`, у номера статьи нет, а ошибка валидации pydantic модели
+        # понятна.
+        article_id: Annotated[
+            str, Field(pattern=r"^\d{5,20}$", description=ARTICLE_ID_DESCRIPTION)
+        ],
+    ) -> str:
+        return await _logged_async(f"faq_article({article_id})", watch.article(article_id))
 
     def summary_request(search_id: str, topic: str, ctx: Context) -> Sample:
         # Детерминированная функция (§3.4): SDK выполняет её на каждом раунде
@@ -1654,22 +2159,6 @@ def build_server(watch: Watch) -> MCPServer:
             f"faq_summarize({search_id})", lambda: watch.summarize(search_id, topic, summary)
         )
 
-    @server.tool(
-        title="Сохранение памятки в файл",
-        description=SAVE_DESCRIPTION.format(name=game_name),
-        annotations=SAVE_ANNOTATIONS,
-        structured_output=False,
-    )
-    async def cheatsheet_save(
-        summary_id: Annotated[
-            str, Field(min_length=1, max_length=20, description=SUMMARY_ID_DESCRIPTION)
-        ],
-        name: Annotated[str, Field(max_length=60, description=NAME_DESCRIPTION)] = "",
-    ) -> str:
-        return _logged(
-            f"cheatsheet_save({summary_id})", lambda: watch.save_cheatsheet(summary_id, name)
-        )
-
     return server
 
 
@@ -1691,6 +2180,22 @@ def _logged(call: str, work) -> str:
     return text
 
 
+async def _logged_async(call: str, work) -> str:
+    """То же, что `_logged()`, для инструментов, которые читают сайт (день
+    20): поиск и статья."""
+    started = time.perf_counter()
+    try:
+        text, summary = await work
+    except ToolError as exc:
+        logger.info("%s: отказ — %s, %.2f с", call, exc, time.perf_counter() - started)
+        raise
+    except sqlite3.Error as exc:
+        logger.warning("%s: отказ — база сервера: %s", call, exc)
+        raise ToolError(f"база сервера не читается: {type(exc).__name__}: {exc}") from exc
+    logger.info("%s: %s, %.2f с", call, summary, time.perf_counter() - started)
+    return text
+
+
 def _interval(value: str) -> int:
     if not value.isdigit() or not MIN_INTERVAL_MIN <= int(value) <= MAX_INTERVAL_MIN:
         raise argparse.ArgumentTypeError(
@@ -1700,11 +2205,27 @@ def _interval(value: str) -> int:
     return int(value)
 
 
-def _args(argv: list[str] | None = None) -> tuple[Config, Path, Path, int, int | None]:
+def _positive(value: str) -> int:
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError(f"ожидается целое число ≥ 1, пришло «{value}»")
+    return int(value)
+
+
+@dataclass(frozen=True)
+class Args:
+    config: Config
+    db: Path
+    port: int
+    interval: int | None
+    max_age_min: int
+    parent_pid: int | None
+
+
+def _args(argv: list[str] | None = None) -> Args:
     parser = argparse.ArgumentParser(
         description=(
-            "Сторож FAQ: MCP-сервер (Streamable HTTP) с планировщиком снимков одной "
-            "категории FAQ портала Freshdesk."
+            "FAQ издателя: MCP-сервер (Streamable HTTP) одной категории FAQ портала Freshdesk — "
+            "копия в SQLite и сайт, фоновые снимки по запросу или по расписанию."
         ),
     )
     parser.add_argument("--base-url", required=True, help="адрес портала без завершающего /")
@@ -1715,9 +2236,6 @@ def _args(argv: list[str] | None = None) -> tuple[Config, Path, Path, int, int |
     )
     parser.add_argument("--db", required=True, help="путь к файлу базы; каталог создаётся")
     parser.add_argument(
-        "--out", required=True, help="каталог для файлов памяток (день 19); создаётся, если его нет",
-    )
-    parser.add_argument(
         "--port", type=int, default=DEFAULT_PORT,
         help=f"порт на {HOST}, по умолчанию {DEFAULT_PORT}",
     )
@@ -1725,8 +2243,19 @@ def _args(argv: list[str] | None = None) -> tuple[Config, Path, Path, int, int |
         "--interval", type=_interval, default=None,
         help=(
             f"интервал снимков в минутах, {MIN_INTERVAL_MIN}-{MAX_INTERVAL_MIN}; задан — "
-            f"перекрывает сохранённый в базе и сохраняется"
+            f"включает расписание и сохраняется в базе (по умолчанию расписание выключено)"
         ),
+    )
+    parser.add_argument(
+        "--max-age-min", type=_positive, default=DEFAULT_MAX_AGE_MIN,
+        help=(
+            f"копия свежая, пока последний удачный снимок не старше стольких минут; по "
+            f"умолчанию {DEFAULT_MAX_AGE_MIN} (неделя)"
+        ),
+    )
+    parser.add_argument(
+        "--parent-pid", type=_positive, default=None,
+        help="pid процесса, который запустил сервер: сменился родитель — сервер останавливается",
     )
     args = parser.parse_args(argv)
     if not args.category.isdigit():
@@ -1738,8 +2267,9 @@ def _args(argv: list[str] | None = None) -> tuple[Config, Path, Path, int, int |
         category=args.category,
         category_name=args.category_name,
     )
-    return (
-        config, Path(args.db).expanduser(), Path(args.out).expanduser(), args.port, args.interval,
+    return Args(
+        config=config, db=Path(args.db).expanduser(), port=args.port, interval=args.interval,
+        max_age_min=args.max_age_min, parent_pid=args.parent_pid,
     )
 
 
@@ -1758,7 +2288,8 @@ def _port_free(port: int) -> str:
 
 
 def main() -> None:
-    config, db, out_dir, port, interval = _args()
+    args = _args()
+    db, port = args.db, args.port
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("[FAQ-сторож] %(message)s"))
     logger.addHandler(handler)
@@ -1778,10 +2309,17 @@ def main() -> None:
         logger.error("порт %s:%d занят (%s) — сервер не запущен", HOST, port, busy)
         sys.exit(1)
     init_db(db, version)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if version not in (0, SCHEMA_VERSION):
+        logger.info("база %s: схема %d → %d", display_path(db), version, SCHEMA_VERSION)
 
-    watch = Watch(config, db, out_dir)
-    watch.load_interval(interval)
+    # SIGTERM — как Ctrl+C (день 20, §6.1): им сервер останавливает
+    # приложение, которое его запустило. Без обработчика процесс умирал бы
+    # сразу, без строки «остановлен» и без штатного выхода uvicorn; снимок в
+    # базу и так попадает только целиком.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+
+    watch = Watch(args.config, db, args.max_age_min, args.parent_pid)
+    watch.load_schedule(args.interval)
     logger.info("%s", watch.start_line(port))
     try:
         build_server(watch).run("streamable-http", host=HOST, port=port, stateless_http=True)

@@ -6,7 +6,8 @@
 # 15: жёсткий контроль переходов — красный путь; день 16, неделя 4:
 # подключение к MCP-серверу BoardGameGeek и список его инструментов; день 17:
 # свой MCP-сервер FAQ издателя и function calling агента; день 18: сторож FAQ
-# — долгоживущий MCP-сервер по Streamable HTTP с расписанием).
+# — долгоживущий MCP-сервер по Streamable HTTP с расписанием; день 19:
+# памятка к столу; день 20: оркестрация MCP — три сервера агента).
 #
 # Здесь только интерфейс. LLM-логики в этом файле нет: ни клиента OpenAI,
 # ни chat.completions.create — всё общение с моделью инкапсулировано в
@@ -88,6 +89,19 @@
 # значениях: меняется только аккордеон, в котором стоят компоненты. Приложение
 # сервер не опрашивает: сводку сам по себе он пишет в свой терминал.
 #
+# День 20 (спецификация дня 20, §8) — оркестрация MCP: `TOOLBOX` — группа из
+# трёх серверов, по одному на источник или назначение: `watch` (FAQ издателя:
+# копия и сайт, HTTP), `wiki` (фанатская вики, stdio) и `files` (выгрузка в
+# Markdown, stdio); `FAQ_MCP` дня 17 из группы ушёл. Сервер FAQ приложение
+# поднимает само, если его порт молчит (`mcp_client.ensure_started()` при
+# старте и перед каталогом каждого хода), и останавливает при выходе только
+# то, что запустило. Блок «Оркестрация MCP (день 20)» развёрнут наверху
+# панели: описание, каталог группы по кнопке (вне `_view()`, свои выходы
+# `GROUP_MCP_OUTPUTS`) и «Инструменты последнего хода» — со строками «Серверы»
+# и «Маршрут», колонками «сервер» и «откуда» и проверкой передачи по значению
+# у `save_markdown`; `_view()` — по-прежнему 37 значений. Код маршрут не
+# проверяет и сохранение с ⚠️ не отменяет: суждение — за человеком.
+#
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
 # словами, текст памяти и числа. День 10 добавил в переключатель ещё две
@@ -152,22 +166,28 @@ from invariants import (
     validate,
 )
 from mcp_client import (
+    AUTOSTART_ANSWERS,
+    AUTOSTART_NOT_STARTED,
+    AUTOSTART_STARTED,
     HANDSHAKE_DISCOVER,
     INHERITED_ENV,
     SDK_VERSION,
     STAGE_CONNECT,
     STAGE_LIST,
     TRANSPORT_HTTP,
+    AutostartStatus,
     McpServer,
     McpToolBox,
     McpToolBoxGroup,
     ToolCall,
     ToolListing,
     call_tool,
+    ensure_started,
     handshake_text,
     is_no_answer,
     list_tools,
     resolve_launch,
+    tool_params,
 )
 from memory import LAYER_LONG_TERM, LAYER_WORKING, REQUEST_LAYERS, long_term_text
 from presets import (
@@ -186,6 +206,8 @@ from presets import (
     FAQ_TIMEOUT_S,
     FAQ_WATCH,
     FAQ_WATCH_DB,
+    FILES_MCP,
+    FILES_TIMEOUT_S,
     INVARIANT_EXAMPLES,
     INVARIANT_MAX_ITEMS,
     INVARIANT_SCENARIO,
@@ -195,6 +217,7 @@ from presets import (
     MEMORY_MAP,
     MEMORY_SCENARIO,
     NEXT_SESSION_QUESTIONS,
+    ORCHESTRATION_SCENARIO,
     PRESETS,
     PROFILE_QUESTION,
     PROFILE_VARIANTS,
@@ -207,9 +230,12 @@ from presets import (
     TOOL_MAX_ROUNDS,
     TOOL_RESULT_MAX_CHARS,
     TOOLS_SCENARIO,
+    WATCH_AUTOSTART_WAIT_S,
     WATCH_CALL_TIMEOUT_S,
     WATCH_SCENARIO,
     WATCH_TIMEOUT_S,
+    WIKI_MCP,
+    WIKI_TIMEOUT_S,
     make_invariants,
     make_memory,
     make_router,
@@ -326,36 +352,63 @@ MCP_LAUNCH = resolve_launch(BGG_MCP, os.environ)
 
 # Инструменты агента (день 17, §8.1) — один `ToolBox` на процесс, рядом с
 # хранилищами: каждый агент получает тот же объект. Каталог и каждый вызов
-# идут новым подключением. Подключения при старте нет, как у BGG: одна строка
-# лога тем же форматом. С дня 18 (§7.1) — группа из двух серверов: FAQ по
-# stdio и сторож FAQ по HTTP; единственное состояние группы — карта «имя
-# инструмента → сервер», которую каталоги только пополняют.
+# идут новым подключением. С дня 18 (§7.1) — группа серверов; её состояние —
+# карта «имя инструмента → сервер», которую каталоги только пополняют, и (день
+# 20) итог последнего каталога по серверу для панели. С дня 20 (§8.1) — три
+# сервера, по одному на источник или назначение: FAQ издателя (`watch`, HTTP,
+# с автозапуском), фанатская вики (`wiki`, stdio) и файлы (`files`, stdio).
+# `FAQ_MCP` дня 17 из группы ушёл — его блок и кнопка в панели остаются.
 TOOLBOX = McpToolBoxGroup((
-    McpToolBox(FAQ_MCP, timeout_s=FAQ_TIMEOUT_S),
-    # `call_timeout_s` (день 19, §8.2): вызов сторожа теперь может включать
-    # сэмплинг — ждать модель клиента, а не только читать локальную базу.
-    McpToolBox(FAQ_WATCH, timeout_s=WATCH_TIMEOUT_S, call_timeout_s=WATCH_CALL_TIMEOUT_S),
+    # `call_timeout_s` (день 19, §8.2): вызов сервера FAQ может включать
+    # сэмплинг — ждать модель клиента, а не только читать базу или сайт.
+    # `autostart_wait_s` (день 20, §6.1): сколько ждать порт после автозапуска.
+    McpToolBox(
+        FAQ_WATCH, timeout_s=WATCH_TIMEOUT_S, call_timeout_s=WATCH_CALL_TIMEOUT_S,
+        autostart_wait_s=WATCH_AUTOSTART_WAIT_S,
+    ),
+    McpToolBox(WIKI_MCP, timeout_s=WIKI_TIMEOUT_S),
+    McpToolBox(FILES_MCP, timeout_s=FILES_TIMEOUT_S),
 ))
+# Свой сервер FAQ дня 17 — только блок и кнопка в панели (день 20, §2.1).
 FAQ_LAUNCH = resolve_launch(FAQ_MCP, os.environ)
 (logger.warning if FAQ_LAUNCH.error else logger.info)(
-    "MCP при старте: сервер %s — %s (%s)%s; SDK mcp %s; агенту — каталог в "
-    "каждом ходе при включённом переключателе",
+    "MCP при старте: сервер %s — %s (%s)%s; SDK mcp %s; с дня 20 не в группе "
+    "агента — только список по кнопке в панели",
     FAQ_MCP.name, FAQ_LAUNCH.command_line, FAQ_LAUNCH.origin,
     f" — ⚠️ {FAQ_LAUNCH.error}" if FAQ_LAUNCH.error else "",
     SDK_VERSION,
 )
-# Сторож FAQ (день 18, §7.1) — сервер, который запускает не приложение: только
-# адрес, откуда он и как его запустить. День 19 дописывает: инструменты
-# сторожа теперь включают и пайплайн памятки, а сжатие идёт сэмплингом моделью
-# агента (§7.3).
+# Сервер FAQ издателя (день 18, §7.1; день 20, §8.1): адрес, откуда он, и что
+# приложение поднимает его само, если порт молчит. Сэмплинг — моделью агента
+# (день 19).
 WATCH_LAUNCH = resolve_launch(FAQ_WATCH, os.environ)
 (logger.warning if WATCH_LAUNCH.error else logger.info)(
-    "MCP при старте: сервер %s — %s (%s)%s, Streamable HTTP; запускается "
-    "отдельно (./run.sh faq-watch); агенту — вместе с %s; инструменты "
-    "сторожа и памятки; сэмплинг — моделью агента",
+    "MCP при старте: сервер %s — %s (%s)%s, Streamable HTTP; порт молчит — "
+    "приложение запускает сервер само (ручной запуск — ./run.sh faq-watch); "
+    "сэмплинг — моделью агента",
     FAQ_WATCH.name, WATCH_LAUNCH.command_line, WATCH_LAUNCH.origin,
     f" — ⚠️ {WATCH_LAUNCH.error}" if WATCH_LAUNCH.error else "",
-    FAQ_MCP.name,
+)
+# Вики и файлы (день 20, §8.1) — stdio, процесс на каждый вызов; строки лога —
+# формат `FAQ_LAUNCH` дня 17.
+WIKI_LAUNCH = resolve_launch(WIKI_MCP, os.environ)
+FILES_LAUNCH = resolve_launch(FILES_MCP, os.environ)
+for _server, _launch in ((WIKI_MCP, WIKI_LAUNCH), (FILES_MCP, FILES_LAUNCH)):
+    (logger.warning if _launch.error else logger.info)(
+        "MCP при старте: сервер %s — %s (%s)%s; агенту — в группе %s, процесс на "
+        "каждый вызов",
+        _server.name, _launch.command_line, _launch.origin,
+        f" — ⚠️ {_launch.error}" if _launch.error else "", TOOLBOX.name,
+    )
+# Автозапуск сервера FAQ (день 20, §6.1, §8.1): адрес молчит — приложение
+# поднимает сервер и ждёт порт. Ход приложения это не останавливает: сбой —
+# строка лога, дальше — сбой каталога, как на дне 18. Процесс, запущенный
+# здесь, `mcp_client` остановит при выходе приложения (`atexit`).
+WATCH_AUTOSTART: AutostartStatus = ensure_started(
+    FAQ_WATCH, os.environ, wait_s=WATCH_AUTOSTART_WAIT_S,
+)
+(logger.info if WATCH_AUTOSTART.state != AUTOSTART_NOT_STARTED else logger.warning)(
+    "MCP при старте: сервер %s — %s", FAQ_WATCH.name, WATCH_AUTOSTART.text(),
 )
 
 # Сколько агентов поднялось из файлов при старте процесса — заполняется
@@ -2117,13 +2170,19 @@ def _md_cell(text: str) -> str:
     return " ".join(str(text).split()).replace("|", "\\|")
 
 
-# --- Цепочка пайплайна памятки (день 19, §7.1, п. 3) -----------------------
-_PIPELINE_TOOLS = ("faq_search", "faq_summarize", "cheatsheet_save")
-_PIPELINE_INPUT_ARG = {"faq_summarize": "search_id", "cheatsheet_save": "summary_id"}
+# --- Маршрут хода по серверам (день 20, §8.2; день 19 — метки id) ----------
+# Строка «Маршрут» заменила «Цепочку» дня 19: вызовы хода по порядку,
+# сгруппированные по серверу подряд, с метками дня 19 для id (`q…`/`s…` —
+# ✓, «из прошлых ходов», ⚠️) и путём файла. Всё — по журналу вызовов хода и
+# карте маршрутов группы, без обращения к серверам. Маршрут код не оценивает:
+# какой путь выбрала модель, видно, а суждение — за человеком.
+_SOURCE_PREFIX = "источник: "
+_FENCE_OPEN = "~~~markdown"
+_FENCE_CLOSE = "~~~"
 
 
 def _first_line_ref(text: str) -> str:
-    """Первая строка ответа — id (`id: q7`) или путь (`файл: …`), §3.2."""
+    """Первая строка ответа — id (`id: q7`) или путь (`файл: …`), §3.2 дня 19."""
     first = text.splitlines()[0] if text else ""
     for prefix in ("id: ", "файл: "):
         if first.startswith(prefix):
@@ -2131,58 +2190,169 @@ def _first_line_ref(text: str) -> str:
     return ""
 
 
-def _cheatsheet_chain_md(calls: list[dict]) -> str:
-    """Строка «Цепочка»: какие id выданы и приняты вызовами пайплайна этого
-    хода — по журналу вызовов, без обращения к серверу (§2.3, §7.1). Ход без
-    инструментов пайплайна — `""`."""
-    pipeline = [call for call in calls if call["name"] in _PIPELINE_TOOLS]
-    if not pipeline:
-        return ""
-    issued: set[str] = set()
-    parts: list[str] = []
-    for call in pipeline:
-        name = call["name"]
-        ok = call["status"] == "ок"
-        output_ref = _first_line_ref(call["text"]) if ok else ""
-        if name == "faq_search":
-            parts.append(f"faq_search → {output_ref or '—'}")
-            if output_ref:
-                issued.add(output_ref)
+def _call_arguments(call: dict) -> dict:
+    """Аргументы вызова словарём. Не объект (`[]`, `"q1"`, `null`) агент
+    отклоняет, но запись в журнале хода остаётся с исходной строкой — панель
+    не должна падать (правка по ревью дня 19)."""
+    try:
+        arguments = json.loads(call["arguments"] or "{}")
+    except ValueError:
+        return {}
+    return arguments if isinstance(arguments, dict) else {}
+
+
+def _source_short(text: str) -> str:
+    """Строка `источник:` ответа сервера FAQ сокращённо (§8.2): «копия #27»,
+    «копия #26 (устарела)», «сайт — копия пуста»; строки нет — «—»."""
+    for line in text.splitlines()[:3]:
+        if not line.startswith(_SOURCE_PREFIX):
             continue
-        try:
-            arguments = json.loads(call["arguments"] or "{}")
-        except ValueError:
-            arguments = {}
-        # Не объект (`[]`, `"q1"`, `null`) агент отклоняет, но запись в
-        # журнале хода остаётся с исходной строкой — панель не должна падать
-        # (правка по ревью).
-        if not isinstance(arguments, dict):
-            arguments = {}
-        input_ref = str(arguments.get(_PIPELINE_INPUT_ARG[name]) or "")
+        rest = line[len(_SOURCE_PREFIX):]
+        if rest.startswith("копия — снимок #"):
+            number = rest[len("копия — снимок #"):].split(" ", 1)[0]
+            return f"копия #{number}" + (" (устарела)" if "(устарела)" in rest else "")
+        if rest.startswith("сайт — "):
+            return "сайт — " + rest[len("сайт — "):].split(",", 1)[0].split(" (", 1)[0]
+        return rest.split(" (", 1)[0]
+    return "—"
+
+
+def _summary_markdown(text: str) -> str | None:
+    """Markdown памятки между `~~~markdown` и `~~~` из ответа `faq_summarize`
+    (день 20, §3.5); ограды нет (ответ обрезан или чужой) — `None`."""
+    lines = text.splitlines()
+    try:
+        start = lines.index(_FENCE_OPEN)
+        end = len(lines) - 1 - lines[::-1].index(_FENCE_CLOSE)
+    except ValueError:
+        return None
+    return "\n".join(lines[start + 1:end]) if end > start else None
+
+
+def _normalized(text: str) -> str:
+    """Текст для сверки передачи по значению: края строк обрезаются (§8.2)."""
+    return "\n".join(line.strip() for line in text.strip().splitlines())
+
+
+def _transfer_mark(content: str, summary: tuple[str, str] | None) -> str:
+    """Проверка передачи по значению у `save_markdown` (§2.8, §8.2): Markdown
+    удачного `faq_summarize` этого хода целиком в `content` — ✓, иначе ⚠️.
+    Это «видно», а не «не даёт»: сохранение с ⚠️ не отменяется."""
+    if summary is None:
+        return "текст агента"
+    ref, markdown = summary
+    got, want = _normalized(content), _normalized(markdown)
+    if got == want:
+        return f"памятка {ref} без изменений ✓"
+    if want and want in got:
+        return f"памятка {ref} внутри ✓, агент дописал своё"
+    return f"⚠️ не совпадает с памяткой {ref}"
+
+
+def _route_step(call: dict, issued: set[str], summary: tuple[str, str] | None) -> str:
+    """Один вызов в строке «Маршрут»."""
+    name = call["name"]
+    ok = call["status"] == "ок"
+    arguments = _call_arguments(call)
+    output_ref = _first_line_ref(call["text"]) if ok else ""
+    fail = "" if ok else " ⚠️"
+    if name == "faq_search":
+        source = f" [{_source_short(call['text'])}]" if ok else ""
+        return f"faq_search → {output_ref or '—'}{source}{fail}"
+    if name == "faq_summarize":
+        input_ref = str(arguments.get("search_id") or "")
         if not ok:
             mark = "⚠️"
         elif not input_ref:
             mark = "?"
-        elif input_ref in issued:
+        elif input_ref.strip().lower() in issued:
             mark = "✓"
         else:
             mark = "из прошлых ходов"
-        parts.append(f"{name}({input_ref or '—'} {mark}) → {output_ref or '—'}")
-        if name == "faq_summarize" and call["samples"]:
-            parts.append(f"сэмплинг {call['samples']}")
-        if output_ref and name == "faq_summarize":
-            issued.add(output_ref)
-    return "Цепочка: " + " · ".join(parts)
+        step = f"faq_summarize({input_ref or '—'} {mark}) → {output_ref or '—'}"
+        return step + (f" (сэмплинг {call['samples']})" if call["samples"] else "")
+    if name == "faq_article":
+        return f"faq_article({arguments.get('article_id') or '—'}){fail}"
+    if name == "wiki_index":
+        args = ", ".join(
+            str(arguments[key]) for key in ("type", "contains") if arguments.get(key)
+        )
+        return f"wiki_index({args}){fail}"
+    if name == "wiki_page":
+        return f"wiki_page({arguments.get('slug') or '—'}){fail}"
+    if name == "save_markdown":
+        transfer = _transfer_mark(str(arguments.get("content") or ""), summary)
+        return (
+            f"save_markdown({arguments.get('name') or '—'}, {transfer}) → "
+            f"{output_ref or '—'}{fail}"
+        )
+    brief = ", ".join(f"{value}" for value in arguments.values())
+    return f"{name}({brief}){fail}"
+
+
+def _route_md(calls: list[dict]) -> str:
+    """Строка «Маршрут» (§8.2): вызовы хода по порядку, подряд идущие вызовы
+    одного сервера — одной группой «сервер: шаг → шаг». Ход без вызовов —
+    `""`."""
+    if not calls:
+        return ""
+    issued: set[str] = set()
+    summary: tuple[str, str] | None = None
+    groups: list[tuple[str, list[str]]] = []
+    for call in calls:
+        server = TOOLBOX.server_of(call["name"]) or "?"
+        step = _route_step(call, issued, summary)
+        if groups and groups[-1][0] == server:
+            groups[-1][1].append(step)
+        else:
+            groups.append((server, [step]))
+        ok = call["status"] == "ок"
+        ref = _first_line_ref(call["text"]) if ok else ""
+        if ref and call["name"] in ("faq_search", "faq_summarize"):
+            issued.add(ref.lower())
+        if ok and call["name"] == "faq_summarize":
+            markdown = _summary_markdown(call["text"])
+            if markdown is not None:
+                summary = (ref or "s?", markdown)
+    return "Маршрут: " + " · ".join(
+        f"{server}: {' → '.join(steps)}" for server, steps in groups
+    )
+
+
+def _servers_md() -> str:
+    """Строка «Серверы» (§8.2): по серверу группы — итог последнего каталога
+    **процесса** (группа одна на процесс, а не на вкладку) и статус
+    автозапуска."""
+    parts: list[str] = []
+    for status in TOOLBOX.statuses():
+        catalog = status["catalog"]
+        if catalog is None:
+            part = f"{status['name']} — каталога ещё не было"
+        elif catalog["ok"]:
+            part = f"{status['name']} ✓ {catalog['tools']}"
+        else:
+            part = f"{status['name']} ⚠️ {_md_cell(catalog['error'])}"
+        autostart: AutostartStatus | None = status["autostart"]
+        if autostart is not None:
+            if autostart.state == AUTOSTART_STARTED or autostart.by_app:
+                part += f" · {AUTOSTART_STARTED}"
+            elif autostart.state == AUTOSTART_ANSWERS:
+                part += " · запущен не приложением"
+            else:
+                part += f" · ⚠️ {_md_cell(autostart.text())}"
+        parts.append(part)
+    return "Серверы (последний каталог процесса): " + " · ".join(parts)
 
 
 def _tools_md(state: dict) -> str:
     """Блок «Инструменты последнего хода» (день 17, §8.3; день 19 — колонка
-    «сэмпл.» и строка «Цепочка», §7.1): каталог хода, вызовы, раунды и
-    предупреждения — из ответа агента (`last_call`)."""
+    «сэмпл.», §7.1; день 20 — строки «Серверы» и «Маршрут», колонки «сервер» и
+    «откуда», §8.2): каталог хода, вызовы, раунды и предупреждения — из ответа
+    агента (`last_call`), серверы — из группы процесса."""
     tools = state["tools"]
     if tools is None:
         return "У агента нет инструментов MCP — запрос как на дне 16."
-    lines: list[str] = []
+    lines: list[str] = [_servers_md()]
     if not tools["in_request"]:
         lines.append(
             "**Инструменты MCP выключены:** запрос без каталога и схем — как на "
@@ -2226,8 +2396,8 @@ def _tools_md(state: dict) -> str:
         # п. 4): каждый вызов забирает из списка ровно `samples` штук.
         sampling_calls = iter(last["sampling_calls"])
         table = [
-            "| № | раунд | инструмент | аргументы | результат | сэмпл. | время |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| № | раунд | сервер | инструмент | аргументы | откуда | результат | сэмпл. | время |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for number, call in enumerate(calls, start=1):
             result = (
@@ -2241,15 +2411,23 @@ def _tools_md(state: dict) -> str:
                 f"{len(used)}, {_fmt_cost(sum(c['cost_usd'] or 0.0 for c in used))}"
                 if used else "—"
             )
+            server = TOOLBOX.server_of(call["name"]) or "?"
+            # «откуда» (§8.2) — строка `источник:` ответа сервера FAQ;
+            # аргументы длиннее 200 символов (Markdown у `save_markdown`) —
+            # с «…»: целиком они в JSON результатов ниже.
+            source = _source_short(call["text"]) if server == FAQ_WATCH.name else "—"
+            arguments = _md_cell(call["arguments"]) or "—"
+            if len(arguments) > 200:
+                arguments = arguments[:200] + "…"
             table.append(
-                f"| {number} | {call['round']} | `{call['name']}` | "
-                f"`{_md_cell(call['arguments']) or '—'}` | {_md_cell(result)} | "
+                f"| {number} | {call['round']} | {server} | `{call['name']}` | "
+                f"`{arguments}` | {_md_cell(source)} | {_md_cell(result)} | "
                 f"{sampling_cell} | {call['elapsed']:.2f} с |"
             )
         lines.append("\n".join(table))
-        chain = _cheatsheet_chain_md(calls)
-        if chain:
-            lines.append(chain)
+        route = _route_md(calls)
+        if route:
+            lines.append(route)
     if rounds:
         lines.append(
             "Раунды: " + " · ".join(
@@ -3585,8 +3763,9 @@ def on_invariants_in_request(agent: Agent | None, enabled: bool, preset_name: st
 def on_tools_in_request(agent: Agent | None, enabled: bool, preset_name: str):
     """«Инструменты MCP в запросе» (день 17, §8.2) — выключено: запрос как на
     дне 16, без каталога и схем; включено: в начале каждого хода приложение
-    запрашивает каталог у серверов FAQ и сторожа FAQ (с дня 18), и модель сама
-    решает, звать ли инструменты. Нового агента не создаёт и ничего не пишет."""
+    запрашивает каталог у серверов группы (с дня 20 — FAQ издателя, вики и
+    файлы), и модель сама решает, звать ли инструменты. Нового агента не
+    создаёт и ничего не пишет."""
     if agent is None:  # страховка на случай сессии без сработавшего load
         agent = _new_agent(preset_name)
 
@@ -3594,8 +3773,8 @@ def on_tools_in_request(agent: Agent | None, enabled: bool, preset_name: str):
     if agent.tools_in_request:
         status = (
             "Инструменты MCP в запросе: включено. В начале каждого хода — "
-            "каталог серверов FAQ и сторожа FAQ; вызывать ли инструменты, "
-            "решает модель."
+            "каталог трёх серверов — FAQ издателя, вики и файлы; какой сервер "
+            "и инструмент звать, решает модель."
         )
     else:
         status = (
@@ -4074,18 +4253,20 @@ FAQ_TOKENS_TAIL = (
     "MCP в запросе»"
 )
 WATCH_AGENT_LINE = (
-    "Агент получает инструменты сторожа вместе с инструментами FAQ дня 17, "
+    "Агент получает эти инструменты вместе с инструментами вики и файлов, "
     "пока включён переключатель «Инструменты MCP в запросе»."
 )
 WATCH_TOKENS_TAIL = (
-    "уходят в запрос каждого раунда вместе со схемами FAQ дня 17 при "
+    "уходят в запрос каждого раунда вместе со схемами вики и файлов при "
     "включённом переключателе «Инструменты MCP в запросе»"
 )
-# Как запустить сторож (день 18, §7.2) — подсказка при сбое соединения:
-# `mcp_client` этого не знает, запускает сервер человек.
+# Как запустить сервер FAQ (день 18, §7.2; день 20, §8.3) — подсказка при
+# сбое соединения: с дня 20 сервер обычно поднимает приложение, а если он не
+# поднялся — причина в логе автозапуска, запустить можно и вручную.
 WATCH_START_HINT = (
-    "запустите сервер в отдельном терминале: `./run.sh faq-watch` (для "
-    "видео — `./run.sh faq-watch --interval 5`)"
+    "приложение поднимает сервер само, если порт молчит (причина сбоя — в "
+    "строке «автозапуск» лога приложения); вручную — `./run.sh faq-watch` в "
+    "отдельном терминале"
 )
 
 MCP_TABLE_COLUMNS = ["№", "инструмент", "описание", "параметры (* — обязательный)"]
@@ -4165,12 +4346,12 @@ def _mcp_http_server_md(
         f"официальный SDK mcp {SDK_VERSION}\n\n"
         f"{server_part}"
         f"{address}\n"
-        f"- Сервер запускается отдельно: `./run.sh faq-watch` (для видео — "
-        f"`./run.sh faq-watch --interval 5`), работает без приложения и "
-        f"переживает его перезапуски.\n"
+        f"- Сервер поднимает приложение, если порт молчит (с дня 20); "
+        f"`./run.sh faq-watch` — ручной запуск: такой сервер приложение "
+        f"использует как есть и не останавливает.\n"
         f"{db_line}"
-        f"- Окружение приложения серверу не передаётся — процесс запускает не "
-        f"приложение.\n"
+        f"- Автозапуск передаёт серверу только {', '.join(INHERITED_ENV)} — "
+        f"ключа DeepSeek сервер не получает.\n"
         f"- Каждое нажатие — новое подключение к работающему серверу: "
         f"согласование протокола → запрос → закрытие. {agent_line}"
     )
@@ -4359,6 +4540,66 @@ on_faq_list = functools.partial(
 on_watch_list = functools.partial(
     _mcp_list, FAQ_WATCH, WATCH_TIMEOUT_S, WATCH_TOKENS_TAIL, True
 )
+
+
+# --- Каталог группы по кнопке (день 20, §8.2) --------------------------------
+# Тот же каталог, что агент получает в начале хода (`TOOLBOX.catalog()`, с
+# автозапуском сервера FAQ), — таблицей «сервер · инструмент · описание ·
+# параметры». Вне `_view()`, как каталоги дней 16-18: свои выходы
+# `GROUP_MCP_OUTPUTS`, обработчик без `agent_state`.
+
+GROUP_TABLE_COLUMNS = ["№", "сервер", "инструмент", "описание", "параметры (* — обязательный)"]
+GROUP_STATUS_INITIAL = (
+    "Ещё не запрашивали. Кнопка берёт каталог так же, как агент в начале хода: "
+    "по подключению к каждому серверу группы, с автозапуском сервера FAQ."
+)
+
+
+def _group_tools_table(catalog: dict | None) -> pd.DataFrame:
+    """По строке на инструмент группы — в порядке каталога (сервер за
+    сервером, как их видит модель); параметры — функциями дня 17."""
+    rows = [
+        [
+            number,
+            TOOLBOX.server_of(tool["name"]) or "?",
+            f"`{tool['name']}`",
+            tool.get("description", ""),
+            " · ".join(
+                _mcp_param_text(param, True) for param in tool_params(tool.get("input_schema"))
+            ) or "—",
+        ]
+        for number, tool in enumerate((catalog or {}).get("tools") or [], start=1)
+    ]
+    return pd.DataFrame(rows, columns=GROUP_TABLE_COLUMNS)
+
+
+def on_group_catalog():
+    """Кнопка «🔌 Каталог группы» (день 20, §8.2). Без `agent_state`: агента
+    не трогает. Сбой части серверов — предупреждение каталога, всех — сбой."""
+    at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    catalog = TOOLBOX.catalog()
+    tools = catalog.get("tools") or []
+    if not catalog.get("ok"):
+        status = (
+            f"❌ **Каталог группы не получен** · {at} · через {catalog['elapsed']:.2f} с: "
+            f"{_md_cell(catalog['error'])}"
+        )
+        return "\n\n".join([status, _servers_md()]), _group_tools_table(None)
+    servers = sorted({TOOLBOX.server_of(tool["name"]) for tool in tools})
+    schemas = json.dumps(
+        [{key: tool[key] for key in ("name", "description", "input_schema")} for tool in tools],
+        ensure_ascii=False,
+    )
+    lines = [
+        f"✅ **Каталог группы `{TOOLBOX.name}`** · {at} · инструментов: {len(tools)} · "
+        f"серверов: {len(servers)} · {catalog['elapsed']:.2f} с · описания и схемы "
+        f"≈{_fmt_int(estimate_tokens(schemas))} ток. по оценке — уходят в запрос каждого "
+        f"раунда при включённом переключателе «Инструменты MCP в запросе»",
+        _servers_md(),
+    ]
+    if catalog.get("warning"):
+        lines.append(f"⚠️ {_md_cell(catalog['warning'])}")
+    return "\n\n".join(lines), _group_tools_table(catalog)
 
 
 # --- Сторож FAQ: сводка по кнопке (день 18, §7.2) --------------------------
@@ -4581,6 +4822,19 @@ _CHEATSHEET_SCENARIO_LABELS: list[str] = [
 ]
 
 
+# --- Сценарий дня 20: подписи для gr.Examples (§8.3) -----------------------
+# Тексты — `presets.ORCHESTRATION_SCENARIO`. Порядок важен: прогон
+# начинается на пустой базе FAQ (§9.3).
+_ORCHESTRATION_SCENARIO_LABELS: list[str] = [
+    "О1 · FAQ при пустой копии",
+    "О2 · Тинк: вики + FAQ → файл",
+    "О3 · только вики",
+    "О4 · только FAQ",
+    "О5 · оба источника",
+    "О6 · без инструментов",
+]
+
+
 # Чат и дебаг-панель — ровно пополам; кнопки компактнее дефолтных.
 APP_CSS = """
 button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8px !important; min-height: 28px !important; }
@@ -4589,16 +4843,16 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 19, неделя 4 — **композиция MCP-инструментов**: памятка к "
-        "столу. Одна просьба игрока — и агент сам проводит три инструмента "
-        "сторожа по очереди: `faq_search` находит статьи в последнем снимке "
-        "FAQ, `faq_summarize` сжимает их в памятку по-русски — **моделью "
-        "агента, по просьбе сервера** (MCP sampling, у сервера нет ни ключа, "
-        "ни модели), `cheatsheet_save` сохраняет памятку в Markdown-файл. "
-        "Данные между шагами идут **по ссылке** (id `q…`/`s…`), а не "
-        "текстом — каждый шаг сам достаёт из базы то, что записал "
-        "предыдущий, и сервер проверяет каждую передачу. Сторож и FAQ — как "
-        "на днях 17-18."
+        "День 20, неделя 4 — **оркестрация MCP**: у агента три сервера, по "
+        "одному на источник или назначение — **официальный FAQ издателя** "
+        "(английский), **фанатская вики** (русский справочник по гирлокам, "
+        "плохишам и коробкам) и **файлы**. Какой сервер и какой инструмент "
+        "звать, модель решает сама — **по описаниям инструментов**, роутера "
+        "в коде нет — и одной просьбой ведёт длинный флоу через несколько "
+        "серверов: вики → FAQ → файл. FAQ доступен всегда: свежая копия — "
+        "ответ из неё, пустая или устаревшая — с сайта, а копия докачивается "
+        "в фоне; сервер FAQ приложение **поднимает само**, если его порт "
+        "молчит."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -4670,9 +4924,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                 info=(
                     "Выключено — запрос как на дне 16: без каталога и схем, "
                     "модель отвечает из общих знаний. Включено — в начале "
-                    "каждого хода приложение запрашивает каталог у серверов "
-                    "FAQ и сторожа FAQ, и модель сама решает, вызывать ли "
-                    "инструменты."
+                    "каждого хода приложение запрашивает каталог у трёх "
+                    "серверов (FAQ издателя, вики, файлы), и модель сама "
+                    "решает, какой сервер и инструмент звать."
                 ),
             )
             # «Слои памяти в запросе» (день 11, §7.2) — сразу под веткой
@@ -4748,14 +5002,18 @@ with gr.Blocks(title="TooManyRules") as demo:
                 placeholder="Например: из каких фаз состоит ход игрока?",
                 lines=2,
             )
-            # Сценарий дня 19 (§8.3, §12) — у поля ввода, в кадре. Клик кладёт
-            # текст в поле, отправляет человек.
+            # Сценарий дня 20 (§8.3, §9.3) — у поля ввода, в кадре. Клик
+            # кладёт текст в поле, отправляет человек. Порядок важен: прогон
+            # начинается на пустой базе FAQ.
             gr.Examples(
-                examples=[[text] for text in CHEATSHEET_SCENARIO],
+                examples=[[text] for text in ORCHESTRATION_SCENARIO],
                 inputs=[question_input],
-                example_labels=_CHEATSHEET_SCENARIO_LABELS,
-                examples_per_page=len(CHEATSHEET_SCENARIO),
-                label="Сценарий дня 19 (сторож FAQ должен быть запущен: ./run.sh faq-watch)",
+                example_labels=_ORCHESTRATION_SCENARIO_LABELS,
+                examples_per_page=len(ORCHESTRATION_SCENARIO),
+                label=(
+                    "Сценарий дня 20 (О1 — на пустой базе FAQ, затем повторить О1 "
+                    "после строки «снимок #1: 82 статьи» в терминале)"
+                ),
             )
             with gr.Row():
                 send_btn = gr.Button("Отправить", size="sm", variant="primary", scale=2)
@@ -4965,9 +5223,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                 )
 
             # Свёрнуто: сценарии прошлых дней. У дня 16 сценария в чате не
-            # было, сценарий дня 18 стоит у поля ввода (правило «на экране —
+            # было, сценарий дня 20 стоит у поля ввода (правило «на экране —
             # текущий день»).
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-18)", open=False):
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-19)", open=False):
                 gr.Examples(
                     examples=[
                         ["Из каких фаз состоит ход игрока?"],
@@ -5097,35 +5355,56 @@ with gr.Blocks(title="TooManyRules") as demo:
                     inputs=[question_input],
                     example_labels=_WATCH_SCENARIO_LABELS,
                     examples_per_page=len(WATCH_SCENARIO),
-                    label="Сценарий дня 18 (сторож FAQ должен быть запущен: ./run.sh faq-watch)",
+                    label="Сценарий дня 18 (ожидания — для инструментов дня 18)",
+                )
+
+                # Сценарий дня 19 (§8.3, §12). С дня 20 свёрнут вместе с
+                # остальными прошлыми днями; сохранение теперь на сервере
+                # файлов (`save_markdown`), а не `cheatsheet_save`.
+                gr.Examples(
+                    examples=[[text] for text in CHEATSHEET_SCENARIO],
+                    inputs=[question_input],
+                    example_labels=_CHEATSHEET_SCENARIO_LABELS,
+                    examples_per_page=len(CHEATSHEET_SCENARIO),
+                    label="Сценарий дня 19 (ожидания — для инструментов дня 19)",
                 )
 
 
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # Памятка к столу (день 19, §7.1) — развёрнут в кадр, над блоком
-            # дня 18. Описание — статичный Markdown; «Инструменты последнего
-            # хода» и JSON результатов переехали сюда из блока дня 18 — те же
-            # компоненты и выходы `_view()` (правило дня 18, §7.2: блок
-            # вызовов агента живёт в блоке текущего дня), внутри markdown
-            # дописана строка «Цепочка» и колонка «сэмпл.» — без новых
-            # выходов `_view()`.
-            with gr.Accordion("Памятка к столу: пайплайн MCP (день 19)", open=True):
+            # Оркестрация MCP (день 20, §8.2) — развёрнут в кадр, над блоком
+            # дня 19. Описание — статичный Markdown; каталог группы по кнопке
+            # — вне `_view()` (свои выходы `GROUP_MCP_OUTPUTS`); «Инструменты
+            # последнего хода» и JSON результатов переехали сюда из блока дня
+            # 19 — те же компоненты и выходы `_view()` (правило дня 18: блок
+            # вызовов агента живёт в блоке текущего дня), внутри Markdown —
+            # строки «Серверы» и «Маршрут», колонки «сервер» и «откуда».
+            with gr.Accordion("Оркестрация MCP: три сервера (день 20)", open=True):
                 gr.Markdown(
-                    "Три шага одной просьбы: **найти** (`faq_search` — по "
-                    "английским словам в последнем снимке сторожа) → "
-                    "**сжать** (`faq_summarize` — по-русски, со ссылками; "
-                    "сжимает **модель агента по просьбе сервера**, MCP "
-                    "sampling — у сервера нет ни ключа, ни модели) → "
-                    "**сохранить** (`cheatsheet_save` — файл в "
-                    f"`{display_path(FAQ_CHEATSHEETS_DIR)}`). "
-                    "Данные между шагами идут **по ссылке** (id `q…`/`s…`), "
-                    "а не текстом — каждый шаг сам достаёт из базы то, что "
-                    "записал предыдущий, а сервер проверяет каждую передачу. "
-                    "Инструменты живут на сервере сторожа (`./run.sh "
-                    "faq-watch`); каталог сторожа и его сводка — кнопками в "
-                    "блоке «Сторож FAQ» ниже."
+                    "**Три сервера — три назначения.** `watch` — официальный "
+                    "FAQ издателя на английском: копия в SQLite и сайт; свежая "
+                    "копия — ответ из неё, пустая или устаревшая — с сайта, а "
+                    "копия докачивается в фоне (строка `источник:` в ответе). "
+                    "Процесс долгий, по HTTP: приложение поднимает его само, "
+                    "если порт молчит, и останавливает при выходе. `wiki` — "
+                    "фанатская вики на русском, только сайт: разделы, строки "
+                    "раздела, страницы. `files` — выгрузка в Markdown "
+                    f"(`{display_path(FAQ_CHEATSHEETS_DIR)}`), данные — по "
+                    "значению. `wiki` и `files` — stdio, процесс на каждый "
+                    "вызов. **Сервер и инструмент выбирает модель** по "
+                    "описаниям инструментов; «копия или сайт» — решает "
+                    "сервер FAQ, а не модель."
+                )
+                group_catalog_btn = gr.Button("🔌 Каталог группы", variant="primary")
+                group_status_md = gr.Markdown(GROUP_STATUS_INITIAL)
+                group_tools_table = gr.Dataframe(
+                    value=_group_tools_table(None),
+                    label="Инструменты группы — в порядке каталога, как их видит модель",
+                    datatype=["number", "str", "markdown", "str", "markdown"],
+                    column_widths=["6%", "10%", "18%", "38%", "28%"],
+                    max_height=360,
+                    wrap=True,
                 )
                 gr.Markdown("#### Инструменты последнего хода агента (все серверы)")
                 tools_md = gr.Markdown("")
@@ -5137,6 +5416,20 @@ with gr.Blocks(title="TooManyRules") as demo:
                         label="Что ушло модели сообщениями tool",
                         max_height=420,
                     )
+            # Памятка к столу (день 19, §7.1) — с дня 20 свёрнут. Описание —
+            # статичный Markdown; инструменты хода переехали в блок дня 20.
+            with gr.Accordion("Памятка к столу: пайплайн MCP (день 19)", open=False):
+                gr.Markdown(
+                    "Три шага одной просьбы: **найти** (`faq_search` — по "
+                    "английским словам в копии FAQ) → **сжать** "
+                    "(`faq_summarize` — по-русски, со ссылками; сжимает "
+                    "**модель агента по просьбе сервера**, MCP sampling — у "
+                    "сервера нет ни ключа, ни модели) → **сохранить** — с дня "
+                    "20 на сервере файлов (`save_markdown`). "
+                    "Между поиском и сжатием данные идут **по ссылке** (id "
+                    "`q…`), а не текстом — сжатие само достаёт из базы то, что "
+                    "записал поиск, а сервер проверяет передачу."
+                )
             # Сторож FAQ (день 18, §7.2) — с дня 19 свёрнут. Каталог по
             # кнопке — те же функции, что у дней 16-17; сводка сторожа —
             # `faq_changes` кнопкой; оба — вне `_view()` (свои выходы
@@ -5147,10 +5440,13 @@ with gr.Blocks(title="TooManyRules") as demo:
                     source_label="категория FAQ на сайте издателя",
                     server_line=(
                         "Сервер — `src/faq_watch.py` этого репозитория: SDK mcp "
-                        "v2 (`MCPServer`), планировщик снимков в `lifespan`, "
-                        "SQLite; сайт читает только планировщик, инструменты "
-                        "сторожа и памятки отвечают из базы. Сводку каждого "
-                        "снимка сервер сам пишет в свой терминал."
+                        "v2 (`MCPServer`), исполнитель снимков в `lifespan`, "
+                        "SQLite. С дня 20 — «FAQ издателя: копия и сайт»: "
+                        "свежая копия — ответ из неё, пустая или устаревшая — "
+                        "с сайта и снимок в фоне; расписание выключено по "
+                        "умолчанию. Сводку каждого снимка сервер сам пишет в "
+                        "свой терминал (у автозапущенного — терминал "
+                        "приложения)."
                     ),
                     db=FAQ_WATCH_DB,
                 ))
@@ -5513,6 +5809,10 @@ with gr.Blocks(title="TooManyRules") as demo:
     # без входов, агента не трогает; остальные обработчики блок не трогают.
     MCP_OUTPUTS = [mcp_status_md, mcp_tools_table, mcp_pages_json]
     mcp_list_btn.click(on_mcp_list, inputs=None, outputs=MCP_OUTPUTS)
+    # Каталог группы по кнопке (день 20, §8.2) — тем же правилом: вне
+    # `_view()`, свои выходы, обработчик без `agent_state`.
+    GROUP_MCP_OUTPUTS = [group_status_md, group_tools_table]
+    group_catalog_btn.click(on_group_catalog, inputs=None, outputs=GROUP_MCP_OUTPUTS)
     # Каталог FAQ по кнопке (день 17, §8.4) — тем же правилом: вне `_view()`,
     # без `agent_state`. Каталог по кнопке — проверка сервера, а не вид на
     # агента; каталог хода агент запрашивает сам.
