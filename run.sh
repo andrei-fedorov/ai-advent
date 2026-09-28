@@ -10,13 +10,18 @@ cd "$(dirname "${BASH_SOURCE[0]}")/src"
 #                               поднимает приложение. Аргументы после faq-watch
 #                               дописываются к командной строке из presets.py и
 #                               перекрывают её (--interval 5, --port 8766, --db …)
+#   ./run.sh index [...]      — индекс правил (день 21): PDF из rag_sources/ →
+#                               куски → эмбеддинги → src/data/rag/index.sqlite3;
+#                               --probe — пробные вопросы по готовому индексу,
+#                               --dump <каталог>, --db <путь>, --sources <каталог>
 APP="app.py"
 case "${1:-}" in
     "")        APP="app.py" ;;
     week1)     APP="app_week1.py" ;;
     faq-watch) APP="" ;;
+    index)     APP="rag_index.py" ;;
     *)
-        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1 или ./run.sh faq-watch [аргументы сервера]" >&2
+        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера] или ./run.sh index [аргументы индекса]" >&2
         exit 1
         ;;
 esac
@@ -35,6 +40,12 @@ if [ -z "$APP" ]; then
     # src/.env (load_dotenv в mcp_client), и через execv ключи уехали бы в
     # процесс сторожа.
     exec python -c 'import os, sys; env = dict(os.environ); import presets; argv = presets.FAQ_WATCH_ARGV + sys.argv[1:]; os.execve(argv[0], argv, env)' "${@:2}"
+fi
+
+if [ "$APP" = "rag_index.py" ]; then
+    # Индексу ключ DeepSeek не нужен: LLM он не вызывает, эмбеддинги считает
+    # локальная модель. Поэтому src/.env здесь не проверяется.
+    exec python rag_index.py "${@:2}"
 fi
 
 if [ ! -f ".env" ]; then

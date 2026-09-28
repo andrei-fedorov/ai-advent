@@ -3,3 +3,6 @@ openai>=2
 python-dotenv>=1.0
 mcp>=2.2,<3
 httpx>=0.28
+pymupdf>=1.26
+sentence-transformers>=5
+numpy>=2
