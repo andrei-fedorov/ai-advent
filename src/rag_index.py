@@ -521,6 +521,14 @@ def main() -> None:
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     logger.propagate = False
+    # Строки поиска (`[RAG]`: индекс прочитан, скачивание и загрузка модели,
+    # расхождение модели) — тем же обработчиком: корневой логгер здесь не
+    # настроен, и без этого INFO поиска терялись бы — на чистой машине `--probe`
+    # молча скачал бы ≈1,1 ГБ (правка по ревью дня 22).
+    rag_logger = logging.getLogger("toomanyrules.rag")
+    rag_logger.addHandler(handler)
+    rag_logger.setLevel(logging.INFO)
+    rag_logger.propagate = False
     db = args.db.expanduser()
     try:
         if args.probe:

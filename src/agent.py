@@ -1070,7 +1070,8 @@ class Agent:
         # агента, но не диалога (§2.5): на диск не едет, в checkpoint не
         # входит, у нового, восстановленного агента и у ветки — включено,
         # сброс его не трогает. `_last_rag` — поиск последнего хода, `None`
-        # — RAG на нём был выключен.
+        # — RAG на нём был выключен или ход оборвался до поиска (обнуляется
+        # в начале каждого хода).
         self._retriever = retriever
         self._rag_instruction = rag_instruction
         self._rag_in_request: bool = True
@@ -1457,6 +1458,10 @@ class Agent:
         модель/температуру/лимиты, у `ask()` нет — другой набор параметров
         означает другой экземпляр агента.
         """
+        # Поиск прошлого хода к этому ходу не относится (день 22, правка по
+        # ревью): ход, упавший до поиска (нет ключа API), иначе показал бы в
+        # панели выдачу прошлого вопроса рядом с новой ошибкой.
+        self._last_rag = None
         try:
             client = self._get_client()
         except RuntimeError as exc:
@@ -2420,8 +2425,9 @@ class Agent:
     @property
     def rag_in_request(self) -> bool:
         """Положение переключателя «RAG: выдержки из правил в запросе» (день
-        22, §2.5)."""
-        return self._rag_in_request
+        22, §2.5). Без поиска у агента — `False`: определение «включён» одно
+        на свойство и `debug_state()`."""
+        return self._rag_in_request and self._retriever is not None
 
     @_locked
     def set_rag_in_request(self, enabled: bool) -> bool:
@@ -2608,11 +2614,11 @@ class Agent:
                 else None
             ),
             # Ключ дня 22 — в конце. `available` — есть ли у агента поиск;
-            # `last` — поиск последнего хода (`None` — ходов ещё не было или
-            # RAG на последнем был выключен).
+            # `last` — поиск последнего хода (`None` — ходов ещё не было, RAG
+            # на последнем был выключен или ход оборвался до поиска).
             "rag": {
                 "available": self._retriever is not None,
-                "enabled": self._rag_in_request and self._retriever is not None,
+                "enabled": self.rag_in_request,
                 "name": self._retriever.name if self._retriever is not None else "",
                 "last": asdict(self._last_rag) if self._last_rag is not None else None,
             },

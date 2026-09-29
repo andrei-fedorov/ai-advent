@@ -237,24 +237,31 @@ class RulesIndex:
         не разрешён."""
         with self._lock:
             self._refresh()
-            model = self._meta["embed_model"]
-            if self._embedder is None:
-                self._embedder = Embedder(model)
-            if self._embedder.loaded:
-                return 0.0
-            step = time.perf_counter()
-            try:
-                self._embedder.load(
-                    lambda: logger.info(
-                        "[RAG] модели %s нет в кэше — скачиваю ≈1,1 ГБ в кэш Hugging Face (один раз)", model,
-                    ),
-                    allow_download=self.allow_download,
-                )
-            except OSError as exc:
-                raise RagError(str(exc)) from exc
-            loaded = time.perf_counter() - step
-            logger.info("[RAG] модель %s загружена за %.1f с · устройство %s", model, loaded, self._embedder.device)
-            return loaded
+            return self._load_model()
+
+    def _load_model(self) -> float:
+        """`load_model()` без перечитывания индекса: под замком, индекс уже
+        перечитан. `nearest()` и `search()` считают маску до загрузки модели:
+        если бы загрузка перечитала сменившийся файл ещё раз, маска
+        разошлась бы с матрицей (правка по ревью дня 22)."""
+        model = self._meta["embed_model"]
+        if self._embedder is None:
+            self._embedder = Embedder(model)
+        if self._embedder.loaded:
+            return 0.0
+        step = time.perf_counter()
+        try:
+            self._embedder.load(
+                lambda: logger.info(
+                    "[RAG] модели %s нет в кэше — скачиваю ≈1,1 ГБ в кэш Hugging Face (один раз)", model,
+                ),
+                allow_download=self.allow_download,
+            )
+        except OSError as exc:
+            raise RagError(str(exc)) from exc
+        loaded = time.perf_counter() - step
+        logger.info("[RAG] модель %s загружена за %.1f с · устройство %s", model, loaded, self._embedder.device)
+        return loaded
 
     # --- Публичное ---------------------------------------------------------------
 
@@ -308,19 +315,24 @@ class RulesIndex:
             if not mask.any():
                 raise RagError(f"в индексе нет кусков {strategy}/{lang}")
             if vector is None:
-                self.load_model()
+                self._load_model()
                 vector = self._embedder.embed_query(question)
-            indexes = np.flatnonzero(mask)
-            scores = self._matrix[indexes] @ np.asarray(vector, dtype=np.float32)
-            order = np.argsort(-scores)[:top]
-            hits: list[Hit] = []
-            for position in order:
-                row = self._rows[indexes[position]]
-                hits.append(Hit(
-                    chunk_id=row[0], doc=row[2], lang=row[3], title=row[4], section=row[5], part=row[6],
-                    page_from=row[7], page_to=row[8], text=row[9], tokens=row[10], score=float(scores[position]),
-                ))
-            return hits
+            return self._ranked(mask, vector, top)
+
+    def _ranked(self, mask: np.ndarray, vector: np.ndarray, top: int) -> list[Hit]:
+        """Перебор: `top` ближайших к вектору среди кусков маски. Под замком,
+        индекс уже перечитан — зовут `nearest()` и `search()`."""
+        indexes = np.flatnonzero(mask)
+        scores = self._matrix[indexes] @ np.asarray(vector, dtype=np.float32)
+        order = np.argsort(-scores)[:top]
+        hits: list[Hit] = []
+        for position in order:
+            row = self._rows[indexes[position]]
+            hits.append(Hit(
+                chunk_id=row[0], doc=row[2], lang=row[3], title=row[4], section=row[5], part=row[6],
+                page_from=row[7], page_to=row[8], text=row[9], tokens=row[10], score=float(scores[position]),
+            ))
+        return hits
 
     def query_vector(self, question: str) -> np.ndarray:
         """Вектор вопроса моделью индекса (для `--probe`); бросает `RagError`."""
@@ -339,14 +351,15 @@ class RulesIndex:
         try:
             with self._lock:
                 self._refresh()
-                result["total"] = int(self._mask(self.strategy, self.lang).sum())
+                mask = self._mask(self.strategy, self.lang)
+                result["total"] = int(mask.sum())
                 if not result["total"]:
                     raise RagError(f"в индексе нет кусков {self.strategy}/{self.lang}")
-                result["load_s"] = self.load_model()
+                result["load_s"] = self._load_model()
                 step = time.perf_counter()
                 vector = self._embedder.embed_query(question)
                 result["embed_s"] = time.perf_counter() - step
-                result["hits"] = [hit.as_dict() for hit in self.nearest(question, vector=vector)]
+                result["hits"] = [hit.as_dict() for hit in self._ranked(mask, vector, self.top_k)]
             result["ok"] = True
         except RagError as exc:
             result["error"] = str(exc)

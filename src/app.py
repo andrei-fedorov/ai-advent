@@ -2565,12 +2565,12 @@ def _rag_place_text(source: tuple, place: int | None) -> str:
     return f"`{doc}` · «{_md_cell(section)}» · стр. {page} — {mark}"
 
 
-def _rag_control_lines(question: str, rag: dict | None, turn_seen: bool) -> list[str]:
+def _rag_control_lines(question: str, rag: dict | None) -> list[str]:
     """Если вопрос хода — контрольный (текст совпал с `RAG_CONTROL_QUESTIONS`):
     номер, что проверяет, ожидание и ожидаемые источники с местом в выдаче.
     Ход без RAG — «поиска не было»; ответ модели не оценивается."""
     control = next((q for q in RAG_CONTROL_QUESTIONS if q["question"].strip() == question.strip()), None)
-    if control is None or not turn_seen:
+    if control is None:
         return []
     lines = [
         "",
@@ -2581,7 +2581,7 @@ def _rag_control_lines(question: str, rag: dict | None, turn_seen: bool) -> list
     if not control["sources"]:
         lines.append("- **Ожидаемые источники:** нет — вопрос вне корпуса.")
     elif rag is None:
-        lines.append("- **Ожидаемые источники:** поиска не было (ход без RAG).")
+        lines.append("- **Ожидаемые источники:** поиска не было.")
     elif not rag["ok"]:
         lines.append("- **Ожидаемые источники:** выдачи нет — поиск не удался.")
     else:
@@ -2641,14 +2641,21 @@ def _rag_md(state: dict) -> str:
     lines += ["", f"- **Вопрос последнего хода:** {_md_cell(question) or '—'}"]
 
     if last is None:
-        lines.append("- **Поиск:** не было — последний ход без RAG (флажок снят).")
-        lines += _rag_control_lines(question, None, True)
+        # Записи поиска нет и у хода, упавшего до поиска (нет ключа API):
+        # агент обнуляет её в начале каждого хода (правка по ревью дня 22).
+        lines.append(
+            "- **Поиск:** не было — последний ход без RAG (флажок снят)."
+            if last_call is None or last_call["ok"]
+            else "- **Поиск:** не было — RAG выключен на этом ходе или ход оборвался до "
+                 "поиска (причина — в «Последнем вызове»)."
+        )
+        lines += _rag_control_lines(question, None)
         return "\n".join(lines)
     if not last["ok"]:
         lines.append(
             f"- ⚠️ **Поиск не удался:** {last['error']} — запрос ушёл без выдержек."
         )
-        lines += _rag_control_lines(question, last, True)
+        lines += _rag_control_lines(question, last)
         return "\n".join(lines)
 
     rounds = (last_call or {}).get("rounds") or []
@@ -2671,7 +2678,7 @@ def _rag_md(state: dict) -> str:
             f"{_hit_pages(hit)} | {hit['tokens']} |"
         )
     lines += ["", "\n".join(table)]
-    lines += _rag_control_lines(question, last, True)
+    lines += _rag_control_lines(question, last)
     return "\n".join(lines)
 
 
@@ -2687,6 +2694,8 @@ def _rag_message_update(state: dict) -> dict:
         )
     if last is not None and not last["ok"]:
         note = "Поиск не удался — последнее сообщение запроса ушло чистым вопросом."
+    elif state["last_call"] is not None and not state["last_call"]["ok"]:
+        note = "Поиска не было: RAG выключен на этом ходе или ход оборвался до поиска."
     elif state["last_call"] is not None:
         note = "Последний ход без RAG — последнее сообщение запроса ушло чистым вопросом."
     else:

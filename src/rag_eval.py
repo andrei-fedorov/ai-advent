@@ -23,7 +23,6 @@
 import argparse
 import logging
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +43,6 @@ class Run:
     """Один ход одного режима."""
 
     reply: agent.AgentReply
-    wall_s: float
 
 
 @dataclass
@@ -122,7 +120,7 @@ def answer_block(run: Run, with_rag: bool) -> list[str]:
 
 
 def build_report(
-    results: list[Result], config: agent.AgentConfig, index: rag_search.RulesIndex, info: dict,
+    results: list[Result], config: agent.AgentConfig, info: dict,
     started: datetime, interrupted_after: str | None, total_questions: int,
 ) -> str:
     out: list[str] = ["# Прогон контрольных вопросов дня 22: без RAG и с RAG", ""]
@@ -224,10 +222,8 @@ def run_question(
     for rag in (False, True):
         mode = "с RAG" if rag else "без RAG"
         bare = make_agent(config, f"eval-{question['id']}-{'с' if rag else 'без'}", index, rag)
-        started = time.perf_counter()
         reply = bare.ask(question["question"])
-        wall = time.perf_counter() - started
-        runs[rag] = Run(reply, wall)
+        runs[rag] = Run(reply)
         line = f"{question['id']} {mode}: "
         if reply.ok:
             line += (
@@ -324,7 +320,7 @@ def main() -> None:
         interrupted_after = results[-1].question["id"] if results else "старта"
         logger.error("прервано после %s — пишу отчёт по пройденным вопросам", interrupted_after)
 
-    report = build_report(results, config, index, info, started, interrupted_after, len(questions))
+    report = build_report(results, config, info, started, interrupted_after, len(questions))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(report, encoding="utf-8")
     logger.info("отчёт: %s (%d из %d вопросов)", rag_search.shown(out_path), len(results), len(questions))
