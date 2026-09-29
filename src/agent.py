@@ -116,7 +116,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from typing import Protocol
 
@@ -208,6 +208,13 @@ TOOL_STATUS_UNKNOWN = "нет такого инструмента"
 # `tool_choice` финального раунда после потолка (день 17, §5.5): модель
 # отвечает тем, что уже собрала, без новых вызовов.
 TOOL_CHOICE_NONE = "none"
+
+# Подписи части RAG последнего сообщения запроса (день 22, §2.3, §6.3). Про
+# Too Many Bones агент не знает: всё, что про игру, — в инструкции
+# (`rag_instruction`, её передаёт `app.py` из `presets.py`) и в метаданных
+# кусков выдачи.
+RAG_HEADER = "Выдержки из документов"
+RAG_QUESTION_LABEL = "Вопрос:"
 
 # Слои в запросе по умолчанию — все переключаемые. Отдельное имя, а не
 # `memory.REQUEST_LAYERS` на месте: в конструкторе и в `fork()` имя `memory`
@@ -350,6 +357,31 @@ class ToolCallRecord:
 
 
 @dataclass(frozen=True)
+class RagRecord:
+    """Поиск выдержек на одном ходе (день 22, §6.2): что нашёл поиск и что
+    ушло в модель. Запись есть только у хода с включённым RAG: выключен — ни
+    записи, ни поиска.
+
+    `hits` — словари, как пришли от `Retriever.search()`. `message` — последнее
+    сообщение запроса целиком, как ушло в модель (выдержки + вопрос); `""` —
+    ушло без выдержек (поиск не удался или ничего не нашёл). `tokens` — оценка
+    корзины `rag`; `question` — вопрос хода, ради панели: она сверяет его с
+    контрольными вопросами.
+    """
+
+    enabled: bool
+    ok: bool
+    error: str
+    elapsed: float
+    load_s: float
+    total: int
+    hits: tuple[dict, ...]
+    message: str = ""
+    tokens: int = 0
+    question: str = ""
+
+
+@dataclass(frozen=True)
 class AgentReply:
     """Результат одного вызова `ask()`. Полный набор метрик на каждый ход —
     это содержимое дебаг-панели (и причина, по которой день 6 обходится без
@@ -448,6 +480,10 @@ class AgentReply:
     # выполнения. Служебные вызовы — как `service_call`/`memory_call`/…, но
     # их может быть несколько за ход (по одному на `faq_summarize`).
     sampling_calls: tuple[ServiceCall, ...] = ()
+    # Поле дня 22 — в конце (§6.5): поиск выдержек этого хода; `None` — RAG
+    # выключен или его у агента нет. Есть и у неудачного хода, если поиск успел
+    # пройти.
+    rag: RagRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -733,6 +769,22 @@ class ToolBox(Protocol):
     ) -> dict: ...
 
 
+class Retriever(Protocol):
+    """Поиск выдержек для RAG (реализация — `rag_search.RulesIndex`,
+    спецификация дня 22, §6.1). Один на процесс и общий для всех агентов, как
+    `ToolBox`. Обмен словарями: реализация протокол не импортирует, агент не
+    импортирует `rag_search` — откуда берутся выдержки, он не знает. `search()`
+    не бросает: сбой возвращается словарём с `ok=False`.
+    """
+
+    @property
+    def name(self) -> str: ...        # для лога
+    # {"ok", "error", "elapsed", "load_s", "embed_s", "total",
+    #  "hits": [{"chunk_id", "doc", "title", "section", "part",
+    #            "page_from", "page_to", "text", "tokens", "score"}]}
+    def search(self, question: str) -> dict: ...
+
+
 # --- Счётчики процесса и реестр агентов ----------------------------------
 # Наглядный ответ на «один инстанс приложения — много агентов»: сколько
 # агентов создано с момента старта, сколько они суммарно потратили и — в
@@ -971,6 +1023,13 @@ class Agent:
         # оставляет решение, можно ли просьбу выполнить, клиенту.
         sampling_max_tokens: int = 1500,
         sampling_max_chars: int = 40_000,
+        # Зависимости дня 22 (§6.1) — снова в конце и необязательные:
+        # `retriever=None` — RAG нет, агент ведёт себя ровно как на дне 20.
+        # Один на процесс и передаётся всем агентам тем же объектом, как
+        # `ToolBox`. `rag_instruction` — текст перед выдержками; настоящий
+        # передаёт `app.py` из `presets.py`.
+        retriever: Retriever | None = None,
+        rag_instruction: str = "",
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -1006,6 +1065,16 @@ class Agent:
         self._sampling_max_tokens = sampling_max_tokens
         self._sampling_max_chars = sampling_max_chars
         self._tools_in_request: bool = True
+        # RAG (день 22): поиск, инструкция к выдержкам и положение
+        # переключателя «RAG: выдержки из правил в запросе» — состояние
+        # агента, но не диалога (§2.5): на диск не едет, в checkpoint не
+        # входит, у нового, восстановленного агента и у ветки — включено,
+        # сброс его не трогает. `_last_rag` — поиск последнего хода, `None`
+        # — RAG на нём был выключен.
+        self._retriever = retriever
+        self._rag_instruction = rag_instruction
+        self._rag_in_request: bool = True
+        self._last_rag: RagRecord | None = None
         # Схемы последнего успешно полученного каталога — только для оценки
         # корзины `tools` в панели до вопроса (§5.4): чистые методы в сеть не
         # ходят. На ход каталог запрашивается заново; это не кэш каталога.
@@ -1457,6 +1526,15 @@ class Agent:
             else ""
         )
 
+        # Поиск выдержек RAG (день 22, §2.1, §6.2) — после трекера и до
+        # каталога инструментов. Это работа кода, а не решение модели и не
+        # служебный вызов LLM: выключен или поиска нет — `None`. Сбой поиска и
+        # пустая выдача ход не отменяют: запрос уходит чистым вопросом, как
+        # без RAG (правило каталога инструментов дня 17).
+        rag = self._run_rag(user_message)
+        self._last_rag = rag
+        rag_hits = rag.hits if rag is not None and rag.ok else ()
+
         # Каталог инструментов (день 17, §5.3) — после всех служебных работ
         # (трекер остаётся последним из них) и до сборки запроса: схемы нужны
         # оценке токенов. Одно подключение к серверу на ход. Сбой каталога
@@ -1473,10 +1551,24 @@ class Agent:
         # только первого раунда (§5.4): сообщения следующих раундов
         # появляются по ходу, считать их заранее не из чего.
         messages, view = self._context_view(
-            user_message, long_term, profile, mode_choice, always, tools_json
+            user_message, long_term, profile, mode_choice, always, tools_json,
+            rag_hits,
         )
         request = view.usage.request
         budget = view.usage
+        if rag is not None:
+            # Что ушло в модель последним сообщением и сколько это весит —
+            # известно только после сборки (§6.2). Ошибка поиска — запись без
+            # сообщения: ушёл чистый вопрос.
+            rag = replace(
+                rag,
+                message=messages[-1]["content"] if rag_hits else "",
+                tokens=request.rag,
+            )
+            self._last_rag = rag
+            self._log_rag(rag)
+        elif self._retriever is not None:
+            logger.info("[%s] RAG: выключен — поиска нет", self._log_name)
         if specs:
             logger.info(
                 "[%s] инструменты: %s (%s), схемы ≈%s ток.",
@@ -1569,6 +1661,7 @@ class Agent:
                     tool_calls=tuple(calls),
                     tool_elapsed=tool_elapsed,
                     sampling_calls=tuple(sampling_calls),
+                    rag=rag,
                 )
             elapsed = time.perf_counter() - started
             model_elapsed += elapsed
@@ -1707,6 +1800,7 @@ class Agent:
             tool_calls=tuple(calls),
             tool_elapsed=tool_elapsed,
             sampling_calls=tuple(sampling_calls),
+            rag=rag,
         )
 
         if self._config.keep_history:
@@ -1942,6 +2036,10 @@ class Agent:
 
         С дня 19 (§6.2) ветка получает те же потолки сэмплинга, что у
         родителя: они относятся к агенту, не к диалогу.
+
+        С дня 22 (§6.1) ветка получает тот же `Retriever` и ту же инструкцию к
+        выдержкам, что у родителя. Переключатель «RAG в запросе» у ветки —
+        включён, как у нового агента; выдержки в checkpoint не входят.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -2004,6 +2102,8 @@ class Agent:
             tool_result_max_chars=self._tool_result_max_chars,
             sampling_max_tokens=self._sampling_max_tokens,
             sampling_max_chars=self._sampling_max_chars,
+            retriever=self._retriever,
+            rag_instruction=self._rag_instruction,
         )
 
     @_locked
@@ -2318,6 +2418,29 @@ class Agent:
         return True
 
     @property
+    def rag_in_request(self) -> bool:
+        """Положение переключателя «RAG: выдержки из правил в запросе» (день
+        22, §2.5)."""
+        return self._rag_in_request
+
+    @_locked
+    def set_rag_in_request(self, enabled: bool) -> bool:
+        """Выключено — поиска нет вовсе (ни загрузки модели, ни вектора
+        вопроса): запрос как на дне 20. Это база сравнения «без RAG».
+        `False` — поиска у агента нет или значение не изменилось. Стек, файл
+        сессии, память и задача не трогаются, на диск ничего не пишется;
+        служебные работы работают при любом положении."""
+        if self._retriever is None or enabled == self._rag_in_request:
+            return False
+        previous = self._rag_in_request
+        self._rag_in_request = enabled
+        logger.info(
+            "[%s] RAG в запросе: %s → %s",
+            self._log_name, _on_off_short(previous), _on_off_short(enabled),
+        )
+        return True
+
+    @property
     def task_in_request(self) -> bool:
         """Положение переключателя «Состояние задачи в запросе» (день 13,
         §5.6)."""
@@ -2484,6 +2607,15 @@ class Agent:
                 if self._tools is not None
                 else None
             ),
+            # Ключ дня 22 — в конце. `available` — есть ли у агента поиск;
+            # `last` — поиск последнего хода (`None` — ходов ещё не было или
+            # RAG на последнем был выключен).
+            "rag": {
+                "available": self._retriever is not None,
+                "enabled": self._rag_in_request and self._retriever is not None,
+                "name": self._retriever.name if self._retriever is not None else "",
+                "last": asdict(self._last_rag) if self._last_rag is not None else None,
+            },
         }
 
     # --- Внутреннее ------------------------------------------------------
@@ -2495,6 +2627,7 @@ class Agent:
         profile: "user_profile.UserProfile | None" = None,
         mode_choice: "user_profile.ModeChoice | None" = None,
         always: list[dict] | None = None,
+        rag_hits: Sequence[dict] | None = None,
     ) -> list[dict]:
         """Единственное место, где собирается список сообщений для запроса.
 
@@ -2528,6 +2661,13 @@ class Agent:
         инвариант устойчивее всего остального и старше всего остального.
         `always` — снимок постоянных инвариантов этого хода; `None` — взять
         свежий (панель).
+
+        День 22 дописывает выдержки RAG (§6.3): `_with_rag()` последним
+        шагом заменяет содержимое **последнего** сообщения на «часть RAG +
+        вопрос» и блоков за системным промптом не трогает — порядок блоков и
+        префикс запроса прежние. `rag_hits` — выдача этого хода; `None`/пусто
+        — запрос без выдержек (панель до вопроса выдержек не знает: чистые
+        методы не ищут).
         """
         if long_term is None:
             long_term = self._long_term_entries()
@@ -2543,7 +2683,42 @@ class Agent:
         messages = self._with_task(messages)
         messages = self._with_layers(messages, long_term)
         messages = self._with_profile(messages, profile, mode_choice)
-        return self._with_invariants(messages, always)
+        messages = self._with_invariants(messages, always)
+        return self._with_rag(messages, rag_hits)
+
+    def _rag_text(self, hits: Sequence[dict] | None) -> str:
+        """Часть RAG последнего сообщения: заголовок, инструкция, выдержки и
+        подпись «Вопрос:» — всё, что стоит перед текстом игрока (§2.3).
+        `""` — выдержек нет. Близость в запрос не уходит: модели она не
+        нужна и сбивала бы её к «первому месту»."""
+        if not hits:
+            return ""
+        parts = [f"{RAG_HEADER} — найдено поиском по вопросу: {len(hits)}"]
+        if self._rag_instruction:
+            parts.append(self._rag_instruction.strip())
+        for number, hit in enumerate(hits, 1):
+            label = f"[{number}] {hit['title']} · {hit['section']}"
+            if hit.get("part"):
+                label += f" · часть {hit['part']}"
+            first, last = hit["page_from"], hit["page_to"]
+            label += f" · стр. {first}" if first == last else f" · стр. {first}–{last}"
+            parts.append(f"{label}\n{hit['text'].strip()}")
+        parts.append(RAG_QUESTION_LABEL + "\n")
+        return "\n\n".join(parts)
+
+    def _with_rag(
+        self, messages: list[dict], hits: Sequence[dict] | None
+    ) -> list[dict]:
+        """Выдержки в готовом списке сообщений — единственное место, где они
+        туда попадают (день 22, §6.3). Выдержки — часть последнего сообщения
+        `user`, перед вопросом, а не ещё один `system`-блок: текст документов
+        — данные, а не голос разработчика, и изменчивое стоит в конце, чтобы
+        не сбивать кэшируемый префикс."""
+        text = self._rag_text(hits)
+        if not text or not messages:
+            return messages
+        last = messages[-1]
+        return messages[:-1] + [{**last, "content": text + (last.get("content") or "")}]
 
     def _with_invariants(self, messages: list[dict], always: list[dict]) -> list[dict]:
         """Блок инвариантов в готовом списке сообщений — единственное место,
@@ -2691,6 +2866,7 @@ class Agent:
         mode_choice: "user_profile.ModeChoice | None" = None,
         always: list[dict] | None = None,
         tools_json: str | None = None,
+        rag_hits: Sequence[dict] | None = None,
     ) -> tuple[list[dict], ContextView]:
         """Сборка запроса и всё, что про неё нужно знать панели и логам, —
         одним проходом.
@@ -2708,7 +2884,9 @@ class Agent:
         вызова роутера. `always` (день 14) — снимок постоянных инвариантов, тем
         же приёмом. `tools_json` (день 17) — схемы инструментов этого хода
         строкой JSON (`""` — инструментов в запросе нет); `None` — панель, и
-        тогда берутся схемы последнего полученного каталога (§5.4).
+        тогда берутся схемы последнего полученного каталога (§5.4). `rag_hits`
+        (день 22) — выдача этого хода; панель передаёт `None`: до вопроса
+        выдержек нет (§6.3).
         """
         if long_term is None:
             long_term = self._long_term_entries()
@@ -2721,10 +2899,11 @@ class Agent:
         if tools_json is None:
             tools_json = self._preview_tools_json()
         messages = self._build_messages(
-            question, long_term, profile, mode_choice, always
+            question, long_term, profile, mode_choice, always, rag_hits
         )
+        rag_text = self._rag_text(rag_hits)
         usage = tokens.context_usage(
-            self._count_messages(messages, tools_json),
+            self._count_messages(messages, tools_json, rag_text),
             model=self._config.model,
             max_tokens=self._config.max_tokens,
             calibration=self.calibration,
@@ -2736,24 +2915,28 @@ class Agent:
         # экономия говорит только о стратегии, а не о том, что слои, профиль
         # или задача добавили.
         # С дня 14 — с тем же блоком инвариантов, с дня 17 — с теми же
-        # схемами инструментов.
+        # схемами инструментов, с дня 22 — с той же частью RAG.
         full = self._count_messages(
-            self._with_invariants(
-                self._with_profile(
-                    self._with_layers(
-                        self._with_task(
-                            _FULL_HISTORY.build(
-                                self._config.system_prompt, self._messages,
-                                question,
-                            )
+            self._with_rag(
+                self._with_invariants(
+                    self._with_profile(
+                        self._with_layers(
+                            self._with_task(
+                                _FULL_HISTORY.build(
+                                    self._config.system_prompt, self._messages,
+                                    question,
+                                )
+                            ),
+                            long_term,
                         ),
-                        long_term,
+                        profile, mode_choice,
                     ),
-                    profile, mode_choice,
+                    always,
                 ),
-                always,
+                rag_hits,
             ),
             tools_json,
+            rag_text,
         )
         state = self.strategy.describe(self._messages)
         task = self.strategy.prepare(self._messages, question)
@@ -3548,7 +3731,7 @@ class Agent:
             )
 
     def _count_messages(
-        self, messages: list[dict], tools_json: str = ""
+        self, messages: list[dict], tools_json: str = "", rag_text: str = ""
     ) -> tokens.RequestTokens:
         """Разложение готового списка сообщений на систему / долговременную и
         рабочую память / память стратегии / историю / вопрос.
@@ -3586,8 +3769,18 @@ class Agent:
         С дня 17 (§5.4) сюда же приходят схемы инструментов строкой JSON —
         те же, что уходят параметром `tools`: корзина `tools`. Сообщением они
         не являются, и разбор по ролям их не касается.
+
+        С дня 22 (§6.4) часть RAG — начало последнего сообщения — приходит
+        параметром `rag_text`, а не угадыванием по содержимому: корзина `rag`
+        — эта часть, корзина `question` — ровно текст игрока, вместе они —
+        всё последнее сообщение.
         """
         middle = messages[1:-1]
+        question = messages[-1]["content"]
+        if rag_text and question.startswith(rag_text):
+            question = question[len(rag_text):]
+        else:
+            rag_text = ""
         system = [
             m.get("content") or "" for m in middle if m.get("role") == "system"
         ]
@@ -3599,7 +3792,7 @@ class Agent:
         return tokens.count_request(
             system_prompt=messages[0]["content"],
             history=[m for m in middle if m.get("role") != "system"],
-            question=messages[-1]["content"],
+            question=question,
             memory="\n\n".join(text for text in system if not text.startswith(named)),
             long_term="\n\n".join(
                 text for text in system if text.startswith(memory.LONG_TERM_HEADER)
@@ -3618,6 +3811,7 @@ class Agent:
                 if text.startswith(invariants.INVARIANT_HEADER)
             ),
             tools_json=tools_json,
+            rag=rag_text,
         )
 
     def _log_context(self, view: ContextView) -> None:
@@ -3648,14 +3842,14 @@ class Agent:
         logger.info(
             "[%s] бюджет: система %s + инварианты %s + профиль %s + "
             "долговременная %s + рабочая %s + задача %s + память стратегии "
-            "%s + история %s + вопрос %s + схемы инструментов %s + служебные "
-            "%s ≈ %s из %s доступных (%s); окно %s, резерв под ответ %s",
+            "%s + история %s + RAG %s + вопрос %s + схемы инструментов %s + "
+            "служебные %s ≈ %s из %s доступных (%s); окно %s, резерв под ответ %s",
             self._log_name,
             _num(request.system), _num(request.invariants), _num(request.profile),
             _num(request.long_term),
             _num(request.working), _num(request.task), _num(request.memory),
-            _num(request.history), _num(request.question), _num(request.tools),
-            _num(request.overhead),
+            _num(request.history), _num(request.rag), _num(request.question),
+            _num(request.tools), _num(request.overhead),
             _num(budget.used), _num(budget.available), _ratio_str(budget.ratio),
             _num(budget.limit), _num(budget.answer_reserve),
         )
@@ -3667,6 +3861,53 @@ class Agent:
                 "доходить, а не проверка перед вызовом",
                 self._log_name, _ratio_str(budget.ratio), budget.level,
             )
+
+    def _run_rag(self, user_message: str) -> RagRecord | None:
+        """Поиск выдержек на ход (день 22, §6.2). `None` — RAG выключен или
+        поиска у агента нет: поиска не было вовсе. Иначе запись; при сбое или
+        пустой выдаче `ok=False`, `hits` пуст — ход идёт без выдержек. Запрос
+        поиска — вопрос игрока как есть: без истории, переписывания и
+        расширения. `message` и `tokens` дописывает `ask()` после сборки."""
+        if self._retriever is None or not self._rag_in_request:
+            return None
+        result = self._retriever.search(user_message)
+        hits = tuple(result.get("hits") or ())
+        ok = bool(result.get("ok")) and bool(hits)
+        error = result.get("error") or ""
+        if result.get("ok") and not hits:
+            error = "поиск ничего не нашёл"
+        return RagRecord(
+            enabled=True,
+            ok=ok,
+            error="" if ok else (error or "причина не названа"),
+            elapsed=float(result.get("elapsed") or 0.0),
+            load_s=float(result.get("load_s") or 0.0),
+            total=int(result.get("total") or 0),
+            hits=hits if ok else (),
+            question=user_message,
+        )
+
+    def _log_rag(self, rag: RagRecord) -> None:
+        """Строка поиска в лог — одна на ход (§6.5)."""
+        if not rag.ok:
+            logger.warning(
+                "[%s] RAG: ⚠️ %s; запрос уходит без выдержек", self._log_name, rag.error,
+            )
+            return
+        loaded = f" (загрузка модели {rag.load_s:.1f} с)" if rag.load_s else ""
+        listed = ", ".join(
+            "{:.3f} {} (стр. {})".format(
+                hit["score"], _shorten(hit["section"], 40),
+                hit["page_from"] if hit["page_from"] == hit["page_to"]
+                else f"{hit['page_from']}–{hit['page_to']}",
+            )
+            for hit in rag.hits
+        )
+        logger.info(
+            "[%s] RAG: %s · %.2f с%s · %d из %d · ≈%s ток. · %s",
+            self._log_name, self._retriever.name, rag.elapsed, loaded,
+            len(rag.hits), rag.total, _num(rag.tokens), listed,
+        )
 
     def _tool_catalog(self) -> tuple[list[dict], str, float]:
         """Каталог инструментов на ход (день 17, §5.3): схемы в формате
@@ -4415,6 +4656,7 @@ class Agent:
         tool_calls: tuple[ToolCallRecord, ...] = (),
         tool_elapsed: float = 0.0,
         sampling_calls: tuple[ServiceCall, ...] = (),
+        rag: RagRecord | None = None,
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
@@ -4463,6 +4705,7 @@ class Agent:
             tool_calls=tool_calls,
             tool_elapsed=tool_elapsed,
             sampling_calls=sampling_calls,
+            rag=rag,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
@@ -4809,6 +5052,11 @@ def _invariants_word(count: int) -> str:
             return "инварианта"
         case _:
             return "инвариантов"
+
+
+def _shorten(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def _on_off(value: bool) -> str:

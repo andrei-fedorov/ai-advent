@@ -1,8 +1,8 @@
 # TooManyRules — эмбеддинги локальной моделью (день 21, неделя 5).
 #
 # **Единственное место, где импортируется `sentence_transformers`** — как
-# `agent.py` для LLM API и `mcp_client.py` для SDK `mcp`. Сегодня модуль берёт
-# программа индексации (`rag_index.py`), дальше — поиск по индексу. Про
+# `agent.py` для LLM API и `mcp_client.py` для SDK `mcp`. Модуль берут программа
+# индексации (`rag_index.py`) и, с дня 22, поиск по индексу (`rag_search.py`). Про
 # документы, куски и индекс модуль не знает: на входе строки, на выходе
 # векторы `float32`, нормированные (косинусная близость = скалярное
 # произведение).
@@ -49,9 +49,11 @@ class Embedder:
         self._model = None
         self.downloaded = False
 
-    def load(self, on_download: Callable[[], None] | None = None) -> None:
+    def load(self, on_download: Callable[[], None] | None = None, allow_download: bool = True) -> None:
         """Загрузка модели; повторный вызов ничего не делает. Модели нет в
-        кэше — `on_download()`, затем скачивание."""
+        кэше — `on_download()`, затем скачивание. `allow_download=False`
+        (приложение и программа сравнения, день 22) — вместо скачивания
+        гигабайта посреди хода игрока исключение с понятным текстом."""
         if self._model is not None:
             return
         # Импорт здесь, а не наверху: `sentence_transformers` тянет `torch` —
@@ -64,14 +66,23 @@ class Embedder:
         transformers_logging.disable_progress_bar()
         try:
             self._model = SentenceTransformer(self.model_name, local_files_only=True)
-        except OSError:
+        except OSError as exc:
             transformers_logging.enable_progress_bar()
+            if not allow_download:
+                raise OSError(
+                    f"модели {self.model_name} нет в кэше Hugging Face — сначала ./run.sh index "
+                    "(скачает ≈1,1 ГБ)"
+                ) from exc
             if on_download is not None:
                 on_download()
             self._model = SentenceTransformer(self.model_name)
             self.downloaded = True
         finally:
             transformers_logging.enable_progress_bar()
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
 
     @property
     def model(self):

@@ -14,14 +14,19 @@ cd "$(dirname "${BASH_SOURCE[0]}")/src"
 #                               куски → эмбеддинги → src/data/rag/index.sqlite3;
 #                               --probe — пробные вопросы по готовому индексу,
 #                               --dump <каталог>, --db <путь>, --sources <каталог>
+#   ./run.sh rag-eval [...]   — контрольные вопросы дня 22 в двух режимах, без RAG
+#                               и с RAG, отчёт Markdown (нужны ключ DeepSeek и
+#                               индекс): --only К1,К8, --preset <имя>, --db <путь>,
+#                               --out <файл.md>
 APP="app.py"
 case "${1:-}" in
     "")        APP="app.py" ;;
     week1)     APP="app_week1.py" ;;
     faq-watch) APP="" ;;
     index)     APP="rag_index.py" ;;
+    rag-eval)  APP="rag_eval.py" ;;
     *)
-        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера] или ./run.sh index [аргументы индекса]" >&2
+        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера], ./run.sh index [аргументы индекса] или ./run.sh rag-eval [аргументы прогона]" >&2
         exit 1
         ;;
 esac
@@ -50,6 +55,12 @@ fi
 
 if [ ! -f ".env" ]; then
     echo "Внимание: src/.env не найден. Создайте его с DEEPSEEK_API_KEY=... перед запуском (см. README, шаг 2)." >&2
+fi
+
+if [ "$APP" = "rag_eval.py" ]; then
+    # Программе сравнения ключ нужен (она ходит к модели через агента), поэтому
+    # src/.env проверяется выше, как у приложения.
+    exec python rag_eval.py "${@:2}"
 fi
 
 python "$APP"

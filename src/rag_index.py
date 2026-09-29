@@ -2,7 +2,7 @@
 #
 # **Отдельная программа**, как серверы дней 17-20, но запускает её человек
 # (`./run.sh index`), и работает она до конца, а не живёт. Приложение её не
-# импортирует, индекс сегодня не читает никто, кроме `--probe`.
+# импортирует; индекс читает `rag_search.py` (приложение и `--probe`).
 #
 # Пайплайн (спецификация дня 21, §2.1):
 #   1. извлечение — PDF → строки с номером страницы, шрифтом и кеглем;
@@ -17,7 +17,9 @@
 # стратегии, без LLM, порогов и сборки ответа.
 #
 # **Единственное место, где импортируется `pymupdf`**, и единственное место
-# работы с базой индекса. Про Too Many Bones знает только через `presets.py`
+# записи базы индекса; читает и проверяет файл (`check_index()`) с дня 22
+# `rag_search.py`, поэтому `--probe` ищет той же `RulesIndex.nearest()`, что и
+# ассистент. Про Too Many Bones знает только через `presets.py`
 # (какие документы, их правила, модель, параметры нарезки, пробные вопросы).
 # LLM API не вызывается вовсе; сеть — только однократное скачивание модели.
 #
@@ -43,12 +45,11 @@ import pymupdf
 import presets
 import rag_chunks
 from embedder import Embedder, package_version
+from rag_search import SCHEMA_VERSION, IndexFileError, RagError, RulesIndex, check_index
 
 logger = logging.getLogger("rag_index")
 
 ROOT = Path(__file__).resolve().parent.parent
-SCHEMA_VERSION = 1
-TABLES = {"meta", "documents", "chunks"}
 PROBE_TOP = 3
 PREVIEW_CHARS = 120
 # Текст и шрифты — да, картинки — нет: их блоки в `dict` не нужны.
@@ -131,33 +132,6 @@ def pages_text(first: int, last: int) -> str:
 
 
 # --- Индекс на диске -----------------------------------------------------------
-
-class IndexFileError(Exception):
-    """По пути индекса лежит чужой или битый файл — он не затирается."""
-
-
-def check_index(path: Path) -> int:
-    """Версия схемы файла по пути индекса; 0 — файла нет или он пустой.
-    Только чтение (`mode=ro`): отказ не оставляет следов в файле (правило
-    базы сервера FAQ, день 18). Своя версия с чужим набором таблиц — тоже
-    чужой файл: версия 1 бывает и у базы сервера FAQ дня 18."""
-    if not path.exists() or path.stat().st_size == 0:
-        return 0
-    try:
-        uri = path.resolve().as_uri() + "?mode=ro"
-        with closing(sqlite3.connect(uri, uri=True)) as conn:
-            version = conn.execute("PRAGMA user_version").fetchone()[0]
-            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    except sqlite3.Error as exc:
-        raise IndexFileError(f"файл не открывается как база SQLite: {exc}") from exc
-    if version == 0 and tables:
-        raise IndexFileError("версия схемы 0, но в базе уже есть таблицы — это не индекс")
-    if version not in (0, SCHEMA_VERSION):
-        raise IndexFileError(f"версия схемы {version}, программа знает только {SCHEMA_VERSION}")
-    if version == SCHEMA_VERSION and tables != TABLES:
-        raise IndexFileError(f"версия схемы {version}, но таблицы не индекса: {', '.join(sorted(tables)) or 'нет'}")
-    return version
-
 
 def write_index(
     path: Path,
@@ -457,77 +431,56 @@ def build(db: Path, sources: Path, dump: Path | None) -> int:
 
 # --- Пробные вопросы -------------------------------------------------------------
 
-def nearest(
-    conn: sqlite3.Connection, vector: np.ndarray, strategy: str, lang: str, top: int,
-) -> list[tuple[float, sqlite3.Row]]:
-    """Ближайшие куски стратегии на языке вопроса: скалярное произведение с
-    каждым (векторы нормированы — это косинусная близость), перебором. Кусков
-    сотни — индекс-структура не нужна (§2.7)."""
-    rows = conn.execute(
-        "SELECT chunk_id, section, part, page_from, page_to, text, embedding "
-        "FROM chunks WHERE strategy = ? AND lang = ?",
-        (strategy, lang),
-    ).fetchall()
-    if not rows:
-        return []
-    matrix = np.stack([np.frombuffer(row["embedding"], dtype="<f4") for row in rows])
-    scores = matrix @ vector.astype(np.float32)
-    order = np.argsort(-scores)[:top]
-    return [(float(scores[index]), rows[index]) for index in order]
-
-
 def probe(db: Path) -> int:
+    """Пробные вопросы: три ближайших куска каждой стратегии. Ищет той же
+    `RulesIndex.nearest()`, что и ассистент (день 22): проба и ответ не
+    расходятся. Скачивание модели разрешено — как при сборке."""
+    index = RulesIndex(
+        db, presets.RAG_SEARCH_STRATEGY, presets.RAG_SEARCH_LANG, PROBE_TOP,
+        allow_download=True, expected_model=presets.RAG_EMBED_MODEL,
+    )
+    info = index.info()
+    if not info["ok"]:
+        logger.error("%s", info["error"])
+        return 2
+    strategies = sorted(info["by_strategy"])
     try:
-        version = check_index(db)
-    except IndexFileError as exc:
-        logger.error("по пути индекса %s: %s", shown(db), exc)
-        return 2
-    if version == 0:
-        logger.error("индекса нет: %s — сначала ./run.sh index", shown(db))
-        return 2
-    uri = db.resolve().as_uri() + "?mode=ro"
-    with closing(sqlite3.connect(uri, uri=True)) as conn:
-        conn.row_factory = sqlite3.Row
-        meta = {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM meta")}
-        model = meta["embed_model"]
-        if model != presets.RAG_EMBED_MODEL:
-            logger.warning(
-                "индекс собран моделью %s, в presets — %s: вопросы считаю моделью индекса "
-                "(векторы разных моделей несравнимы)", model, presets.RAG_EMBED_MODEL,
-            )
-        strategies = [row[0] for row in conn.execute("SELECT DISTINCT strategy FROM chunks ORDER BY strategy")]
-        counts = dict(conn.execute("SELECT strategy, count(*) FROM chunks GROUP BY strategy").fetchall())
-        embedder = Embedder(model)
         step = time.perf_counter()
-        embedder.load(lambda: logger.info("модели %s нет в кэше — скачиваю ≈1,1 ГБ (один раз)", model))
+        index.load_model()
         logger.info(
             "индекс %s · собран %s · %s · модель %s · устройство %s · загрузка %.1f с",
-            shown(db), meta["built_at"],
-            ", ".join(f"{name}: {chunks_word(counts[name])}" for name in strategies),
-            model, embedder.device, time.perf_counter() - step,
+            shown(db), info["built_at"],
+            ", ".join(f"{name}: {chunks_word(info['by_strategy'][name])}" for name in strategies),
+            info["model"], index.device, time.perf_counter() - step,
         )
         for number, (lang, question) in enumerate(presets.RAG_PROBE_QUESTIONS, 1):
             step = time.perf_counter()
-            vector = embedder.embed_query(question)
+            vector = index.query_vector(question)
             query_s = time.perf_counter() - step
             print()
             print(f"{number}. [{lang}] {question}   (вектор вопроса {query_s:.2f} с)")
             for strategy in strategies:
                 print(f"   {strategy}")
-                hits = nearest(conn, vector, strategy, lang, PROBE_TOP)
+                try:
+                    hits = index.nearest(question, strategy, lang, PROBE_TOP, vector=vector)
+                except RagError:
+                    hits = []
                 if not hits:
                     print("     кусков на этом языке нет")
-                for score, row in hits:
-                    part = f" · часть {row['part']}" if row["part"] else ""
+                for hit in hits:
+                    part = f" · часть {hit.part}" if hit.part else ""
                     print(
-                        f"     {score:.3f}  {row['chunk_id']} · {row['section']}{part} · "
-                        f"{pages_text(row['page_from'], row['page_to'])}"
+                        f"     {hit.score:.3f}  {hit.chunk_id} · {hit.section}{part} · "
+                        f"{pages_text(hit.page_from, hit.page_to)}"
                     )
-                    preview = " ".join(row["text"].split())
+                    preview = " ".join(hit.text.split())
                     if len(preview) > PREVIEW_CHARS:
                         preview = preview[:PREVIEW_CHARS].rstrip() + "…"
                     print(f"            «{preview}»")
-        print()
+    except RagError as exc:
+        logger.error("%s", exc)
+        return 2
+    print()
     return 0
 
 

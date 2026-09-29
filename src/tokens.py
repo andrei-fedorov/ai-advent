@@ -208,6 +208,12 @@ class RequestTokens:
     # запроса `tools`, но токены он стоит так же — в каждом раунде хода.
     # Служебных токенов разметки сообщения за него не начисляется.
     tools: int = 0
+    # Корзина дня 22 — в конце и с умолчанием: часть RAG (заголовок,
+    # инструкция и выдержки) — начало последнего сообщения `user`, перед
+    # вопросом (спецификация дня 22, §2.3, §7). Сообщение одно, поэтому
+    # служебных токенов разметки за корзину не начисляется; `question` при
+    # этом ровно текст игрока, а вместе они — всё последнее сообщение.
+    rag: int = 0
 
 
 def count_request(
@@ -221,6 +227,7 @@ def count_request(
     task: str = "",
     invariants: str = "",
     tools_json: str = "",
+    rag: str = "",
 ) -> RequestTokens:
     """Оценка запроса по частям: системный промпт + инварианты + профиль +
     долговременная и рабочая память + состояние задачи + память стратегии +
@@ -239,6 +246,10 @@ def count_request(
     `tools_json` (день 17) — схемы инструментов строкой JSON, ровно те, что
     уходят параметром `tools`. Сообщением они не являются, поэтому к
     `overhead` ничего не добавляют; пустая строка — инструментов нет.
+
+    `rag` (день 22) — часть RAG последнего сообщения, отдельной строкой: она
+    и `question` вместе — одно сообщение `user`, поэтому корзина `rag`
+    служебных токенов не добавляет.
     """
     per_message = [estimate_tokens(_content(message)) for message in history or []]
     system = estimate_tokens(system_prompt)
@@ -251,6 +262,7 @@ def count_request(
     task_tokens = estimate_tokens(task)
     invariants_tokens = estimate_tokens(invariants)
     tools_tokens = estimate_tokens(tools_json)
+    rag_tokens = estimate_tokens(rag)
 
     messages = (
         1 + len(per_message) + (1 if question else 0) + (1 if memory else 0)
@@ -266,7 +278,7 @@ def count_request(
         total=(
             system + history_tokens + question_tokens + memory_tokens
             + long_term_tokens + working_tokens + profile_tokens + task_tokens
-            + invariants_tokens + tools_tokens + overhead
+            + invariants_tokens + tools_tokens + rag_tokens + overhead
         ),
         per_message=per_message,
         memory=memory_tokens,
@@ -276,6 +288,7 @@ def count_request(
         task=task_tokens,
         invariants=invariants_tokens,
         tools=tools_tokens,
+        rag=rag_tokens,
     )
 
 

@@ -102,6 +102,17 @@
 # у `save_markdown`; `_view()` — по-прежнему 37 значений. Код маршрут не
 # проверяет и сохранение с ⚠️ не отменяет: суждение — за человеком.
 #
+# День 22 (спецификация дня 22, §9) — первый RAG-запрос, неделя 5: перед
+# ответом агент ищет в индексе правил дня 21 пять ближайших кусков и прикладывает
+# их к вопросу выдержками (`rag_search.RulesIndex` — один на процесс, рядом с
+# хранилищами; агент про индекс не знает, поиск приходит к нему через протокол
+# `Retriever`). Флажок «RAG: выдержки из правил в запросе» стоит первым из
+# переключателей запроса, блок «RAG: первый запрос (день 22)» развёрнут наверху
+# дебаг-панели; оба входят в `_view()`: **40 значений** (флажок, Markdown блока,
+# последнее сообщение запроса целиком). Индекс автора приложение только читает;
+# `TOOMANYRULES_RAG_INDEX` заменяет путь — для своего экземпляра и проверки
+# сбоев. День 20 свёрнут под блоком дня 22, контрольные вопросы — у поля ввода.
+#
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
 # словами, текст памяти и числа. День 10 добавил в переключатель ещё две
@@ -221,6 +232,13 @@ from presets import (
     PRESETS,
     PROFILE_QUESTION,
     PROFILE_VARIANTS,
+    RAG_CONTROL_QUESTIONS,
+    RAG_EMBED_MODEL,
+    RAG_INDEX_DB,
+    RAG_INSTRUCTION,
+    RAG_SEARCH_LANG,
+    RAG_SEARCH_STRATEGY,
+    RAG_TOP_K,
     ROUTE_SCENARIO,
     ROUTING_SCENARIO,
     SAMPLING_MAX_CHARS,
@@ -270,6 +288,7 @@ from task_state import (
     STAGE_VALIDATION,
     TRANSITIONS,
 )
+from rag_search import RulesIndex, sources_found
 from tokens import FILLER_MAX_TOKENS, estimate_tokens, filler_text
 from user_profile import (
     CHOICE_AUTO,
@@ -411,6 +430,31 @@ WATCH_AUTOSTART: AutostartStatus = ensure_started(
     "MCP при старте: сервер %s — %s", FAQ_WATCH.name, WATCH_AUTOSTART.text(),
 )
 
+# Индекс правил для RAG (день 22, §9.1) — один на процесс, рядом с хранилищами:
+# каждый агент получает тот же объект. Путь — `presets.RAG_INDEX_DB`,
+# перекрывается `TOOMANYRULES_RAG_INDEX` (свой экземпляр и проверка сбоев);
+# индекс автора приложение только читает. Модель эмбеддингов не скачивается из
+# приложения (`allow_download=False`) и загружается при первом поиске, а не при
+# старте: строка ниже — по `info()`, без модели.
+RULES_INDEX = RulesIndex(
+    Path(os.environ.get("TOOMANYRULES_RAG_INDEX") or RAG_INDEX_DB).expanduser(),
+    RAG_SEARCH_STRATEGY, RAG_SEARCH_LANG, RAG_TOP_K,
+    allow_download=False, expected_model=RAG_EMBED_MODEL,
+)
+_rag_start = RULES_INDEX.info()
+if _rag_start["ok"]:
+    logger.info(
+        "RAG при старте: индекс %s · собран %s · %s/%s — %d кусков из %d · модель %s "
+        "загрузится при первом поиске",
+        _rag_start["path"], _rag_start["built_at"][:16].replace("T", " "),
+        _rag_start["strategy"], _rag_start["lang"], _rag_start["chunks"],
+        _rag_start["total"], _rag_start["model"],
+    )
+else:
+    logger.warning(
+        "RAG при старте: %s; ходы с RAG пойдут без выдержек", _rag_start["error"],
+    )
+
 # Сколько агентов поднялось из файлов при старте процесса — заполняется
 # `_restore_agents()` ниже и показывается в строке статуса при открытии
 # страницы.
@@ -535,6 +579,10 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
         # показать, на чём оборвалось, больше негде.
         if last_call.get("rounds"):
             lines += ["", _rounds_line(last_call)]
+        # Поиск выдержек (день 22) — прошёл до упавшего вызова.
+        rag_lines = _rag_metric_lines(last_call)
+        if rag_lines:
+            lines += ["", *rag_lines]
         return "\n".join(lines)
     request = last_call.get("request_tokens") or {}
     estimated_prompt = request.get("total")
@@ -589,6 +637,7 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
     ]
     if rounds:
         lines.append(_rounds_line(last_call))
+    lines += _rag_metric_lines(last_call)
     lines += _service_lines(last_call.get("service_call"))
     # Страж инвариантов (день 14, §8.6) — перед разбором памяти, в порядке
     # служебных работ хода.
@@ -598,6 +647,22 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
     lines += _task_tracker_lines(last_call)
     lines += _sampling_lines(last_call)
     return "\n".join(lines)
+
+
+def _rag_metric_lines(last_call: dict) -> list[str]:
+    """Строка RAG в «Последнем вызове» (день 22, §7): корзина «RAG (выдержки)»
+    рядом с фактом хода. Ход без RAG — строки нет."""
+    rag = last_call.get("rag")
+    if not rag:
+        return []
+    if not rag["ok"]:
+        return [f"- **📚 RAG (выдержки):** ⚠️ {rag['error']} — запрос ушёл без выдержек"]
+    loaded = f" (загрузка модели {rag['load_s']:.1f} с)" if rag["load_s"] else ""
+    return [
+        f"- **📚 RAG (выдержки):** ≈{_fmt_int(rag['tokens'])} токенов в запросе, "
+        f"{len(rag['hits'])} из {_fmt_int(rag['total'])} кусков, поиск "
+        f"{rag['elapsed']:.2f} s{loaded}"
+    ]
 
 
 def _rounds_word(count: int) -> str:
@@ -919,6 +984,7 @@ def _context_md(
     calibration: float | None,
     calibration_calls: int,
     question: str,
+    rag_state: dict | None = None,
 ) -> str:
     """Блок «Бюджет контекста»: сколько уйдёт в модель, если отправить сейчас.
 
@@ -949,6 +1015,7 @@ def _context_md(
         f"{_fmt_int(request['working'])} + задача {_fmt_int(request['task'])} + "
         f"память стратегии {_fmt_int(request['memory'])} + история "
         f"{_fmt_int(request['history'])} ({len(request['per_message'])} сообщ.) + "
+        f"RAG (выдержки) {_fmt_int(request['rag'])} + "
         f"вопрос {_fmt_int(request['question'])} + схемы инструментов "
         f"{_fmt_int(request['tools'])} + служебные "
         f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(request['total'])}**",
@@ -989,6 +1056,14 @@ def _context_md(
             "ещё не было"
         ),
     ]
+    # Выдержки RAG (день 22, §6.3): панель до вопроса их не знает — поиск
+    # грузит модель, а чистые методы в сеть и за моделью не ходят.
+    if rag_state is not None and rag_state["enabled"]:
+        lines.append(
+            "- **RAG (выдержки) в запросе:** выдержки подбираются по вопросу — до "
+            "вопроса оценки нет; часть RAG в эту сумму не входит, факт хода — в "
+            "«Последнем вызове» и блоке дня 22"
+        )
     if question:
         lines.append(
             f"- **В поле ввода:** ≈{_fmt_int(request['question'])} токенов — "
@@ -1069,6 +1144,7 @@ def _flow_md(view: dict, totals: dict, model: str) -> str:
         f"{_fmt_int(request['working'])} + задача {_fmt_int(request['task'])} + "
         f"{memory_name} {_fmt_int(request['memory'])} + "
         f"{view['sent_messages']} сообщ. истории {_fmt_int(request['history'])} + "
+        f"RAG (выдержки) {_fmt_int(request['rag'])} + "
         f"вопрос {_fmt_int(request['question'])} + схемы инструментов "
         f"{_fmt_int(request['tools'])} (по каталогу прошлого хода) + служебные "
         f"{_fmt_int(request['overhead'])} ≈ **{_fmt_int(estimated)}**",
@@ -2466,6 +2542,158 @@ def _tools_md(state: dict) -> str:
     return "\n\n".join(lines)
 
 
+# --- Блок «RAG: первый запрос (день 22)» (§9.3) -----------------------------
+# Всё берётся из `debug_state()["rag"]` и ответа агента: своей копии выдачи у
+# интерфейса нет. Код не оценивает ответы — «найден» относится только к выдаче
+# и ожидаемым источникам (`rag_search.sources_found()`), оценка за автором.
+
+def _rag_in_request_update(state: dict) -> dict:
+    """Переключатель «RAG: выдержки из правил в запросе» (день 22, §9.2):
+    значение и активность подтягиваются к агенту; нет `Retriever` — неактивен."""
+    rag = state["rag"]
+    return gr.update(value=rag["enabled"], interactive=rag["available"])
+
+
+def _hit_pages(hit: dict) -> str:
+    first, last = hit["page_from"], hit["page_to"]
+    return str(first) if first == last else f"{first}–{last}"
+
+
+def _rag_place_text(source: tuple, place: int | None) -> str:
+    doc, section, page = source
+    mark = f"место {place} ✓" if place is not None else "не в выдаче"
+    return f"`{doc}` · «{_md_cell(section)}» · стр. {page} — {mark}"
+
+
+def _rag_control_lines(question: str, rag: dict | None, turn_seen: bool) -> list[str]:
+    """Если вопрос хода — контрольный (текст совпал с `RAG_CONTROL_QUESTIONS`):
+    номер, что проверяет, ожидание и ожидаемые источники с местом в выдаче.
+    Ход без RAG — «поиска не было»; ответ модели не оценивается."""
+    control = next((q for q in RAG_CONTROL_QUESTIONS if q["question"].strip() == question.strip()), None)
+    if control is None or not turn_seen:
+        return []
+    lines = [
+        "",
+        f"**Контрольный вопрос {control['id']}** — проверяет: {control['checks']}.",
+        "",
+        f"- **Ожидание:** {control['expected']}.",
+    ]
+    if not control["sources"]:
+        lines.append("- **Ожидаемые источники:** нет — вопрос вне корпуса.")
+    elif rag is None:
+        lines.append("- **Ожидаемые источники:** поиска не было (ход без RAG).")
+    elif not rag["ok"]:
+        lines.append("- **Ожидаемые источники:** выдачи нет — поиск не удался.")
+    else:
+        lines.append("- **Ожидаемые источники в выдаче:**")
+        places = sources_found(rag["hits"], control["sources"])
+        lines += [
+            f"  - {_rag_place_text(source, place)}"
+            for source, place in zip(control["sources"], places, strict=True)
+        ]
+    lines.append(
+        "\n_«Найден» — только про выдачу. Совпадение ответа с ожиданием, верность "
+        "ссылок и выдумки оценивает человек._"
+    )
+    return lines
+
+
+def _rag_md(state: dict) -> str:
+    """Блок «RAG последнего хода» (день 22, §9.3)."""
+    rag_state = state["rag"]
+    lines = ["### RAG последнего хода", ""]
+    if not rag_state["available"]:
+        return "\n".join(lines + ["У агента нет поиска по индексу — запрос как на дне 20."])
+
+    info = RULES_INDEX.info()
+    if info["ok"]:
+        lines.append(
+            f"- **Индекс:** `{info['path']}` · собран {info['built_at'][:16].replace('T', ' ')} · "
+            f"{info['strategy']}/{info['lang']} — {info['chunks']} кусков из {info['total']} · "
+            f"top-{info['top_k']} · модель `{info['model']}`"
+        )
+    else:
+        lines.append(f"- **Индекс:** ⚠️ {info['error']}")
+    lines.append(
+        "- **Режим:** с RAG ✓" if rag_state["enabled"]
+        else "- **Режим:** без RAG — флажок снят"
+    )
+    tools = state["tools"]
+    if tools is not None and tools["in_request"]:
+        lines.append(
+            "- ⚠️ **Инструменты MCP включены:** FAQ издателя подмешивается в ответ — "
+            "для сравнения «общие знания» и «по правилам» выключите их"
+        )
+
+    last_call = state["last_call"]
+    last = rag_state["last"]
+    if last_call is None and last is None:
+        lines += ["", "Ходов ещё не было. Поиск идёт на каждом ходе с включённым RAG, "
+                      "до вызова модели; порога близости нет."]
+        return "\n".join(lines)
+
+    if last is not None:
+        question = last["question"]
+    elif last_call is not None and last_call["ok"] and len(state["messages"]) >= 2:
+        question = state["messages"][-2]["content"]
+    else:
+        question = ""
+    lines += ["", f"- **Вопрос последнего хода:** {_md_cell(question) or '—'}"]
+
+    if last is None:
+        lines.append("- **Поиск:** не было — последний ход без RAG (флажок снят).")
+        lines += _rag_control_lines(question, None, True)
+        return "\n".join(lines)
+    if not last["ok"]:
+        lines.append(
+            f"- ⚠️ **Поиск не удался:** {last['error']} — запрос ушёл без выдержек."
+        )
+        lines += _rag_control_lines(question, last, True)
+        return "\n".join(lines)
+
+    rounds = (last_call or {}).get("rounds") or []
+    first_prompt = rounds[0]["prompt_tokens"] if rounds else (last_call or {}).get("prompt_tokens")
+    loaded = f" (загрузка модели {last['load_s']:.1f} с)" if last["load_s"] else ""
+    lines.append(
+        f"- **Поиск:** {last['elapsed']:.2f} с{loaded} · {len(last['hits'])} из "
+        f"{_fmt_int(last['total'])} кусков · выдержки ≈{_fmt_int(last['tokens'])} токенов "
+        f"(оценка) при `prompt_tokens` хода {_fmt_int(first_prompt)}"
+        + (" (первый раунд)" if len(rounds) > 1 else "")
+    )
+    table = [
+        "| место | близость | документ | раздел | страницы | токенов |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for place, hit in enumerate(last["hits"], 1):
+        section = _md_cell(hit["section"]) + (f" (часть {hit['part']})" if hit.get("part") else "")
+        table.append(
+            f"| {place} | {hit['score']:.3f} | {_md_cell(hit['doc'])} | {section} | "
+            f"{_hit_pages(hit)} | {hit['tokens']} |"
+        )
+    lines += ["", "\n".join(table)]
+    lines += _rag_control_lines(question, last, True)
+    return "\n".join(lines)
+
+
+def _rag_message_update(state: dict) -> dict:
+    """Последнее сообщение запроса целиком (выдержки + вопрос) — то самое
+    «объединение с вопросом» (§9.3). Рядом со «Стеком сообщений агента», где тот
+    же ход — чистый вопрос."""
+    last = state["rag"]["last"]
+    if last is not None and last["message"]:
+        return gr.update(
+            value=last["message"],
+            label=f"Последнее сообщение запроса целиком · ≈{_fmt_int(last['tokens'])} токенов выдержек + вопрос",
+        )
+    if last is not None and not last["ok"]:
+        note = "Поиск не удался — последнее сообщение запроса ушло чистым вопросом."
+    elif state["last_call"] is not None:
+        note = "Последний ход без RAG — последнее сообщение запроса ушло чистым вопросом."
+    else:
+        note = ""
+    return gr.update(value=note, label="Последнее сообщение запроса целиком (выдержки + вопрос)")
+
+
 def _tools_json(state: dict) -> list[dict]:
     """Результаты инструментов последнего хода (день 17, §8.3) — ровно то,
     что ушло модели сообщениями `tool`."""
@@ -2589,10 +2817,10 @@ def _profile_choice_options(choices: list[str]) -> list[tuple[str, str]]:
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 37 значений
+    """Полный вид на состояние агента — фиксированный кортеж из 40 значений
     (18 — до дня 10, 22 — до дня 11, 26 — до дня 12, 29 — до дня 13, 31 — до
-    дня 14, 34 — до дня 17; дни 14 и 17 добавляют по три), позиционно
-    раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
+    дня 14, 34 — до дня 17, 37 — до дня 22; дни 14, 17 и 22 добавляют по три),
+    позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
     Значения всех выпадающих списков — тоже часть вида: иначе после
@@ -2661,6 +2889,7 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
             state["calibration"],
             state["totals"]["calibration_calls"],
             question,
+            state["rag"],
         ),
         # 15. рост по ходам: таблица из журнала агента
         gr.update(value=_turns_table(state["turns"])),
@@ -2759,6 +2988,14 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         _tools_md(state),
         # 37. результаты инструментов последнего хода — что ушло модели
         _tools_json(state),
+        # Значения дня 22 — в конце кортежа и в конце VIEW_OUTPUTS (§9.3).
+        # 38. переключатель «RAG: выдержки из правил в запросе» — значение и
+        #     активность подтянуты к агенту; нет `Retriever` — неактивен
+        _rag_in_request_update(state),
+        # 39. блок «RAG последнего хода»
+        _rag_md(state),
+        # 40. последнее сообщение запроса целиком — выдержки + вопрос
+        _rag_message_update(state),
     )
 
 
@@ -2810,6 +3047,10 @@ def _new_agent(preset_name: str) -> Agent:
         # Потолки сэмплинга — из `presets.py` (день 19, §8.2).
         sampling_max_tokens=SAMPLING_MAX_TOKENS,
         sampling_max_chars=SAMPLING_MAX_CHARS,
+        # Поиск выдержек — один `RulesIndex` на процесс, инструкция — из
+        # `presets.py` (день 22, §9.1). Ветку `fork()` собирает с теми же.
+        retriever=RULES_INDEX,
+        rag_instruction=RAG_INSTRUCTION,
     )
 
 
@@ -2899,6 +3140,9 @@ def _restore_agents() -> int:
             tool_result_max_chars=TOOL_RESULT_MAX_CHARS,
             sampling_max_tokens=SAMPLING_MAX_TOKENS,
             sampling_max_chars=SAMPLING_MAX_CHARS,
+            # RAG включён у восстановленного агента, как у нового (день 22, §2.5).
+            retriever=RULES_INDEX,
+            rag_instruction=RAG_INSTRUCTION,
         )
         restored += 1
     logger.info(
@@ -3780,6 +4024,34 @@ def on_tools_in_request(agent: Agent | None, enabled: bool, preset_name: str):
         status = (
             "Инструменты MCP в запросе: выключено. Запрос как на дне 16 — без "
             "каталога и схем, модель отвечает из общих знаний."
+        )
+    return (agent, gr.update(), *_view(agent, status))
+
+
+def on_rag_in_request(agent: Agent | None, enabled: bool, preset_name: str):
+    """«RAG: выдержки из правил в запросе» (день 22, §9.2) — включено: перед
+    каждым ответом приложение ищет в индексе правил ближайшие куски и
+    прикладывает их к вопросу; выключено: поиска нет вовсе, запрос как на
+    дне 20. Нового агента не создаёт и ничего не пишет."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    agent.set_rag_in_request(bool(enabled))
+    if agent.rag_in_request:
+        status = (
+            f"RAG включён: со следующего вопроса перед ответом — поиск {RAG_TOP_K} "
+            "ближайших кусков правил (по структуре, русские) и выдержки в запросе."
+        )
+    else:
+        status = (
+            "RAG выключен: со следующего вопроса поиска нет — модель отвечает без "
+            "выдержек, как на дне 20."
+        )
+    tools = agent.debug_state()["tools"]
+    if tools is not None and tools["in_request"]:
+        status += (
+            " Инструменты MCP включены — для сравнения «общие знания» и «по "
+            "правилам» выключите и их."
         )
     return (agent, gr.update(), *_view(agent, status))
 
@@ -4835,6 +5107,24 @@ _ORCHESTRATION_SCENARIO_LABELS: list[str] = [
 ]
 
 
+# --- Контрольные вопросы дня 22: подписи для gr.Examples (§9.4) -------------
+# Тексты — `presets.RAG_CONTROL_QUESTIONS`; подписи — здесь, как у сценариев
+# дней 13-20.
+_RAG_QUESTION_LABELS: list[str] = [
+    "К1 · колода встреч",
+    "К2 · Провокация",
+    "К3 · сила злодеев",
+    "К4 · ловкость",
+    "К5 · нокаут",
+    "К6 · фаза восстановления",
+    "К7 · отравление поверх отравления",
+    "К8 · сколько трофеев",
+    "К9 · first turn (EN)",
+    "К10 · Undertow (вне правил)",
+]
+assert len(_RAG_QUESTION_LABELS) == len(RAG_CONTROL_QUESTIONS)
+
+
 # Чат и дебаг-панель — ровно пополам; кнопки компактнее дефолтных.
 APP_CSS = """
 button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8px !important; min-height: 28px !important; }
@@ -4843,16 +5133,13 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 20, неделя 4 — **оркестрация MCP**: у агента три сервера, по "
-        "одному на источник или назначение — **официальный FAQ издателя** "
-        "(английский), **фанатская вики** (русский справочник по гирлокам, "
-        "плохишам и коробкам) и **файлы**. Какой сервер и какой инструмент "
-        "звать, модель решает сама — **по описаниям инструментов**, роутера "
-        "в коде нет — и одной просьбой ведёт длинный флоу через несколько "
-        "серверов: вики → FAQ → файл. FAQ доступен всегда: свежая копия — "
-        "ответ из неё, пустая или устаревшая — с сайта, а копия докачивается "
-        "в фоне; сервер FAQ приложение **поднимает само**, если его порт "
-        "молчит."
+        "День 22, неделя 5 — **первый RAG-запрос**: перед ответом ассистент "
+        "ищет в индексе правил дня 21 (нарезка по структуре) пять кусков, "
+        "ближайших к вопросу, прикладывает их к вопросу **выдержками со "
+        "ссылками** на документ, раздел и страницу и только потом зовёт "
+        "модель. У агента **два режима — с RAG и без**: переключатель слева; "
+        "для сравнения — **10 контрольных вопросов** с ожиданиями и "
+        "источниками (у поля ввода) и программа `./run.sh rag-eval`."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -4914,7 +5201,22 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "своим файлом, своей стратегией и своими счётчиками."
                 ),
             )
-            # «Инструменты MCP в запросе» (день 17, §8.2) — первым из
+            # «RAG: выдержки из правил в запросе» (день 22, §9.2) — первым из
+            # переключателей запроса, над инструментами MCP. Событие — `input`
+            # (правило флажков), значение и активность — из `_view()`.
+            rag_in_request_checkbox = gr.Checkbox(
+                value=True,
+                label="RAG: выдержки из правил в запросе",
+                info=(
+                    f"Включено — перед каждым ответом приложение ищет в индексе "
+                    f"правил {RAG_TOP_K} ближайших кусков (по структуре, русские) и "
+                    "прикладывает их к вопросу выдержками; выключено — модель "
+                    "отвечает без выдержек, как на дне 20. Для сравнения "
+                    "выключите и инструменты MCP: иначе FAQ издателя "
+                    "подмешивается в оба режима."
+                ),
+            )
+            # «Инструменты MCP в запросе» (день 17, §8.2) — теперь вторым из
             # переключателей запроса, над слоями памяти: инструменты — не блок
             # сообщений, а отдельный параметр запроса. Событие — `input`
             # (правило флажков), значение и активность — из `_view()`.
@@ -5002,17 +5304,17 @@ with gr.Blocks(title="TooManyRules") as demo:
                 placeholder="Например: из каких фаз состоит ход игрока?",
                 lines=2,
             )
-            # Сценарий дня 20 (§8.3, §9.3) — у поля ввода, в кадре. Клик
-            # кладёт текст в поле, отправляет человек. Порядок важен: прогон
-            # начинается на пустой базе FAQ.
+            # Контрольные вопросы дня 22 (§9.4) — у поля ввода, в кадре. Клик
+            # кладёт текст в поле, отправляет человек; каждый вопрос — новому
+            # агенту (кнопка «Новый агент»), в каждом режиме.
             gr.Examples(
-                examples=[[text] for text in ORCHESTRATION_SCENARIO],
+                examples=[[q["question"]] for q in RAG_CONTROL_QUESTIONS],
                 inputs=[question_input],
-                example_labels=_ORCHESTRATION_SCENARIO_LABELS,
-                examples_per_page=len(ORCHESTRATION_SCENARIO),
+                example_labels=_RAG_QUESTION_LABELS,
+                examples_per_page=len(RAG_CONTROL_QUESTIONS),
                 label=(
-                    "Сценарий дня 20 (О1 — на пустой базе FAQ, затем повторить О1 "
-                    "после строки «снимок #1: 82 статьи» в терминале)"
+                    "Контрольные вопросы дня 22 — каждый задавайте новому агенту; "
+                    "для сравнения выключите инструменты MCP"
                 ),
             )
             with gr.Row():
@@ -5223,9 +5525,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                 )
 
             # Свёрнуто: сценарии прошлых дней. У дня 16 сценария в чате не
-            # было, сценарий дня 20 стоит у поля ввода (правило «на экране —
-            # текущий день»).
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-19)", open=False):
+            # было, контрольные вопросы дня 22 стоят у поля ввода (правило «на
+            # экране — текущий день»).
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-20)", open=False):
                 gr.Examples(
                     examples=[
                         ["Из каких фаз состоит ход игрока?"],
@@ -5369,18 +5671,60 @@ with gr.Blocks(title="TooManyRules") as demo:
                     label="Сценарий дня 19 (ожидания — для инструментов дня 19)",
                 )
 
+                # Сценарий дня 20 (§8.3, §9.3): О1-О6. С дня 22 свёрнут вместе с
+                # остальными прошлыми днями. Порядок важен: прогон начинается на
+                # пустой базе FAQ.
+                gr.Examples(
+                    examples=[[text] for text in ORCHESTRATION_SCENARIO],
+                    inputs=[question_input],
+                    example_labels=_ORCHESTRATION_SCENARIO_LABELS,
+                    examples_per_page=len(ORCHESTRATION_SCENARIO),
+                    label=(
+                        "Сценарий дня 20 (О1 — на пустой базе FAQ, затем повторить О1 "
+                        "после строки «снимок #1: 82 статьи» в терминале)"
+                    ),
+                )
+
 
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # Оркестрация MCP (день 20, §8.2) — развёрнут в кадр, над блоком
-            # дня 19. Описание — статичный Markdown; каталог группы по кнопке
+            # RAG: первый запрос (день 22, §9.3) — развёрнут наверху панели.
+            # Описание — статичный Markdown; «RAG последнего хода» и последнее
+            # сообщение запроса целиком — выходы `_view()` (38-40).
+            with gr.Accordion("RAG: первый запрос (день 22)", open=True):
+                gr.Markdown(
+                    "**Цепочка одного хода:** вопрос → *поиск* пяти ближайших "
+                    "кусков индекса правил → *выдержки + вопрос* одним "
+                    "сообщением → модель. Выдержки — часть последнего сообщения "
+                    "запроса, перед вопросом; **в историю идёт только вопрос**, "
+                    "ниже это видно рядом со «Стеком сообщений агента». Поиск — "
+                    "работа кода, а не решение модели: он идёт на каждом ходе с "
+                    "включённым RAG, порога близости нет, лишние выдержки "
+                    "отсекает модель по инструкции. **Качество ответов оценивает "
+                    "человек**, код сверяет только выдачу с ожидаемыми "
+                    "источниками контрольных вопросов."
+                )
+                rag_md = gr.Markdown("")
+                with gr.Accordion(
+                    "Последнее сообщение запроса целиком (выдержки + вопрос)", open=False
+                ):
+                    rag_message_box = gr.Textbox(
+                        label="Последнее сообщение запроса целиком (выдержки + вопрос)",
+                        lines=12,
+                        max_lines=40,
+                        interactive=False,
+                        buttons=["copy"],
+                    )
+            # Оркестрация MCP (день 20, §8.2) — с дня 22 свёрнут под блоком
+            # дня 22 (§9.4); «Инструменты последнего хода» остаются в нём: день 22
+            # не про инструменты, а сравнение идёт без них. Описание — статичный Markdown; каталог группы по кнопке
             # — вне `_view()` (свои выходы `GROUP_MCP_OUTPUTS`); «Инструменты
             # последнего хода» и JSON результатов переехали сюда из блока дня
             # 19 — те же компоненты и выходы `_view()` (правило дня 18: блок
             # вызовов агента живёт в блоке текущего дня), внутри Markdown —
             # строки «Серверы» и «Маршрут», колонки «сервер» и «откуда».
-            with gr.Accordion("Оркестрация MCP: три сервера (день 20)", open=True):
+            with gr.Accordion("Оркестрация MCP: три сервера (день 20)", open=False):
                 gr.Markdown(
                     "**Три сервера — три назначения.** `watch` — официальный "
                     "FAQ издателя на английском: копия в SQLite и сайт; свежая "
@@ -5776,6 +6120,9 @@ with gr.Blocks(title="TooManyRules") as demo:
         tools_in_request_checkbox,
         tools_md,
         tools_json,
+        rag_in_request_checkbox,
+        rag_md,
+        rag_message_box,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
     # Выходы формы редактора профиля (день 12, §7.3) — отдельно от
@@ -6007,6 +6354,14 @@ with gr.Blocks(title="TooManyRules") as demo:
     tools_in_request_checkbox.input(
         on_tools_in_request,
         inputs=[agent_state, tools_in_request_checkbox, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+    # «RAG: выдержки из правил в запросе» (день 22, §9.2) — `input`, тем же
+    # правилом: один запрос на клик, на обновление значения из `_view()` не
+    # приходит.
+    rag_in_request_checkbox.input(
+        on_rag_in_request,
+        inputs=[agent_state, rag_in_request_checkbox, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
 
