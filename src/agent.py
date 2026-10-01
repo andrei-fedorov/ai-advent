@@ -127,6 +127,7 @@ from openai import OpenAI
 import context
 import invariants
 import memory
+import rag_answer
 import task_state
 import tokens
 import user_profile
@@ -347,6 +348,9 @@ class ModelRound:
     finish_reason: str | None
     tool_calls: int                 # сколько вызовов попросила модель в этом раунде
     tool_choice: str = ""           # "none" — финальный раунд после потолка
+    # Поле дня 24 (§4.1) — в конце: раунд — повтор формата ответа RAG. Тот же
+    # ответ на тот же вопрос, а не служебная работа: своих счётчиков нет.
+    repair: bool = False
 
 
 @dataclass(frozen=True)
@@ -411,6 +415,24 @@ class RagRecord:
     rerank_s: float = 0.0
     rerank_load_s: float = 0.0
     candidates: tuple[dict, ...] = ()
+    # Поля дня 24 (§4.1) — в конце и с умолчаниями. `answer` — итоговая проверка
+    # ответа (`None` — проверки не было: нет формата, или в последнем сообщении
+    # не было части RAG, или ход оборвался), `answer_first` — первая попытка,
+    # если был повтор формата, `repair_note` — почему повтора не было, хотя
+    # нарушения есть (какое условие §2.4 не выполнено), или почему он не удался;
+    # пусто — повтор не требовался или прошёл. `repair_message` — сообщение
+    # повтора, как ушло в модель (и у неудавшегося повтора; пусто — повтора не
+    # было): панель показывает отправленный текст, а не собирает его заново
+    # (правка по ревью).
+    answer: "rag_answer.AnswerCheck | None" = None
+    answer_first: "rag_answer.AnswerCheck | None" = None
+    repair_note: str = ""
+    repair_message: str = ""
+
+    @property
+    def repaired(self) -> bool:
+        """Повтор формата был и дал ответ хода."""
+        return self.answer_first is not None
 
     @property
     def empty(self) -> bool:
@@ -432,6 +454,10 @@ class AgentReply:
     стриминга)."""
 
     ok: bool
+    # С дня 24 (§4.1) у хода с проверкой ответа RAG `text` меняет смысл один
+    # раз: это ответ, собранный кодом (текст модели + «Источники:» + «Цитаты:»),
+    # ровно то, что ушло в историю и чат; ответ модели как пришёл — в
+    # `rag.answer.raw`.
     text: str
     error: str | None
     finish_reason: str | None
@@ -1096,6 +1122,12 @@ class Agent:
         rag_rewrite_prompt: str = "",
         rag_rewrite_max_tokens: int = 100,
         rag_empty_instruction: str = "",
+        # Параметры дня 24 (§4.1) — снова в конце, с умолчаниями: `None` —
+        # проверки и сборки ответа нет, ход как на дне 23; пустая инструкция
+        # повтора — повтора формата нет. Настоящие передаёт `app.py` из
+        # `presets.py`.
+        rag_answer_format: "rag_answer.AnswerFormat | None" = None,
+        rag_repair_instruction: str = "",
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -1152,6 +1184,11 @@ class Agent:
         self._rag_empty_instruction = rag_empty_instruction
         self._rag_rewrite: bool = True
         self._rag_rerank: bool = True
+        # Ответ с источниками и цитатами (день 24): маркеры формата и
+        # инструкция повтора — настройки агента, как инструкции выше: на диск
+        # не едут, в checkpoint не входят, ветка получает те же.
+        self._rag_answer_format = rag_answer_format
+        self._rag_repair_instruction = rag_repair_instruction
         # Схемы последнего успешно полученного каталога — только для оценки
         # корзины `tools` в панели до вопроса (§5.4): чистые методы в сеть не
         # ходят. На ход каталог запрашивается заново; это не кэш каталога.
@@ -1841,6 +1878,86 @@ class Agent:
 
         choice = response.choices[0]
         text = choice.message.content or ""
+        # Проверка ответа RAG и повтор формата (день 24, §2.1, §4.2): после
+        # цикла раундов и до записи в историю, под тем же замком. Только у
+        # хода, в последнем сообщении которого была часть RAG — выдержки или
+        # «подходящих не найдено»; иначе проверять нечего. Повтор — ещё один
+        # раунд основного запроса, а не служебная работа: тот же ответ на тот
+        # же вопрос. Его сбой ход не отменяет (ответ уже есть).
+        model_text = text
+        answer: "rag_answer.AnswerCheck | None" = None
+        answer_first: "rag_answer.AnswerCheck | None" = None
+        repair_note = ""
+        repair_message = ""
+        answer_fmt = self._rag_answer_format
+        if rag is not None and answer_fmt is not None and (rag_hits or rag_empty):
+            answer = rag_answer.check(text, rag_hits, rag_empty, answer_fmt)
+            if answer.ok:
+                self._log_answer(answer, rag, "ответ")
+            else:
+                blocked = self._repair_blocked(rag, rag_hits, calls)
+                if blocked:
+                    repair_note = "не применяется: " + blocked
+                    self._log_answer(answer, rag, "ответ", f"повтора нет: {blocked}")
+                else:
+                    number = len(rounds) + 1
+                    self._log_answer(
+                        answer, rag, "ответ", f"повтор формата (раунд {number})"
+                    )
+                    repair_message = rag_answer.repair_message(
+                        answer, self._rag_repair_instruction
+                    )
+                    retry, retry_round, retry_elapsed, retry_error = self._run_repair(
+                        client, messages, text, repair_message, specs, number
+                    )
+                    model_elapsed += retry_elapsed
+                    if retry_round is None:
+                        repair_note = "не удался: " + retry_error
+                    else:
+                        rounds.append(retry_round)
+                        cache_hit.append(getattr(retry.usage, "prompt_cache_hit_tokens", None))
+                        cache_miss.append(getattr(retry.usage, "prompt_cache_miss_tokens", None))
+                        retry_message = retry.choices[0].message
+                        retry_reasoning = getattr(retry_message, "reasoning_content", None) or ""
+                        if retry_reasoning:
+                            reasonings.append((number, retry_reasoning))
+                        retry_text = retry_message.content or ""
+                        # Раунд повтора — последний раунд хода: его
+                        # `finish_reason` и его текст для оценки ответа (правило
+                        # дня 17), даже если текст пуст и ответом остаётся
+                        # первый — иначе оценка первой попытки сравнивалась бы с
+                        # `completion_tokens` повтора (правка по ревью).
+                        choice = retry.choices[0]
+                        model_text = retry_text
+                        if not retry_text.strip():
+                            repair_note = "не удался: повтор вернул пустой ответ — остаётся первый"
+                            logger.warning(
+                                "[%s] RAG, повтор формата: ⚠️ не удался (пустой ответ) — "
+                                "остаётся первый ответ", self._log_name,
+                            )
+                        else:
+                            text = retry_text
+                            answer_first, answer = answer, rag_answer.check(
+                                retry_text, rag_hits, rag_empty, answer_fmt
+                            )
+                            self._log_answer(
+                                answer, rag, "ответ после повтора",
+                                f"{retry_round.elapsed:.2f} с · "
+                                f"≈{_num((retry_round.prompt_tokens or 0) + (retry_round.completion_tokens or 0))} ток. · "
+                                f"{_cost_str(retry_round.cost_usd)}",
+                            )
+            # Ответ игроку собирает код: текст модели, «Источники:» по
+            # метаданным куска и «Цитаты:» с пометками. Он же уходит в историю
+            # и в чат; ответ модели как пришёл — `rag.answer.raw`.
+            text = rag_answer.render(
+                answer, rag_hits, answer_fmt,
+                rag.threshold if rag.rerank_ok else None, rag.best,
+            )
+            rag = replace(
+                rag, answer=answer, answer_first=answer_first, repair_note=repair_note,
+                repair_message=repair_message,
+            )
+            self._last_rag = rag
         # reasoning_content отдаём в AgentReply для дебага, но в стек не
         # кладём (§5.6). Раундов несколько — рассуждения всех подряд, с
         # разделителями.
@@ -1878,7 +1995,7 @@ class Agent:
             model=self._config.model,
             agent_name=self._config.name,
             request_tokens=request,
-            estimated_completion_tokens=tokens.estimate_tokens(text),
+            estimated_completion_tokens=tokens.estimate_tokens(model_text),
             prompt_cache_hit_tokens=_sum_known(cache_hit),
             prompt_cache_miss_tokens=_sum_known(cache_miss),
             service_call=service,
@@ -2144,6 +2261,8 @@ class Agent:
 
         С дня 23 (§6.1) — и тот же промпт переписывания, потолок его ответа и
         инструкция пустой выдачи; оба пункта второго этапа у ветки включены.
+
+        С дня 24 (§4.1) — и те же маркеры формата ответа и инструкция повтора.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -2211,6 +2330,8 @@ class Agent:
             rag_rewrite_prompt=self._rag_rewrite_prompt,
             rag_rewrite_max_tokens=self._rag_rewrite_max_tokens,
             rag_empty_instruction=self._rag_empty_instruction,
+            rag_answer_format=self._rag_answer_format,
+            rag_repair_instruction=self._rag_repair_instruction,
         )
 
     @_locked
@@ -2766,6 +2887,14 @@ class Agent:
                 "rewrite": self.rag_rewrite,
                 "rerank": self.rag_rerank,
                 "rewrite_available": self._retriever is not None and bool(self._rag_rewrite_prompt),
+                # Ключи дня 24 (§4.3): проверка ответа включена (есть поиск и
+                # маркеры формата) и возможен ли повтор формата.
+                "format": self._retriever is not None and self._rag_answer_format is not None,
+                "repair": (
+                    self._retriever is not None
+                    and self._rag_answer_format is not None
+                    and bool(self._rag_repair_instruction)
+                ),
             },
         }
 
@@ -4195,6 +4324,118 @@ class Agent:
             self._log_name, self._retriever.name, stages, _num(rag.tokens), listed,
         )
 
+    def _repair_blocked(
+        self, rag: RagRecord, rag_hits: Sequence[dict], calls: Sequence[ToolCallRecord],
+    ) -> str:
+        """Почему повтора формата не будет, хотя у ответа есть нарушения (день
+        24, §2.4); `""` — повтор можно делать. Все четыре условия сразу:
+        реранкер подтвердил релевантность (второй этап удался и выдержки есть),
+        в ходе не было вызовов инструментов, у агента есть инструкция повтора.
+        Порядок проверки — порядок строк §4.3."""
+        if not rag_hits:
+            return "выдача пуста по порогу — код не отличает вопрос от реплики"
+        if not rag.rerank_ok:
+            return "второй этап не работал"
+        if calls:
+            return "в ходе вызывались инструменты MCP — проверка их результатов не видит"
+        if not self._rag_repair_instruction:
+            return "нет инструкции повтора"
+        return ""
+
+    def _run_repair(
+        self,
+        client: OpenAI,
+        messages: list[dict],
+        text: str,
+        repair_message: str,
+        specs: list[dict],
+        number: int,
+    ) -> tuple[object | None, ModelRound | None, float, str]:
+        """Повтор формата ответа RAG (день 24, §2.4) — один раунд основного
+        запроса: сообщения последнего раунда, ответ модели и сообщение повтора
+        со списком нарушений (`rag_answer.repair_message()`). Параметры — как у основного вызова; были схемы
+        инструментов — с ними и `tool_choice="none"`. Раунд учитывается в
+        счётчиках сразу, как раунды цикла (`_record_round()`). Сбой API ход не
+        отменяет: `(None, None, секунды, причина)`, ответ остаётся первым."""
+        retry_messages = messages + [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": repair_message},
+        ]
+        params: dict = {}
+        tool_choice = ""
+        if specs:
+            tool_choice = TOOL_CHOICE_NONE
+            params["tools"] = specs
+            params["tool_choice"] = tool_choice
+        started = time.perf_counter()
+        try:
+            response = client.chat.completions.create(
+                model=self._config.model,
+                messages=retry_messages,
+                extra_body={
+                    "thinking": {"type": "enabled" if self._config.thinking else "disabled"}
+                },
+                **self._optional_params(),
+                **params,
+            )
+        except Exception as exc:
+            elapsed = time.perf_counter() - started
+            reason = _shorten(str(exc), 200) or type(exc).__name__
+            logger.warning(
+                "[%s] RAG, повтор формата: ⚠️ не удался (%s) — остаётся первый ответ",
+                self._log_name, reason,
+            )
+            return None, None, elapsed, reason
+        elapsed = time.perf_counter() - started
+        choice = response.choices[0]
+        usage = response.usage
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        model_round = ModelRound(
+            number=number,
+            elapsed=elapsed,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=estimate_cost_usd(self._config.model, prompt_tokens, completion_tokens),
+            finish_reason=choice.finish_reason,
+            tool_calls=0,
+            tool_choice=tool_choice,
+            repair=True,
+        )
+        self._record_round(model_round, getattr(usage, "total_tokens", None))
+        return response, model_round, elapsed, ""
+
+    def _log_answer(
+        self, check: "rag_answer.AnswerCheck", rag: RagRecord, label: str, tail: str = "",
+    ) -> None:
+        """Строка проверки ответа RAG в лог (день 24, §4.3): вид, источники,
+        цитаты, «не знаю», нарушения; `tail` — повтор, его цена или причина,
+        почему повтора нет. С нарушениями — WARNING."""
+        if label == "ответ" and check.violations:
+            text = "⚠️ нарушения: " + "; ".join(check.violations)
+            if tail:
+                text += f" — {tail}"
+            logger.warning("[%s] RAG, %s: %s", self._log_name, label, text)
+            return
+        parts = [check.kind]
+        if check.empty:
+            best = rag.best
+            parts.append(
+                f"выдача пуста по порогу {rag.threshold:.2f}"
+                + (f" (лучший {best:.3f})" if best is not None else "")
+            )
+        elif check.sources:
+            parts.append("источники [" + ", ".join(str(n) for n in check.sources) + "]")
+        if check.quotes:
+            parts.append(f"цитат {len(check.quotes)}, дословно {check.verbatim}")
+        if check.kind == rag_answer.KIND_IDK:
+            parts.append("уточняющий вопрос " + ("✓" if check.asks else "✗"))
+        parts.append("⚠️ нарушения: " + "; ".join(check.violations) if check.violations else "нарушений нет")
+        if tail:
+            parts.append(tail)
+        log = logger.warning if check.violations else logger.info
+        log("[%s] RAG, %s: %s", self._log_name, label, " · ".join(parts))
+
     def _tool_catalog(self) -> tuple[list[dict], str, float]:
         """Каталог инструментов на ход (день 17, §5.3): схемы в формате
         function calling, заметка для ответа и панели и время подключения.
@@ -5463,11 +5704,29 @@ def _route_update(choice: "user_profile.ModeChoice") -> str:
     return f"«{choice.mode}» — {choice.note}"
 
 
+def _answer_dict(check: "rag_answer.AnswerCheck | None") -> dict | None:
+    """`AnswerCheck` словарём для панели — с его свойствами `ok`, `sources` и
+    `verbatim` (день 24, §4.3): `asdict()` свойств не видит."""
+    if check is None:
+        return None
+    return {
+        **asdict(check), "ok": check.ok, "sources": list(check.sources), "verbatim": check.verbatim,
+    }
+
+
 def _rag_dict(record: RagRecord) -> dict:
     """`RagRecord` словарём для панели — с его свойствами `empty` и `best` (день
     23, §6.6): `asdict()` свойств не видит, и без них панели пришлось бы
-    повторять их определения (правка по ревью дня 23)."""
-    return {**asdict(record), "empty": record.empty, "best": record.best}
+    повторять их определения (правка по ревью дня 23). С дня 24 — и проверки
+    ответа (`answer`, `answer_first`) со своими свойствами, и `repaired`."""
+    return {
+        **asdict(record),
+        "empty": record.empty,
+        "best": record.best,
+        "answer": _answer_dict(record.answer),
+        "answer_first": _answer_dict(record.answer_first),
+        "repaired": record.repaired,
+    }
 
 
 def _reply_dict(reply: AgentReply) -> dict:

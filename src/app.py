@@ -123,6 +123,18 @@
 # показывается везде, где остальные. `_view()` — **41 значение** (+ группа
 # второго этапа). Уточняющие вопросы дня 23 — у поля ввода рядом с контрольными.
 #
+# День 24 (спецификация дня 24, §6) — источники, цитаты и «не знаю»: агенты
+# получают `RAG_ANSWER_FORMAT` и `RAG_REPAIR_INSTRUCTION` из `presets.py`; ответ
+# модели проверяет и собирает `rag_answer` внутри `Agent.ask()`, в историю и в
+# чат уходит собранный ответ («Источники:» и «Цитаты:» с пометками ⚠️). Блок
+# «RAG: источники, цитаты и «не знаю» (день 24)» развёрнут наверху панели —
+# описание, «Проверка ответа» (новое 42-е значение `_view()`) и переехавшие
+# «RAG последнего хода» и последнее сообщение запроса целиком; блок дня 23
+# свёрнут. Раунд повтора формата подписан в «Последнем вызове». У поля ввода —
+# контрольные вопросы дня 22 и вопросы проверки ответа (Н1, Н2, Ф1); уточняющие
+# дня 23 — в аккордеоне прошлых дней. Панель проверку только рисует: код
+# проверяет форму, смысл ответа сверяет человек.
+#
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
 # словами, текст памяти и числа. День 10 добавил в переключатель ещё две
@@ -242,6 +254,8 @@ from presets import (
     PRESETS,
     PROFILE_QUESTION,
     PROFILE_VARIANTS,
+    RAG_ANSWER_FORMAT,
+    RAG_ANSWER_QUESTIONS,
     RAG_CANDIDATES,
     RAG_CONTROL_QUESTIONS,
     RAG_EMBED_MODEL,
@@ -249,6 +263,7 @@ from presets import (
     RAG_FOLLOWUP_QUESTIONS,
     RAG_INDEX_DB,
     RAG_INSTRUCTION,
+    RAG_REPAIR_INSTRUCTION,
     RAG_RERANK_BATCH,
     RAG_RERANK_MAX_LENGTH,
     RAG_RERANK_MODEL,
@@ -307,6 +322,7 @@ from task_state import (
     STAGE_VALIDATION,
     TRANSITIONS,
 )
+from rag_answer import KIND_IDK, Quote, quote_mark
 from rag_search import RulesIndex, source_status
 from tokens import FILLER_MAX_TOKENS, estimate_tokens, filler_text
 from user_profile import (
@@ -750,7 +766,10 @@ def _rounds_line(last_call: dict) -> str:
     calls = last_call["tool_calls"]
     text = (
         f"- **🔁 Раундов:** {len(rounds)} ("
-        + ", ".join(str(r["finish_reason"]) for r in rounds)
+        + ", ".join(
+            str(r["finish_reason"]) + (" — повтор формата" if r.get("repair") else "")
+            for r in rounds
+        )
         + ")"
     )
     if calls:
@@ -2587,6 +2606,7 @@ def _tools_md(state: dict) -> str:
         lines.append(
             "Раунды: " + " · ".join(
                 f"{r['number']} — {r['finish_reason']}"
+                + (" (повтор формата)" if r.get("repair") else "")
                 + (" (tool_choice=none)" if r["tool_choice"] else "")
                 + f", prompt {_fmt_int(r['prompt_tokens'])}"
                 for r in rounds
@@ -2610,7 +2630,7 @@ def _tools_md(state: dict) -> str:
                 f"{_fmt_int(call['chars'])} символов больше потолка "
                 f"{_fmt_int(tools['result_max_chars'])}."
             )
-    if any(r["tool_choice"] for r in rounds):
+    if any(r["tool_choice"] and not r.get("repair") for r in rounds):
         warnings.append(
             f"⚠️ Потолок раундов ({tools['max_rounds']}): последний раунд — с "
             f"tool_choice=none, модель ответила тем, что уже собрала."
@@ -2676,17 +2696,23 @@ def _rag_place_text(source: tuple, rag: dict | None) -> str:
 
 
 def _rag_control_lines(question: str, rag: dict | None) -> list[str]:
-    """Если вопрос хода — контрольный (текст совпал с `RAG_CONTROL_QUESTIONS`)
-    или уточняющий (`RAG_FOLLOWUP_QUESTIONS`, день 23): номер, что проверяет,
+    """Если вопрос хода — контрольный (текст совпал с `RAG_CONTROL_QUESTIONS`),
+    уточняющий (`RAG_FOLLOWUP_QUESTIONS`, день 23) или вопрос проверки ответа
+    (`RAG_ANSWER_QUESTIONS`, день 24): номер, что проверяет,
     ожидание и ожидаемые источники с местом «до» и «после». Ход без RAG —
     «поиска не было»; ответ модели не оценивается."""
     control = next(
-        (q for q in (*RAG_CONTROL_QUESTIONS, *RAG_FOLLOWUP_QUESTIONS) if q["question"].strip() == question.strip()),
+        (
+            q for q in (*RAG_CONTROL_QUESTIONS, *RAG_FOLLOWUP_QUESTIONS, *RAG_ANSWER_QUESTIONS)
+            if q["question"].strip() == question.strip()
+        ),
         None,
     )
     if control is None:
         return []
-    if control.get("after"):
+    if control["id"] in {q["id"] for q in RAG_ANSWER_QUESTIONS}:
+        title = f"**Вопрос проверки ответа {control['id']}** — проверяет: {control['checks']}."
+    elif control.get("after"):
         title = (
             f"**Уточняющий вопрос {control['id']}** — задаётся после {control['after']} тем же агентом; "
             f"проверяет: {control['checks']}."
@@ -2887,6 +2913,176 @@ def _rag_md(state: dict) -> str:
     return "\n".join(lines)
 
 
+# --- Блок «RAG: источники, цитаты и «не знаю» (день 24)» (§6.3) -------------
+# Проверку ответа делает агент (`rag_answer.check()` внутри `ask()`), панель её
+# только рисует: берёт `debug_state()["rag"]["last"]["answer"]`, свою копию
+# проверки не ведёт. Код проверяет форму — номера, дословность цитат, «Не знаю»
+# и уточняющий вопрос; совпадает ли смысл ответа с цитатами, решает человек по
+# таблице «Утверждения и цитаты».
+
+def _fence(text: str) -> str:
+    return "~~~\n" + text.strip("\n") + "\n~~~"
+
+
+def _answer_relevance_line(last: dict) -> str:
+    """Что знал код о релевантности (§6.3): от этого зависит, что обязан
+    сделать ответ."""
+    if not last["rerank_ok"]:
+        return "второго этапа не было — порога нет: «не знаю» решает модель, повтора нет"
+    threshold, best = last["threshold"], last["best"]
+    if last["empty"]:
+        return (
+            f"выдача пуста по порогу {threshold:.2f} (лучший {(best or 0.0):.3f}) — "
+            "ответ обязан начинаться с «Не знаю» и спрашивать уточнение"
+        )
+    return (
+        f"выдержки прошли порог {threshold:.2f}: {len(last['hits'])} из {len(last['candidates'])} "
+        f"(лучшая {(best or 0.0):.2f}) — ответ обязан ссылаться на них и цитировать"
+    )
+
+
+def _answer_quote_mark(quote: dict) -> str:
+    return quote_mark(Quote(**quote)) or "✓ дословно"
+
+
+def _answer_repair_lines(last: dict, last_call: dict | None) -> list[str]:
+    """Строка «Повтор»: не требовался / был (с ценой) / не удался / не
+    применяется — по `repair_note`."""
+    answer, first, note = last["answer"], last["answer_first"], last["repair_note"]
+    if first is not None:
+        retry = [r for r in ((last_call or {}).get("rounds") or []) if r.get("repair")]
+        cost = ""
+        if retry:
+            r = retry[-1]
+            cost = (
+                f"; раунд {r['number']} · {r['elapsed']:.2f} с · "
+                f"≈{_fmt_int((r['prompt_tokens'] or 0) + (r['completion_tokens'] or 0))} ток. · "
+                f"{_fmt_cost(r['cost_usd'])}"
+            )
+        return [
+            "- **Повтор формата:** первая попытка — " + "; ".join(first["violations"])
+            + "; после повтора — " + ("; ".join(answer["violations"]) or "нет") + cost
+        ]
+    if note:
+        return [f"- **Повтор формата:** {note}"]
+    return ["- **Повтор формата:** не требовался"]
+
+
+def _answer_md(state: dict) -> str:
+    """Блок «Проверка ответа» (день 24, §6.3): что знал код о релевантности,
+    итог проверки, повтор формата, таблицы «Источники ответа» и «Утверждения и
+    цитаты (смысл сверяет человек)», ответ модели как пришёл."""
+    rag_state = state["rag"]
+    lines = ["### Проверка ответа", ""]
+    if not rag_state["available"]:
+        return "\n".join(lines + ["У агента нет поиска по индексу — проверки ответа нет."])
+    if not rag_state["format"]:
+        return "\n".join(lines + ["У агента нет формата ответа — проверки нет, ход как на дне 23."])
+    last, last_call = rag_state["last"], state["last_call"]
+    if last is None and last_call is None:
+        return "\n".join(lines + [
+            "Ходов ещё не было. После каждого хода с выдержками (или «подходящих не найдено») "
+            "здесь — проверка номеров, цитат и «Не знаю»."
+        ])
+    if last is None or not last["ok"]:
+        return "\n".join(lines + ["RAG выключен или поиск не удался — проверки нет."])
+    lines.append(f"- **Что знал код о релевантности:** {_answer_relevance_line(last)}")
+    answer = last["answer"]
+    if answer is None:
+        lines.append(
+            "- **Итог:** проверки не было — ход оборвался или в запрос ушёл чистый вопрос "
+            "(выдача пуста, а инструкции пустой выдачи нет)."
+        )
+        return "\n".join(lines)
+
+    quotes = answer["quotes"]
+    lines.append(f"- **Вид ответа:** {answer['kind']}")
+    lines.append(
+        "- **Источники:** " + (", ".join(f"[{n}]" for n in answer["sources"]) or "—")
+    )
+    if quotes:
+        every = answer["verbatim"] == len(quotes)
+        lines.append(
+            f"- **Цитаты:** {len(quotes)}, дословно {answer['verbatim']} {'✓' if every else '⚠️'}"
+        )
+    else:
+        lines.append("- **Цитаты:** нет")
+    lines.append(
+        f"- **«Не знаю»:** {'да' if answer['kind'] == KIND_IDK else 'нет'} · "
+        f"**«?» в ответе:** {'да' if answer['asks'] else 'нет'}"
+    )
+    if answer["violations"]:
+        lines.append("- **Нарушения:**")
+        lines += [f"  - ⚠️ {violation}" for violation in answer["violations"]]
+    else:
+        lines.append("- **Нарушений нет** ✓")
+    if answer["kind"] == KIND_IDK and not answer["empty"] and last["rerank_ok"]:
+        lines.append(
+            f"- **«Не знаю» при выдержках выше порога — сверьте:** лучшая оценка {(last['best'] or 0.0):.2f}"
+        )
+    if answer["own_sources"]:
+        lines.append("- Модель написала свой раздел «Источники:» — он заменён списком приложения")
+    if last_call is not None and last_call.get("tool_calls"):
+        lines.append(
+            "- ⚠️ Ответ мог опираться на результаты инструментов: проверка их не видит, повтора нет"
+        )
+    lines += _answer_repair_lines(last, last_call)
+
+    numbers = sorted({*answer["refs"], *(q["number"] for q in quotes)})
+    claims = {number: sentences for number, sentences in answer["claims"]}
+    if numbers:
+        table = [
+            "**Источники ответа:**", "",
+            "| № | документ | раздел | стр. | chunk_id | оценка | ссылок в тексте | цитат |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for number in numbers:
+            cited = len(claims.get(number, ()))
+            quoted = sum(1 for q in quotes if q["number"] == number)
+            if 1 <= number <= len(last["hits"]):
+                hit = last["hits"][number - 1]
+                section = _md_cell(hit["section"]) + (f" (часть {hit['part']})" if hit.get("part") else "")
+                score = f"{hit['rerank_score']:.3f}" if hit.get("rerank_score") is not None else "—"
+                table.append(
+                    f"| [{number}] | {_md_cell(hit['title'])} | {section} | {_hit_pages(hit)} | "
+                    f"`{hit['chunk_id']}` | {score} | {cited} | {quoted} |"
+                )
+            else:
+                table.append(
+                    f"| [{number}] | ⚠️ выдержки с таким номером в запросе не было | — | — | — | — | {cited} | {quoted} |"
+                )
+        lines += ["", "\n".join(table)]
+        table = [
+            "**Утверждения и цитаты (смысл сверяет человек):**", "",
+            "| № | утверждения ответа с этим номером | цитаты | проверка |",
+            "| --- | --- | --- | --- |",
+        ]
+        for number in numbers:
+            sentences = "<br>".join(_md_cell(text) for text in claims.get(number, ())) or "—"
+            own = [q for q in quotes if q["number"] == number]
+            texts = "<br>".join(_md_cell(f"«{q['text']}»") for q in own) or "—"
+            marks = "<br>".join(_md_cell(_answer_quote_mark(q)) for q in own) or "—"
+            table.append(f"| [{number}] | {sentences} | {texts} | {marks} |")
+        lines += ["", "\n".join(table)]
+
+    # Сообщение повтора — то, что ушло в модель (`repair_message`), а не
+    # собранное здесь заново (правка по ревью).
+    if last["answer_first"] is not None:
+        lines += [
+            "", "**Первая попытка — ответ модели как пришёл:**", "", _fence(last["answer_first"]["raw"]),
+            "", "**Сообщение повтора:**", "", _fence(last["repair_message"]),
+            "", "**Второй ответ модели:**", "", _fence(answer["raw"]),
+        ]
+    else:
+        lines += ["", "**Ответ модели как пришёл:**", "", _fence(answer["raw"])]
+        if last["repair_message"]:
+            lines += [
+                "", "**Сообщение повтора (повтор не удался — ответом остался первый):**", "",
+                _fence(last["repair_message"]),
+            ]
+    return "\n".join(lines)
+
+
 def _rag_message_update(state: dict) -> dict:
     """Последнее сообщение запроса целиком (выдержки + вопрос) — то самое
     «объединение с вопросом» (§9.3); у пустой выдачи (день 23) — «подходящих не
@@ -3040,10 +3236,10 @@ def _profile_choice_options(choices: list[str]) -> list[tuple[str, str]]:
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 41 значения
+    """Полный вид на состояние агента — фиксированный кортеж из 42 значений
     (18 — до дня 10, 22 — до дня 11, 26 — до дня 12, 29 — до дня 13, 31 — до
-    дня 14, 34 — до дня 17, 37 — до дня 22, 40 — до дня 23; дни 14, 17 и 22
-    добавляют по три, день 23 — одно),
+    дня 14, 34 — до дня 17, 37 — до дня 22, 40 — до дня 23, 41 — до дня 24;
+    дни 14, 17 и 22 добавляют по три, дни 23 и 24 — по одному),
     позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
@@ -3223,6 +3419,9 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         # 41. группа «RAG: второй этап поиска» — значение и активность из
         #     агента (день 23)
         _rag_stages_update(state),
+        # Значение дня 24 — в конце кортежа и в конце VIEW_OUTPUTS (§6.3).
+        # 42. блок «Проверка ответа» — источники, цитаты, «не знаю», повтор
+        _answer_md(state),
     )
 
 
@@ -3281,6 +3480,10 @@ def _new_agent(preset_name: str) -> Agent:
         rag_rewrite_prompt=RAG_REWRITE_PROMPT,
         rag_rewrite_max_tokens=RAG_REWRITE_MAX_TOKENS,
         rag_empty_instruction=RAG_EMPTY_INSTRUCTION,
+        # Формат ответа с источниками и цитатами и инструкция повтора — из
+        # `presets.py` (день 24, §6.1). Ветку `fork()` собирает с теми же.
+        rag_answer_format=RAG_ANSWER_FORMAT,
+        rag_repair_instruction=RAG_REPAIR_INSTRUCTION,
     )
 
 
@@ -3376,6 +3579,8 @@ def _restore_agents() -> int:
             rag_rewrite_prompt=RAG_REWRITE_PROMPT,
             rag_rewrite_max_tokens=RAG_REWRITE_MAX_TOKENS,
             rag_empty_instruction=RAG_EMPTY_INSTRUCTION,
+            rag_answer_format=RAG_ANSWER_FORMAT,
+            rag_repair_instruction=RAG_REPAIR_INSTRUCTION,
         )
         restored += 1
     logger.info(
@@ -5398,6 +5603,13 @@ _RAG_FOLLOWUP_LABELS: list[str] = [
     "У3 · после К5: кто поднимет",
 ]
 assert len(_RAG_FOLLOWUP_LABELS) == len(RAG_FOLLOWUP_QUESTIONS)
+# Вопросы проверки ответа дня 24 — `presets.RAG_ANSWER_QUESTIONS`.
+_RAG_ANSWER_LABELS: list[str] = [
+    "Н1 · без контекста: что с ним делать",
+    "Н2 · English: Undertow",
+    "Ф1 · просьба без цитат",
+]
+assert len(_RAG_ANSWER_LABELS) == len(RAG_ANSWER_QUESTIONS)
 
 
 # Чат и дебаг-панель — ровно пополам; кнопки компактнее дефолтных.
@@ -5408,15 +5620,16 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 23, неделя 5 — **второй этап поиска и переписывание запроса**: "
-        "перед поиском модель превращает вопрос и последний обмен в "
-        "самостоятельный запрос на русском, поиск берёт 20 ближайших кусков "
-        "индекса правил, **локальный реранкер** оценивает каждый, куски ниже "
-        "порога отсекаются, в запрос уходит не больше пяти — а если не прошёл "
-        "никто, модель узнаёт, что подходящего не нашлось. Пункты второго "
-        "этапа включаются отдельно (**четыре режима**: простой, фильтр, "
-        "переписывание, полный); для сравнения — 10 контрольных и 3 "
-        "уточняющих вопроса (у поля ввода) и программа `./run.sh rag-eval`."
+        "День 24, неделя 5 — **источники, цитаты и «не знаю»**: модель "
+        "отвечает только по выдержкам, ставит после утверждений номера "
+        "`[1]` и в конце пишет «Цитаты:» дословными фрагментами; **код** "
+        "проверяет номера и дословность цитат, при нарушении просит один "
+        "повтор и сам собирает под ответом список источников — документ, "
+        "раздел, страница, `chunk_id`. Если ни один кусок не прошёл порог "
+        "релевантности, ответ обязан начинаться с «Не знаю» и спрашивать "
+        "уточнение. Для проверки — 10 контрольных вопросов и 3 вопроса "
+        "проверки ответа (у поля ввода), программа `./run.sh rag-eval`; "
+        "смысл ответа сверяет человек."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -5609,20 +5822,17 @@ with gr.Blocks(title="TooManyRules") as demo:
                 examples_per_page=len(RAG_CONTROL_QUESTIONS),
                 label=(
                     "Контрольные вопросы — каждый задавайте новому агенту; "
-                    "для сравнения выключите инструменты MCP"
+                    "инструменты MCP выключите"
                 ),
             )
-            # Уточняющие вопросы дня 23 (§8.5) — рядом с контрольными: каждый
-            # задаётся тем же агентом сразу после своего контрольного.
+            # Вопросы проверки ответа дня 24 (§6.4) — рядом с контрольными:
+            # «не знаю» по порогу на двух языках и просьба против формата.
             gr.Examples(
-                examples=[[q["question"]] for q in RAG_FOLLOWUP_QUESTIONS],
+                examples=[[q["question"]] for q in RAG_ANSWER_QUESTIONS],
                 inputs=[question_input],
-                example_labels=_RAG_FOLLOWUP_LABELS,
-                examples_per_page=len(RAG_FOLLOWUP_QUESTIONS),
-                label=(
-                    "Уточняющие (день 23) — задавайте тем же агентом сразу после "
-                    "указанного контрольного"
-                ),
+                example_labels=_RAG_ANSWER_LABELS,
+                examples_per_page=len(RAG_ANSWER_QUESTIONS),
+                label="Проверка ответа (день 24) — каждый новому агенту",
             )
             with gr.Row():
                 send_btn = gr.Button("Отправить", size="sm", variant="primary", scale=2)
@@ -5834,7 +6044,19 @@ with gr.Blocks(title="TooManyRules") as demo:
             # Свёрнуто: сценарии прошлых дней. У дня 16 сценария в чате не
             # было, контрольные вопросы дня 22 стоят у поля ввода (правило «на
             # экране — текущий день»).
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-20)", open=False):
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-20, 23)", open=False):
+                # Уточняющие вопросы дня 23 (§6.4): каждый задаётся тем же
+                # агентом сразу после своего контрольного.
+                gr.Examples(
+                    examples=[[q["question"]] for q in RAG_FOLLOWUP_QUESTIONS],
+                    inputs=[question_input],
+                    example_labels=_RAG_FOLLOWUP_LABELS,
+                    examples_per_page=len(RAG_FOLLOWUP_QUESTIONS),
+                    label=(
+                        "Уточняющие (день 23) — задавайте тем же агентом сразу после "
+                        "указанного контрольного"
+                    ),
+                )
                 gr.Examples(
                     examples=[
                         ["Из каких фаз состоит ход игрока?"],
@@ -5996,12 +6218,44 @@ with gr.Blocks(title="TooManyRules") as demo:
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # RAG: фильтр и переписывание запроса (день 23, §8.3) — развёрнут
-            # наверху панели. Описание — статичный Markdown; «RAG последнего
-            # хода» и последнее сообщение запроса целиком переехали сюда из
-            # блока дня 22 (правило дней 19-20: блок хода живёт в блоке
-            # текущего дня) — те же компоненты и выходы `_view()` (39-40).
-            with gr.Accordion("RAG: фильтр и переписывание запроса (день 23)", open=True):
+            # RAG: источники, цитаты и «не знаю» (день 24, §6.2) — развёрнут
+            # наверху панели. Описание — статичный Markdown; «Проверка ответа»
+            # — новое 42-е значение `_view()`; «RAG последнего хода» и
+            # последнее сообщение запроса целиком переехали сюда из блока дня
+            # 23 (правило дней 19-20: блок хода живёт в блоке текущего дня) —
+            # те же компоненты и выходы `_view()` (39-40).
+            with gr.Accordion("RAG: источники, цитаты и «не знаю» (день 24)", open=True):
+                gr.Markdown(
+                    "**Модель отвечает только по выдержкам** и ставит после "
+                    "утверждений номер выдержки `[N]`; в конце — раздел "
+                    "«Цитаты:» с дословными фрагментами. **Код проверяет**: "
+                    "номера есть в выдаче, каждая цитата стоит в своей выдержке "
+                    "слово в слово. При нарушении — **один повтор** формата "
+                    "(только если реранкер подтвердил релевантность и в ходе не "
+                    "было инструментов); список «Источники:» собирает код по "
+                    "номерам из метаданных куска, `chunk_id` модель не пишет. "
+                    "**Ни один кусок не прошёл порог 0,10 — ответ обязан "
+                    "начинаться с «Не знаю» и спрашивать уточнение**, общих "
+                    "знаний нет. Код проверяет форму; **совпадает ли смысл "
+                    "ответа с цитатами, решает человек** — по таблице "
+                    "«Утверждения и цитаты»."
+                )
+                answer_md = gr.Markdown("")
+                rag_md = gr.Markdown("")
+                with gr.Accordion(
+                    "Последнее сообщение запроса целиком (выдержки + вопрос)", open=False
+                ):
+                    rag_message_box = gr.Textbox(
+                        label="Последнее сообщение запроса целиком (выдержки + вопрос)",
+                        lines=12,
+                        max_lines=40,
+                        interactive=False,
+                        buttons=["copy"],
+                    )
+            # RAG: фильтр и переписывание запроса (день 23, §8.3) — с дня 24
+            # свёрнут под блоком дня 24 (§6.4); остаётся статичное описание
+            # дня 23.
+            with gr.Accordion("RAG: фильтр и переписывание запроса (день 23)", open=False):
                 gr.Markdown(
                     "**Цепочка одного хода:** вопрос → *переписывание* (служебный "
                     "вызов модели: последний обмен + сообщение → самостоятельный "
@@ -6018,17 +6272,6 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "сверяет только выдачу с ожидаемыми источниками — «до» и "
                     "«после» второго этапа."
                 )
-                rag_md = gr.Markdown("")
-                with gr.Accordion(
-                    "Последнее сообщение запроса целиком (выдержки + вопрос)", open=False
-                ):
-                    rag_message_box = gr.Textbox(
-                        label="Последнее сообщение запроса целиком (выдержки + вопрос)",
-                        lines=12,
-                        max_lines=40,
-                        interactive=False,
-                        buttons=["copy"],
-                    )
             # RAG: первый запрос (день 22, §9.3) — с дня 23 свёрнут под блоком
             # дня 23 (§8.5); остаётся статичное описание дня 22.
             with gr.Accordion("RAG: первый запрос (день 22)", open=False):
@@ -6037,7 +6280,7 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "ближайших кусков индекса правил → *выдержки + вопрос* одним "
                     "сообщением → модель. Выдержки — часть последнего сообщения "
                     "запроса, перед вопросом; **в историю идёт только вопрос**, "
-                    "выше, в блоке дня 23, это видно рядом со «Стеком сообщений "
+                    "выше, в блоке дня 24, это видно рядом со «Стеком сообщений "
                     "агента». Поиск — работа кода, а не решение модели: он идёт "
                     "на каждом ходе с включённым RAG. Оба пункта «второго этапа» "
                     "сняты — и это ровно день 22: порога нет, лишние выдержки "
@@ -6453,6 +6696,7 @@ with gr.Blocks(title="TooManyRules") as demo:
         rag_md,
         rag_message_box,
         rag_stages_group,
+        answer_md,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
     # Выходы формы редактора профиля (день 12, §7.3) — отдельно от
