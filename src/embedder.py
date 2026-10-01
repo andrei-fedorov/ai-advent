@@ -42,15 +42,22 @@ import numpy as np  # noqa: E402
 PASSAGE_PREFIX = "passage: "
 QUERY_PREFIX = "query: "
 BATCH_SIZE = 16
+# Файлы весов, по которым `in_cache()` судит, что модель скачана целиком.
+WEIGHT_FILES = ("model.safetensors", "model.safetensors.index.json", "pytorch_model.bin")
 
 
 def in_cache(model_name: str) -> bool:
-    """Есть ли модель в кэше Hugging Face — без загрузки и без сети (по
-    `config.json`). Для строки лога при старте приложения."""
+    """Есть ли модель в кэше Hugging Face — без загрузки и без сети: и
+    `config.json`, и файл весов (`config.json` скачивается первым, и по нему
+    одному прерванное скачивание выглядело бы готовой моделью — правка по ревью
+    дня 23; недокачанный файл в снимок кэша не попадает). Для строки лога при
+    старте приложения и отказа программы сравнения."""
     from huggingface_hub import try_to_load_from_cache
 
-    cached = try_to_load_from_cache(model_name, "config.json")
-    return isinstance(cached, str)
+    def cached(filename: str) -> bool:
+        return isinstance(try_to_load_from_cache(model_name, filename), str)
+
+    return cached("config.json") and any(cached(name) for name in WEIGHT_FILES)
 
 
 def package_version(name: str) -> str:

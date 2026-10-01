@@ -164,25 +164,12 @@ def places_before(run: Run, question: dict) -> list[int | None]:
 
 
 def source_status(source: tuple[str, str, int], run: Run | None) -> str:
-    """Где ожидаемый источник в режиме `run`: «до — место 7 (0.789) · после —
-    место 1 ✓ (0.913)» / «до — место 4 (0.80) · отсечён порогом (0.015)» / «не в
-    кандидатах»; без второго этапа — «в выдаче — место N ✓ / не в выдаче»."""
+    """Где ожидаемый источник в режиме `run` — строка `rag_search.source_status()`
+    (одно определение с панелью приложения); поиска нет — «н/д»."""
     record = record_of(run) if run is not None else None
     if record is None:
         return "н/д"
-    if not record.rerank_ok:
-        place = rag_search.sources_found(record.hits, [source])[0]
-        return f"в выдаче — место {place} ✓" if place is not None else "не в выдаче"
-    before = rag_search.sources_found(record.candidates, [source])[0]
-    if before is None:
-        return "не в кандидатах"
-    candidate = record.candidates[before - 1]
-    start = f"до — место {before} ({candidate['score']:.3f})"
-    after = rag_search.sources_found(record.hits, [source])[0]
-    score = f"{candidate['rerank_score']:.3f}"
-    if after is not None:
-        return f"{start} · после — место {after} ✓ ({score})"
-    return f"{start} · " + ("отсечён порогом" if candidate["fate"] == "ниже порога" else "сверх top-K") + f" ({score})"
+    return rag_search.source_status(source, record.hits, record.candidates, record.rerank_ok)
 
 
 # --- Метрики --------------------------------------------------------------------

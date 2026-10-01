@@ -307,7 +307,7 @@ from task_state import (
     STAGE_VALIDATION,
     TRANSITIONS,
 )
-from rag_search import RulesIndex, sources_found
+from rag_search import RulesIndex, source_status
 from tokens import FILLER_MAX_TOKENS, estimate_tokens, filler_text
 from user_profile import (
     CHOICE_AUTO,
@@ -702,18 +702,6 @@ def _rewrite_call_lines(last_call: dict) -> list[str]:
     ]
 
 
-def _rag_empty(rag: dict) -> bool:
-    """Выдача пуста по порогу (`RagRecord.empty` по словарю `last_call["rag"]`):
-    второй этап удался и отсёк всех."""
-    return bool(rag["ok"] and rag.get("rerank_ok") and not rag["hits"])
-
-
-def _rag_best(rag: dict) -> float | None:
-    """Наибольшая оценка реранкера среди кандидатов (`RagRecord.best`)."""
-    scores = [c["rerank_score"] for c in rag.get("candidates") or () if c.get("rerank_score") is not None]
-    return max(scores) if scores else None
-
-
 def _rag_metric_lines(last_call: dict) -> list[str]:
     """Строка RAG в «Последнем вызове» (день 22, §7): корзина «RAG (выдержки)»
     рядом с фактом хода; с дня 23 — сколько кандидатов прошло порог и ⚠️ при
@@ -730,7 +718,7 @@ def _rag_metric_lines(last_call: dict) -> list[str]:
             f"{len(rag['hits'])} из {len(rag['candidates'])} кандидатов прошли порог "
             f"{rag['threshold']:.2f}, второй этап {rag['rerank_s']:.2f} s{reranked}"
         )
-        if _rag_empty(rag):
+        if rag["empty"]:
             what += " — подходящих не найдено"
     else:
         what = f"{len(rag['hits'])} из {_fmt_int(rag['total'])} кусков"
@@ -2672,26 +2660,14 @@ def _hit_pages(hit: dict) -> str:
 
 
 def _rag_source_status(source: tuple, rag: dict | None) -> str:
-    """Где ожидаемый источник: со вторым этапом — «до — место 7 (0.789) · после —
-    место 1 ✓ (0.913)» / «до — место 4 · отсечён порогом (0.015)» / «не в
-    кандидатах»; без него — «в выдаче — место N ✓ / не в выдаче», как на дне 22."""
+    """Где ожидаемый источник — строка `rag_search.source_status()` (одно
+    определение с отчётом программы сравнения); поиска нет или он не удался —
+    своя строка панели."""
     if rag is None:
         return "поиска не было"
     if not rag["ok"]:
         return "выдачи нет — поиск не удался"
-    if not rag.get("rerank_ok"):
-        place = sources_found(rag["hits"], [source])[0]
-        return f"в выдаче — место {place} ✓" if place is not None else "не в выдаче"
-    before = sources_found(rag["candidates"], [source])[0]
-    if before is None:
-        return "не в кандидатах"
-    candidate = rag["candidates"][before - 1]
-    start = f"до — место {before} ({candidate['score']:.3f})"
-    after = sources_found(rag["hits"], [source])[0]
-    score = f"{candidate['rerank_score']:.3f}"
-    if after is not None:
-        return f"{start} · после — место {after} ✓ ({score})"
-    return f"{start} · " + ("отсечён порогом" if candidate["fate"] == "ниже порога" else "сверх top-K") + f" ({score})"
+    return source_status(source, rag["hits"], rag["candidates"], bool(rag.get("rerank_ok")))
 
 
 def _rag_place_text(source: tuple, rag: dict | None) -> str:
@@ -2853,12 +2829,16 @@ def _rag_md(state: dict) -> str:
             f"этап 2 — `{last['rerank_model'].rsplit('/', 1)[-1]}`, порог {last['threshold']:.2f}, "
             f"{last['rerank_s']:.2f} с{reranked}"
         )
-        best = _rag_best(last) or 0.0
-        if _rag_empty(last):
+        best = last["best"] or 0.0
+        if last["empty"]:
             lines.append(
                 f"- **Результат:** **ни один из {len(last['candidates'])} не прошёл порог** "
-                f"(лучший {best:.3f}) — в запрос ушло «подходящих не найдено»"
-                + ("" if RAG_EMPTY_INSTRUCTION else " (инструкции пустой выдачи нет — чистый вопрос)")
+                f"(лучший {best:.3f}) — "
+                # По тому, что ушло в запрос, а не по константе (правка по ревью дня 23).
+                + (
+                    "в запрос ушло «подходящих не найдено»" if last["message"]
+                    else "инструкции пустой выдачи нет — в запрос ушёл чистый вопрос"
+                )
                 + f"; {tail}"
             )
         else:

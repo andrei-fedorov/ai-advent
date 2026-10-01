@@ -121,22 +121,57 @@ def sources_found(
     же документа и раздела, покрывающий эту страницу; часть длинного раздела
     не важна. Одно определение «найден» для панели и программы сравнения; про
     ответ модели оно ничего не говорит."""
-
-    def field(hit: Hit | Mapping, name: str):
-        return hit[name] if isinstance(hit, Mapping) else getattr(hit, name)
-
     places: list[int | None] = []
-    for doc, section, page in sources:
+    for source in sources:
         place = None
         for number, hit in enumerate(hits, 1):
-            if (
-                field(hit, "doc") == doc and field(hit, "section") == section
-                and field(hit, "page_from") <= page <= field(hit, "page_to")
-            ):
+            if _covers(hit, source):
                 place = number
                 break
         places.append(place)
     return places
+
+
+def source_status(
+    source: tuple[str, str, int], hits: Sequence[Mapping], candidates: Sequence[Mapping], rerank_ok: bool,
+) -> str:
+    """Где ожидаемый источник в выдаче одного поиска — строка для панели и
+    отчёта программы сравнения (день 23, §8.3, §7.3). Без второго этапа — «в
+    выдаче — место N ✓» / «не в выдаче», как на дне 22. Со вторым этапом —
+    «до — место 7 (0.789) · после — место 1 ✓ (0.913)» / «до — место 4 (0.80) ·
+    отсечён порогом (0.015)» / «… · сверх top-K (…)» / «не в кандидатах».
+
+    Источник может покрывать несколько кусков (части `1/2` и `2/2` длинного
+    раздела на одной странице), и строка — про один кусок, а не про смесь
+    разных (правка по ревью дня 23: «после — место 1 ✓ (0.065)» брало место у
+    прошедшей части, а оценку — у отсечённой). Прошёл — кусок, ушедший в модель
+    первым; не прошёл — лучший по оценке из подходящих кандидатов."""
+    if not rerank_ok:
+        place = sources_found(hits, [source])[0]
+        return f"в выдаче — место {place} ✓" if place is not None else "не в выдаче"
+    matching = [(place, c) for place, c in enumerate(candidates, 1) if _covers(c, source)]
+    if not matching:
+        return "не в кандидатах"
+    after = sources_found(hits, [source])[0]
+    if after is not None:
+        chunk_id = hits[after - 1]["chunk_id"]
+        before, candidate = next((p, c) for p, c in matching if c["chunk_id"] == chunk_id)
+        fate = f"после — место {after} ✓"
+    else:
+        before, candidate = max(matching, key=lambda item: (item[1]["rerank_score"], -item[0]))
+        fate = "отсечён порогом" if candidate["fate"] == "ниже порога" else "сверх top-K"
+    return f"до — место {before} ({candidate['score']:.3f}) · {fate} ({candidate['rerank_score']:.3f})"
+
+
+def _covers(hit: Hit | Mapping, source: tuple[str, str, int]) -> bool:
+    """Кусок покрывает ожидаемый источник: тот же документ и раздел, страница
+    внутри его страниц (часть длинного раздела не важна)."""
+
+    def field(name: str):
+        return hit[name] if isinstance(hit, Mapping) else getattr(hit, name)
+
+    doc, section, page = source
+    return field("doc") == doc and field("section") == section and field("page_from") <= page <= field("page_to")
 
 
 class RulesIndex:
@@ -287,6 +322,14 @@ class RulesIndex:
         loaded = time.perf_counter() - step
         logger.info("[RAG] модель %s загружена за %.1f с · устройство %s", model, loaded, self._embedder.device)
         return loaded
+
+    def load_reranker(self) -> float:
+        """Загружает реранкер (если ещё нет); секунды загрузки, 0.0 — уже был в
+        памяти. Для `--probe`: время загрузки (и скачивания) не должно попадать
+        во время оценки первого вопроса (правка по ревью дня 23). Бросает
+        `RagError`."""
+        with self._lock:
+            return self._load_reranker()
 
     def _load_reranker(self) -> float:
         """Загрузка реранкера (если ещё нет); секунды загрузки, 0.0 — уже был в
@@ -519,5 +562,6 @@ class RulesIndex:
 
 
 __all__ = [
-    "Hit", "IndexFileError", "RagError", "RulesIndex", "SCHEMA_VERSION", "TABLES", "check_index", "shown", "sources_found",
+    "Hit", "IndexFileError", "RagError", "RulesIndex", "SCHEMA_VERSION", "TABLES", "check_index", "shown", "source_status",
+    "sources_found",
 ]

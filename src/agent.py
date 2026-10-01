@@ -1633,9 +1633,10 @@ class Agent:
         rag_empty = bool(rag is not None and rag.empty and self._rag_empty_instruction)
 
         # Каталог инструментов (день 17, §5.3) — после всех служебных работ
-        # (трекер остаётся последним из них) и до сборки запроса: схемы нужны
-        # оценке токенов. Одно подключение к серверу на ход. Сбой каталога
-        # ход не отменяет: запрос уходит без `tools`, как на дне 16.
+        # (с дня 23 последняя из них — переписывание запроса) и поиска RAG, до
+        # сборки запроса: схемы нужны оценке токенов. Одно подключение к
+        # серверу на ход. Сбой каталога ход не отменяет: запрос уходит без
+        # `tools`, как на дне 16.
         specs, tools_note, tool_elapsed = self._tool_catalog()
         known_names = [spec["function"]["name"] for spec in specs]
         tools_json = json.dumps(specs, ensure_ascii=False) if specs else ""
@@ -2634,7 +2635,7 @@ class Agent:
             "store_error": self._store_error,
             "history_size": len(self._messages),
             "messages": self.history,
-            "last_call": asdict(self._last_reply) if self._last_reply else None,
+            "last_call": _reply_dict(self._last_reply) if self._last_reply else None,
             "totals": dict(self._totals),
             "process": process_stats(),
             # Ключи дня 8 — в конце: существующие не переименовываются и не
@@ -2758,10 +2759,7 @@ class Agent:
                 "available": self._retriever is not None,
                 "enabled": self.rag_in_request,
                 "name": self._retriever.name if self._retriever is not None else "",
-                "last": (
-                    {**asdict(self._last_rag), "empty": self._last_rag.empty, "best": self._last_rag.best}
-                    if self._last_rag is not None else None
-                ),
+                "last": _rag_dict(self._last_rag) if self._last_rag is not None else None,
                 # Ключи дня 23 (§6.6): положение пунктов второго этапа
                 # (определение «включён» — то же, что у свойств) и есть ли у
                 # агента промпт переписывания.
@@ -5463,6 +5461,22 @@ def _route_update(choice: "user_profile.ModeChoice") -> str:
     if choice.mode is None:
         return choice.note
     return f"«{choice.mode}» — {choice.note}"
+
+
+def _rag_dict(record: RagRecord) -> dict:
+    """`RagRecord` словарём для панели — с его свойствами `empty` и `best` (день
+    23, §6.6): `asdict()` свойств не видит, и без них панели пришлось бы
+    повторять их определения (правка по ревью дня 23)."""
+    return {**asdict(record), "empty": record.empty, "best": record.best}
+
+
+def _reply_dict(reply: AgentReply) -> dict:
+    """`AgentReply` словарём для `debug_state()["last_call"]`; запись поиска —
+    через `_rag_dict()`, как `debug_state()["rag"]["last"]`."""
+    data = asdict(reply)
+    if reply.rag is not None:
+        data["rag"] = _rag_dict(reply.rag)
+    return data
 
 
 def _rewrite_input(history: Sequence[dict], question: str) -> str:

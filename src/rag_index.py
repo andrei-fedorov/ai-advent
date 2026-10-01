@@ -491,6 +491,9 @@ def probe(db: Path) -> int:
                     candidates = index.nearest(
                         question, presets.RAG_SEARCH_STRATEGY, lang, presets.RAG_CANDIDATES, vector=vector,
                     )
+                    # Загрузка (и скачивание) — отдельно от оценки: иначе время
+                    # первого вопроса включало бы их (правка по ревью дня 23).
+                    load_s = index.load_reranker()
                     step = time.perf_counter()
                     ranked = index.rerank(question, candidates)
                     rerank_s = time.perf_counter() - step
@@ -498,9 +501,11 @@ def probe(db: Path) -> int:
                     second_stage = False
                     logger.error("второй этап пропущен: %s", exc)
                 else:
+                    loaded = f", загрузка реранкера {load_s:.1f} с" if load_s else ""
                     print(
                         f"   после переранжирования ({presets.RAG_RERANK_MODEL.rsplit('/', 1)[-1]}, "
-                        f"порог {presets.RAG_RERANK_THRESHOLD:.2f}; {len(candidates)} кандидатов, {rerank_s:.2f} с)"
+                        f"порог {presets.RAG_RERANK_THRESHOLD:.2f}; {len(candidates)} кандидатов, "
+                        f"оценка {rerank_s:.2f} с{loaded})"
                     )
                     places = {hit.chunk_id: place for place, hit in enumerate(candidates, 1)}
                     for hit in ranked[:PROBE_TOP]:
