@@ -113,6 +113,16 @@
 # `TOOMANYRULES_RAG_INDEX` заменяет путь — для своего экземпляра и проверки
 # сбоев. День 20 свёрнут под блоком дня 22, контрольные вопросы — у поля ввода.
 #
+# День 23 (спецификация дня 23, §8) — второй этап поиска и переписывание запроса:
+# `RULES_INDEX` получает числа второго этапа из `presets.py`, под флажком RAG
+# стоит `gr.CheckboxGroup` «RAG: второй этап поиска» (переписать запрос;
+# переранжировать и отсечь по порогу), блок «RAG: фильтр и переписывание запроса
+# (день 23)» развёрнут наверху панели (сюда переехали «RAG последнего хода» и
+# «Последнее сообщение запроса целиком» — те же компоненты и выходы `_view()`),
+# блок дня 22 свёрнут под ним. Переписывание — седьмая служебная работа и
+# показывается везде, где остальные. `_view()` — **41 значение** (+ группа
+# второго этапа). Уточняющие вопросы дня 23 — у поля ввода рядом с контрольными.
+#
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
 # словами, текст памяти и числа. День 10 добавил в переключатель ещё две
@@ -232,10 +242,19 @@ from presets import (
     PRESETS,
     PROFILE_QUESTION,
     PROFILE_VARIANTS,
+    RAG_CANDIDATES,
     RAG_CONTROL_QUESTIONS,
     RAG_EMBED_MODEL,
+    RAG_EMPTY_INSTRUCTION,
+    RAG_FOLLOWUP_QUESTIONS,
     RAG_INDEX_DB,
     RAG_INSTRUCTION,
+    RAG_RERANK_BATCH,
+    RAG_RERANK_MAX_LENGTH,
+    RAG_RERANK_MODEL,
+    RAG_RERANK_THRESHOLD,
+    RAG_REWRITE_MAX_TOKENS,
+    RAG_REWRITE_PROMPT,
     RAG_SEARCH_LANG,
     RAG_SEARCH_STRATEGY,
     RAG_TOP_K,
@@ -436,19 +455,32 @@ WATCH_AUTOSTART: AutostartStatus = ensure_started(
 # индекс автора приложение только читает. Модель эмбеддингов не скачивается из
 # приложения (`allow_download=False`) и загружается при первом поиске, а не при
 # старте: строка ниже — по `info()`, без модели.
+# День 23 (§8.1): к индексу добавлены числа второго этапа — кандидатов, модель
+# реранкера, порог; реранкер, как и модель эмбеддингов, не скачивается из
+# приложения и загружается при первом поиске со вторым этапом.
 RULES_INDEX = RulesIndex(
     Path(os.environ.get("TOOMANYRULES_RAG_INDEX") or RAG_INDEX_DB).expanduser(),
     RAG_SEARCH_STRATEGY, RAG_SEARCH_LANG, RAG_TOP_K,
+    candidates_k=RAG_CANDIDATES, rerank_model=RAG_RERANK_MODEL, threshold=RAG_RERANK_THRESHOLD,
+    rerank_max_length=RAG_RERANK_MAX_LENGTH, rerank_batch=RAG_RERANK_BATCH,
     allow_download=False, expected_model=RAG_EMBED_MODEL,
 )
 _rag_start = RULES_INDEX.info()
 if _rag_start["ok"]:
+    _rerank_name = _rag_start["rerank_model"].rsplit("/", 1)[-1]
     logger.info(
         "RAG при старте: индекс %s · собран %s · %s/%s — %d кусков из %d · модель %s "
-        "загрузится при первом поиске",
+        "загрузится при первом поиске · %s",
         _rag_start["path"], _rag_start["built_at"][:16].replace("T", " "),
         _rag_start["strategy"], _rag_start["lang"], _rag_start["chunks"],
         _rag_start["total"], _rag_start["model"],
+        (
+            f"второй этап: {_rerank_name} (в кэше, загрузится при первом поиске), "
+            f"{_rag_start['candidates_k']} → ≥ {_rag_start['threshold']:.2f} → ≤{_rag_start['top_k']}"
+            if _rag_start["rerank_cached"]
+            else f"реранкера {_rerank_name} нет в кэше — ./run.sh index --probe скачает ≈1,5 ГБ; "
+                 "до тех пор выдача без фильтра"
+        ),
     )
 else:
     logger.warning(
@@ -579,8 +611,9 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
         # показать, на чём оборвалось, больше негде.
         if last_call.get("rounds"):
             lines += ["", _rounds_line(last_call)]
-        # Поиск выдержек (день 22) — прошёл до упавшего вызова.
-        rag_lines = _rag_metric_lines(last_call)
+        # Переписывание запроса (день 23) и поиск выдержек (день 22) — прошли
+        # до упавшего вызова и оплачены, показать их больше негде.
+        rag_lines = _rewrite_call_lines(last_call) + _rag_metric_lines(last_call)
         if rag_lines:
             lines += ["", *rag_lines]
         return "\n".join(lines)
@@ -637,6 +670,7 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
     ]
     if rounds:
         lines.append(_rounds_line(last_call))
+    lines += _rewrite_call_lines(last_call)
     lines += _rag_metric_lines(last_call)
     lines += _service_lines(last_call.get("service_call"))
     # Страж инвариантов (день 14, §8.6) — перед разбором памяти, в порядке
@@ -649,19 +683,62 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
     return "\n".join(lines)
 
 
+def _rewrite_call_lines(last_call: dict) -> list[str]:
+    """Переписывание запроса этого хода (день 23, §8.4) — седьмая служебная
+    работа, строка по образцу `_route_call_lines()`: запрос, токены, стоимость,
+    время; ⚠️ при сбое. Не вызывалось — строки нет."""
+    call = last_call.get("rewrite_call")
+    if call is None:
+        return []
+    if not call["ok"]:
+        return [
+            f"- **✏️ Переписывание запроса не удалось:** ⚠️ {call['error']} — "
+            f"искали по вопросу как есть, ход состоялся. Потрачено {_fmt_int(call['total_tokens'] or 0)} токенов."
+        ]
+    return [
+        f"- **✏️ Переписывание запроса:** «{_md_cell(call['text'])}» "
+        f"({call.get('memory_update') or 'ок'}), вызов {_fmt_int(call['total_tokens'])} токенов, "
+        f"{_fmt_cost(call['cost_usd'])}, {call['elapsed']:.2f} s"
+    ]
+
+
+def _rag_empty(rag: dict) -> bool:
+    """Выдача пуста по порогу (`RagRecord.empty` по словарю `last_call["rag"]`):
+    второй этап удался и отсёк всех."""
+    return bool(rag["ok"] and rag.get("rerank_ok") and not rag["hits"])
+
+
+def _rag_best(rag: dict) -> float | None:
+    """Наибольшая оценка реранкера среди кандидатов (`RagRecord.best`)."""
+    scores = [c["rerank_score"] for c in rag.get("candidates") or () if c.get("rerank_score") is not None]
+    return max(scores) if scores else None
+
+
 def _rag_metric_lines(last_call: dict) -> list[str]:
     """Строка RAG в «Последнем вызове» (день 22, §7): корзина «RAG (выдержки)»
-    рядом с фактом хода. Ход без RAG — строки нет."""
+    рядом с фактом хода; с дня 23 — сколько кандидатов прошло порог и ⚠️ при
+    сбое второго этапа. Ход без RAG — строки нет."""
     rag = last_call.get("rag")
     if not rag:
         return []
     if not rag["ok"]:
         return [f"- **📚 RAG (выдержки):** ⚠️ {rag['error']} — запрос ушёл без выдержек"]
     loaded = f" (загрузка модели {rag['load_s']:.1f} с)" if rag["load_s"] else ""
+    if rag.get("rerank_ok"):
+        reranked = f" (загрузка реранкера {rag['rerank_load_s']:.1f} с)" if rag["rerank_load_s"] else ""
+        what = (
+            f"{len(rag['hits'])} из {len(rag['candidates'])} кандидатов прошли порог "
+            f"{rag['threshold']:.2f}, второй этап {rag['rerank_s']:.2f} s{reranked}"
+        )
+        if _rag_empty(rag):
+            what += " — подходящих не найдено"
+    else:
+        what = f"{len(rag['hits'])} из {_fmt_int(rag['total'])} кусков"
+        if rag.get("rerank"):
+            what += f" · ⚠️ второй этап не удался: {rag['rerank_error'] or 'причина не названа'} — выдача без фильтра"
     return [
         f"- **📚 RAG (выдержки):** ≈{_fmt_int(rag['tokens'])} токенов в запросе, "
-        f"{len(rag['hits'])} из {_fmt_int(rag['total'])} кусков, поиск "
-        f"{rag['elapsed']:.2f} s{loaded}"
+        f"{what}, поиск {rag['elapsed']:.2f} s{loaded}"
     ]
 
 
@@ -1363,6 +1440,11 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
             # своя пара колонок, как у остальных служебных работ.
             "сэмпл. ток.": turn["sampling_tokens"],
             "сэмпл. $": _fmt_cost(turn["sampling_cost_usd"]),
+            # Колонки дня 23 — в конце (§8.4): цена переписывания запроса
+            # поиска этого хода — своя пара колонок и время.
+            "перепис. ток.": turn["rewrite_tokens"],
+            "перепис. $": _fmt_cost(turn["rewrite_cost_usd"]),
+            "время перепис., s": f"{turn['rewrite_elapsed']:.2f}",
         }
         for turn in turns
     ]
@@ -1378,7 +1460,8 @@ def _turns_table(turns: list[dict]) -> pd.DataFrame:
                  "время трекера, s", "инварианты", "конфликт", "страж",
                  "время стража, s", "отказ", "сход", "раунды",
                  "вызовы инстр.", "схемы ток.", "инстр. с",
-                 "сэмпл. ток.", "сэмпл. $"],
+                 "сэмпл. ток.", "сэмпл. $", "перепис. ток.", "перепис. $",
+                 "время перепис., s"],
     )
 
 
@@ -1394,7 +1477,8 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"разборов памяти: {totals['memory_calls']}, роутера профиля: "
         f"{totals['route_calls']}, трекера задачи: {totals['tracker_calls']}, "
         f"стража инвариантов: {totals['guard_calls']}, сэмплинга: "
-        f"{totals['sampling_calls']})\n"
+        f"{totals['sampling_calls']}, переписывания запроса: "
+        f"{totals['rewrite_calls']})\n"
         f"- **🔢 Токены:** prompt={totals['prompt_tokens']} / "
         f"completion={totals['completion_tokens']} / "
         f"total={totals['total_tokens']}\n"
@@ -1441,6 +1525,13 @@ def _totals_md(agent_title: str, totals: dict, model: str) -> str:
         f"{_fmt_int(totals['sampling_tokens'])} токенов, "
         f"{_fmt_cost(totals['sampling_cost_usd'])} — модель агента по "
         f"просьбе сервера (MCP sampling)\n"
+        # Строка дня 23 (§6.3, §8.4): переписывание запроса поиска — седьмая
+        # служебная работа, своя цена, не входит ни в одну из строк выше.
+        f"- **✏️ Переписывание запроса:** {totals['rewrite_calls']} "
+        f"{_calls_word(totals['rewrite_calls'])}, "
+        f"{_fmt_int(totals['rewrite_tokens'])} токенов, "
+        f"{_fmt_cost(totals['rewrite_cost_usd'])} — цена самостоятельного "
+        f"запроса для поиска по правилам\n"
         f"- **💲 Стоимость:** {_fmt_cost(totals['cost_usd'])}"
     )
 
@@ -2542,10 +2633,20 @@ def _tools_md(state: dict) -> str:
     return "\n\n".join(lines)
 
 
-# --- Блок «RAG: первый запрос (день 22)» (§9.3) -----------------------------
-# Всё берётся из `debug_state()["rag"]` и ответа агента: своей копии выдачи у
+# --- Блок «RAG: фильтр и переписывание запроса (день 23)» (§8.3) ------------
+# С дня 23 блок «RAG последнего хода» и «Последнее сообщение запроса целиком»
+# живут в блоке текущего дня (правило дней 19-20), блок дня 22 свёрнут. Всё
+# берётся из `debug_state()["rag"]` и ответа агента: своей копии выдачи у
 # интерфейса нет. Код не оценивает ответы — «найден» относится только к выдаче
 # и ожидаемым источникам (`rag_search.sources_found()`), оценка за автором.
+
+RAG_STAGE_REWRITE = "rewrite"
+RAG_STAGE_RERANK = "rerank"
+RAG_STAGE_CHOICES: list[tuple[str, str]] = [
+    ("переписать запрос (по последнему обмену, на русском)", RAG_STAGE_REWRITE),
+    ("переранжировать и отсечь по порогу", RAG_STAGE_RERANK),
+]
+
 
 def _rag_in_request_update(state: dict) -> dict:
     """Переключатель «RAG: выдержки из правил в запросе» (день 22, §9.2):
@@ -2554,43 +2655,76 @@ def _rag_in_request_update(state: dict) -> dict:
     return gr.update(value=rag["enabled"], interactive=rag["available"])
 
 
+def _rag_stages_update(state: dict) -> dict:
+    """Группа «RAG: второй этап поиска» (день 23, §8.2): значение — из агента
+    (определение «включён» одно на свойство и `debug_state()`), активность —
+    есть ли поиск."""
+    rag = state["rag"]
+    value = [
+        stage for stage, on in ((RAG_STAGE_REWRITE, rag["rewrite"]), (RAG_STAGE_RERANK, rag["rerank"])) if on
+    ]
+    return gr.update(value=value, interactive=rag["available"])
+
+
 def _hit_pages(hit: dict) -> str:
     first, last = hit["page_from"], hit["page_to"]
     return str(first) if first == last else f"{first}–{last}"
 
 
-def _rag_place_text(source: tuple, place: int | None) -> str:
+def _rag_source_status(source: tuple, rag: dict | None) -> str:
+    """Где ожидаемый источник: со вторым этапом — «до — место 7 (0.789) · после —
+    место 1 ✓ (0.913)» / «до — место 4 · отсечён порогом (0.015)» / «не в
+    кандидатах»; без него — «в выдаче — место N ✓ / не в выдаче», как на дне 22."""
+    if rag is None:
+        return "поиска не было"
+    if not rag["ok"]:
+        return "выдачи нет — поиск не удался"
+    if not rag.get("rerank_ok"):
+        place = sources_found(rag["hits"], [source])[0]
+        return f"в выдаче — место {place} ✓" if place is not None else "не в выдаче"
+    before = sources_found(rag["candidates"], [source])[0]
+    if before is None:
+        return "не в кандидатах"
+    candidate = rag["candidates"][before - 1]
+    start = f"до — место {before} ({candidate['score']:.3f})"
+    after = sources_found(rag["hits"], [source])[0]
+    score = f"{candidate['rerank_score']:.3f}"
+    if after is not None:
+        return f"{start} · после — место {after} ✓ ({score})"
+    return f"{start} · " + ("отсечён порогом" if candidate["fate"] == "ниже порога" else "сверх top-K") + f" ({score})"
+
+
+def _rag_place_text(source: tuple, rag: dict | None) -> str:
     doc, section, page = source
-    mark = f"место {place} ✓" if place is not None else "не в выдаче"
-    return f"`{doc}` · «{_md_cell(section)}» · стр. {page} — {mark}"
+    return f"`{doc}` · «{_md_cell(section)}» · стр. {page} — {_rag_source_status(source, rag)}"
 
 
 def _rag_control_lines(question: str, rag: dict | None) -> list[str]:
-    """Если вопрос хода — контрольный (текст совпал с `RAG_CONTROL_QUESTIONS`):
-    номер, что проверяет, ожидание и ожидаемые источники с местом в выдаче.
-    Ход без RAG — «поиска не было»; ответ модели не оценивается."""
-    control = next((q for q in RAG_CONTROL_QUESTIONS if q["question"].strip() == question.strip()), None)
+    """Если вопрос хода — контрольный (текст совпал с `RAG_CONTROL_QUESTIONS`)
+    или уточняющий (`RAG_FOLLOWUP_QUESTIONS`, день 23): номер, что проверяет,
+    ожидание и ожидаемые источники с местом «до» и «после». Ход без RAG —
+    «поиска не было»; ответ модели не оценивается."""
+    control = next(
+        (q for q in (*RAG_CONTROL_QUESTIONS, *RAG_FOLLOWUP_QUESTIONS) if q["question"].strip() == question.strip()),
+        None,
+    )
     if control is None:
         return []
-    lines = [
-        "",
-        f"**Контрольный вопрос {control['id']}** — проверяет: {control['checks']}.",
-        "",
-        f"- **Ожидание:** {control['expected']}.",
-    ]
+    if control.get("after"):
+        title = (
+            f"**Уточняющий вопрос {control['id']}** — задаётся после {control['after']} тем же агентом; "
+            f"проверяет: {control['checks']}."
+        )
+    else:
+        title = f"**Контрольный вопрос {control['id']}** — проверяет: {control['checks']}."
+    lines = ["", title, "", f"- **Ожидание:** {control['expected']}."]
     if not control["sources"]:
         lines.append("- **Ожидаемые источники:** нет — вопрос вне корпуса.")
-    elif rag is None:
-        lines.append("- **Ожидаемые источники:** поиска не было.")
-    elif not rag["ok"]:
-        lines.append("- **Ожидаемые источники:** выдачи нет — поиск не удался.")
+    elif rag is None or not rag["ok"]:
+        lines.append(f"- **Ожидаемые источники:** {_rag_source_status(control['sources'][0], rag)}.")
     else:
-        lines.append("- **Ожидаемые источники в выдаче:**")
-        places = sources_found(rag["hits"], control["sources"])
-        lines += [
-            f"  - {_rag_place_text(source, place)}"
-            for source, place in zip(control["sources"], places, strict=True)
-        ]
+        lines.append("- **Ожидаемые источники:**" if rag.get("rerank_ok") else "- **Ожидаемые источники в выдаче:**")
+        lines += [f"  - {_rag_place_text(source, rag)}" for source in control["sources"]]
     lines.append(
         "\n_«Найден» — только про выдачу. Совпадение ответа с ожиданием, верность "
         "ссылок и выдумки оценивает человек._"
@@ -2598,8 +2732,55 @@ def _rag_control_lines(question: str, rag: dict | None) -> list[str]:
     return lines
 
 
+def _rag_mode_line(state: dict, info: dict) -> str:
+    """Строка режима: «RAG ✓ · переписывание ✓ · фильтр ✓ — модель (устройство,
+    точность), порог, 20 → ≤5»; RAG выключен — «второй этап не действует»."""
+    rag_state = state["rag"]
+    if not rag_state["enabled"]:
+        return "- **Режим:** RAG ✗ — флажок снят, второй этап не действует"
+    mark = lambda on: "✓" if on else "✗"  # noqa: E731 — одна строка ради двух вызовов
+    line = (
+        f"- **Режим:** RAG ✓ · переписывание {mark(rag_state['rewrite'])} · "
+        f"фильтр {mark(rag_state['rerank'])}"
+    )
+    if rag_state["rerank"] and info["ok"]:
+        device = (
+            f"{info['rerank_device']}, {info['rerank_dtype']}" if info.get("rerank_loaded")
+            else ("в кэше, ещё не загружен" if info["rerank_cached"] else "⚠️ нет в кэше")
+        )
+        line += (
+            f" — {info['rerank_model'].rsplit('/', 1)[-1]} ({device}), порог "
+            f"{info['threshold']:.2f}, {info['candidates_k']} → ≤{info['top_k']}"
+        )
+    elif info["ok"]:
+        line += f" — {info['top_k']} ближайших к " + ("запросу" if rag_state["rewrite"] else "вопросу")
+    return line
+
+
+def _rag_query_line(last: dict, rewrite_call: dict | None) -> str:
+    """Запрос поиска (§8.3): переписан (с ценой) / без изменений / «вопрос как
+    есть — переписывание выключено» / ⚠️ при сбое."""
+    query = last.get("query") or last["question"]
+    if not last["rewrite"]:
+        return "- **Запрос поиска:** вопрос как есть — переписывание выключено"
+    if not last["rewrite_ok"]:
+        return (
+            f"- **Запрос поиска:** ⚠️ переписывание не удалось: {last['rewrite_error'] or 'причина не названа'} — "
+            "искали по вопросу"
+        )
+    cost = ""
+    if rewrite_call is not None:
+        cost = (
+            f" · {rewrite_call['elapsed']:.2f} с · ≈{_fmt_int(rewrite_call['total_tokens'])} ток. · "
+            f"{_fmt_cost(rewrite_call['cost_usd'])}"
+        )
+    if " ".join(query.split()) == " ".join(last["question"].split()):
+        return f"- **Запрос поиска:** «{_md_cell(query)}» (без изменений{cost})"
+    return f"- **Запрос поиска:** «{_md_cell(query)}» (переписан{cost}) — модель видит вопрос игрока, а не этот запрос"
+
+
 def _rag_md(state: dict) -> str:
-    """Блок «RAG последнего хода» (день 22, §9.3)."""
+    """Блок «RAG последнего хода» (день 22, §9.3; день 23, §8.3)."""
     rag_state = state["rag"]
     lines = ["### RAG последнего хода", ""]
     if not rag_state["available"]:
@@ -2610,14 +2791,11 @@ def _rag_md(state: dict) -> str:
         lines.append(
             f"- **Индекс:** `{info['path']}` · собран {info['built_at'][:16].replace('T', ' ')} · "
             f"{info['strategy']}/{info['lang']} — {info['chunks']} кусков из {info['total']} · "
-            f"top-{info['top_k']} · модель `{info['model']}`"
+            f"модель `{info['model']}`"
         )
     else:
         lines.append(f"- **Индекс:** ⚠️ {info['error']}")
-    lines.append(
-        "- **Режим:** с RAG ✓" if rag_state["enabled"]
-        else "- **Режим:** без RAG — флажок снят"
-    )
+    lines.append(_rag_mode_line(state, info))
     tools = state["tools"]
     if tools is not None and tools["in_request"]:
         lines.append(
@@ -2629,7 +2807,7 @@ def _rag_md(state: dict) -> str:
     last = rag_state["last"]
     if last_call is None and last is None:
         lines += ["", "Ходов ещё не было. Поиск идёт на каждом ходе с включённым RAG, "
-                      "до вызова модели; порога близости нет."]
+                      "до вызова модели."]
         return "\n".join(lines)
 
     if last is not None:
@@ -2651,6 +2829,8 @@ def _rag_md(state: dict) -> str:
         )
         lines += _rag_control_lines(question, None)
         return "\n".join(lines)
+    rewrite_call = (last_call or {}).get("rewrite_call")
+    lines.append(_rag_query_line(last, rewrite_call))
     if not last["ok"]:
         lines.append(
             f"- ⚠️ **Поиск не удался:** {last['error']} — запрос ушёл без выдержек."
@@ -2661,39 +2841,88 @@ def _rag_md(state: dict) -> str:
     rounds = (last_call or {}).get("rounds") or []
     first_prompt = rounds[0]["prompt_tokens"] if rounds else (last_call or {}).get("prompt_tokens")
     loaded = f" (загрузка модели {last['load_s']:.1f} с)" if last["load_s"] else ""
-    lines.append(
-        f"- **Поиск:** {last['elapsed']:.2f} с{loaded} · {len(last['hits'])} из "
-        f"{_fmt_int(last['total'])} кусков · выдержки ≈{_fmt_int(last['tokens'])} токенов "
-        f"(оценка) при `prompt_tokens` хода {_fmt_int(first_prompt)}"
-        + (" (первый раунд)" if len(rounds) > 1 else "")
+    tail = (
+        f"выдержки ≈{_fmt_int(last['tokens'])} токенов (оценка) при `prompt_tokens` хода "
+        f"{_fmt_int(first_prompt)}" + (" (первый раунд)" if len(rounds) > 1 else "")
     )
-    table = [
-        "| место | близость | документ | раздел | страницы | токенов |",
-        "| --- | --- | --- | --- | --- | --- |",
-    ]
-    for place, hit in enumerate(last["hits"], 1):
-        section = _md_cell(hit["section"]) + (f" (часть {hit['part']})" if hit.get("part") else "")
-        table.append(
-            f"| {place} | {hit['score']:.3f} | {_md_cell(hit['doc'])} | {section} | "
-            f"{_hit_pages(hit)} | {hit['tokens']} |"
+    if last["rerank_ok"]:
+        stage1 = max(last["elapsed"] - last["rerank_s"], 0.0)
+        reranked = f" (загрузка {last['rerank_load_s']:.1f} с)" if last["rerank_load_s"] else ""
+        lines.append(
+            f"- **Поиск:** этап 1 — {last['candidates_k']} из {_fmt_int(last['total'])} за {stage1:.2f} с{loaded}; "
+            f"этап 2 — `{last['rerank_model'].rsplit('/', 1)[-1]}`, порог {last['threshold']:.2f}, "
+            f"{last['rerank_s']:.2f} с{reranked}"
         )
-    lines += ["", "\n".join(table)]
+        best = _rag_best(last) or 0.0
+        if _rag_empty(last):
+            lines.append(
+                f"- **Результат:** **ни один из {len(last['candidates'])} не прошёл порог** "
+                f"(лучший {best:.3f}) — в запрос ушло «подходящих не найдено»"
+                + ("" if RAG_EMPTY_INSTRUCTION else " (инструкции пустой выдачи нет — чистый вопрос)")
+                + f"; {tail}"
+            )
+        else:
+            lines.append(
+                f"- **Результат:** **прошли порог: {len(last['hits'])} из {len(last['candidates'])}** · "
+                f"лучшая оценка {best:.3f} · {tail}"
+            )
+    else:
+        lines.append(f"- **Поиск:** {last['elapsed']:.2f} с{loaded} · {len(last['hits'])} из "
+                     f"{_fmt_int(last['total'])} кусков · {tail}")
+        if last["rerank"]:
+            lines.append(
+                f"- ⚠️ **Второй этап не удался:** {last['rerank_error'] or 'причина не названа'} — "
+                f"в запрос ушли {len(last['hits'])} ближайших этапа 1"
+            )
+    if last["hits"]:
+        places = {c["chunk_id"]: n for n, c in enumerate(last["candidates"], 1)}
+        header = ["место", "оценка", "близость", "место до"] if last["rerank_ok"] else ["место", "близость"]
+        table = [
+            "**Ушло в модель (после):**" if last["rerank_ok"] else "**Выдача:**", "",
+            "| " + " | ".join(header + ["документ", "раздел", "страницы", "токенов"]) + " |",
+            "| " + " | ".join("---" for _ in header + [0, 0, 0, 0]) + " |",
+        ]
+        for place, hit in enumerate(last["hits"], 1):
+            section = _md_cell(hit["section"]) + (f" (часть {hit['part']})" if hit.get("part") else "")
+            lead = (
+                f"{place} | {hit['rerank_score']:.3f} | {hit['score']:.3f} | {places.get(hit['chunk_id'], '—')}"
+                if last["rerank_ok"] else f"{place} | {hit['score']:.3f}"
+            )
+            table.append(f"| {lead} | {_md_cell(hit['doc'])} | {section} | {_hit_pages(hit)} | {hit['tokens']} |")
+        lines += ["", "\n".join(table)]
+    if last["rerank_ok"]:
+        table = [
+            f"**Кандидаты этапа 1 (до) — {len(last['candidates'])}:**", "",
+            "| место | близость | оценка | место после | судьба | раздел | страницы |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for place, c in enumerate(last["candidates"], 1):
+            section = _md_cell(c["section"]) + (f" (часть {c['part']})" if c.get("part") else "")
+            table.append(
+                f"| {place} | {c['score']:.3f} | {c['rerank_score']:.3f} | {c['rerank_place']} | "
+                f"{c['fate']} | {section} | {_hit_pages(c)} |"
+            )
+        lines += ["", "\n".join(table)]
     lines += _rag_control_lines(question, last)
     return "\n".join(lines)
 
 
 def _rag_message_update(state: dict) -> dict:
     """Последнее сообщение запроса целиком (выдержки + вопрос) — то самое
-    «объединение с вопросом» (§9.3). Рядом со «Стеком сообщений агента», где тот
+    «объединение с вопросом» (§9.3); у пустой выдачи (день 23) — «подходящих не
+    найдено» + инструкция + вопрос. Рядом со «Стеком сообщений агента», где тот
     же ход — чистый вопрос."""
     last = state["rag"]["last"]
     if last is not None and last["message"]:
+        what = "подходящих не найдено" if last["empty"] else f"≈{_fmt_int(last['tokens'])} токенов выдержек"
         return gr.update(
             value=last["message"],
-            label=f"Последнее сообщение запроса целиком · ≈{_fmt_int(last['tokens'])} токенов выдержек + вопрос",
+            label=f"Последнее сообщение запроса целиком · {what} + вопрос",
         )
     if last is not None and not last["ok"]:
         note = "Поиск не удался — последнее сообщение запроса ушло чистым вопросом."
+    elif last is not None and last["empty"]:
+        note = "Выдача пуста по порогу, инструкции пустой выдачи нет — последнее сообщение ушло чистым вопросом."
     elif state["last_call"] is not None and not state["last_call"]["ok"]:
         note = "Поиска не было: RAG выключен на этом ходе или ход оборвался до поиска."
     elif state["last_call"] is not None:
@@ -2763,6 +2992,9 @@ def _agents_table() -> pd.DataFrame:
         # действует у агента и токены стража. Стоимость и среднее время хода
         # включают и стража.
         "инварианты", "токены стража",
+        # Колонка дня 23 — в конце (§8.4): токены переписывания запроса.
+        # Стоимость и среднее время хода включают и его.
+        "токены переписывания",
     ]
     rows = []
     for a in agents():
@@ -2774,11 +3006,12 @@ def _agents_table() -> pd.DataFrame:
                 (t.cost_usd or 0.0) + (t.service_cost_usd or 0.0)
                 + (t.memory_cost_usd or 0.0) + (t.route_cost_usd or 0.0)
                 + (t.tracker_cost_usd or 0.0) + (t.guard_cost_usd or 0.0)
+                + (t.rewrite_cost_usd or 0.0)
                 for t in turns
             )
             cost_str = _fmt_cost(total_cost)
         avg_time = (
-            f"{sum(t.elapsed + t.service_elapsed + t.memory_elapsed + t.route_elapsed + t.tracker_elapsed + t.guard_elapsed for t in turns) / len(turns):.2f}"
+            f"{sum(t.elapsed + t.service_elapsed + t.memory_elapsed + t.route_elapsed + t.tracker_elapsed + t.guard_elapsed + t.rewrite_elapsed for t in turns) / len(turns):.2f}"
             if turns else "н/д"
         )
         task_view = a.task_view
@@ -2810,6 +3043,7 @@ def _agents_table() -> pd.DataFrame:
             "токены трекера": sum(t.tracker_tokens for t in turns),
             "инварианты": invariant_view.active if invariant_view else "—",
             "токены стража": sum(t.guard_tokens for t in turns),
+            "токены переписывания": sum(t.rewrite_tokens for t in turns),
         })
     return pd.DataFrame(rows, columns=columns)
 
@@ -2826,9 +3060,10 @@ def _profile_choice_options(choices: list[str]) -> list[tuple[str, str]]:
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 40 значений
+    """Полный вид на состояние агента — фиксированный кортеж из 41 значения
     (18 — до дня 10, 22 — до дня 11, 26 — до дня 12, 29 — до дня 13, 31 — до
-    дня 14, 34 — до дня 17, 37 — до дня 22; дни 14, 17 и 22 добавляют по три),
+    дня 14, 34 — до дня 17, 37 — до дня 22, 40 — до дня 23; дни 14, 17 и 22
+    добавляют по три, день 23 — одно),
     позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
@@ -3005,6 +3240,9 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         _rag_md(state),
         # 40. последнее сообщение запроса целиком — выдержки + вопрос
         _rag_message_update(state),
+        # 41. группа «RAG: второй этап поиска» — значение и активность из
+        #     агента (день 23)
+        _rag_stages_update(state),
     )
 
 
@@ -3060,6 +3298,9 @@ def _new_agent(preset_name: str) -> Agent:
         # `presets.py` (день 22, §9.1). Ветку `fork()` собирает с теми же.
         retriever=RULES_INDEX,
         rag_instruction=RAG_INSTRUCTION,
+        rag_rewrite_prompt=RAG_REWRITE_PROMPT,
+        rag_rewrite_max_tokens=RAG_REWRITE_MAX_TOKENS,
+        rag_empty_instruction=RAG_EMPTY_INSTRUCTION,
     )
 
 
@@ -3152,6 +3393,9 @@ def _restore_agents() -> int:
             # RAG включён у восстановленного агента, как у нового (день 22, §2.5).
             retriever=RULES_INDEX,
             rag_instruction=RAG_INSTRUCTION,
+            rag_rewrite_prompt=RAG_REWRITE_PROMPT,
+            rag_rewrite_max_tokens=RAG_REWRITE_MAX_TOKENS,
+            rag_empty_instruction=RAG_EMPTY_INSTRUCTION,
         )
         restored += 1
     logger.info(
@@ -4048,8 +4292,14 @@ def on_rag_in_request(agent: Agent | None, enabled: bool, preset_name: str):
     agent.set_rag_in_request(bool(enabled))
     if agent.rag_in_request:
         status = (
-            f"RAG включён: со следующего вопроса перед ответом — поиск {RAG_TOP_K} "
-            "ближайших кусков правил (по структуре, русские) и выдержки в запросе."
+            "RAG включён: со следующего вопроса перед ответом — поиск по правилам "
+            "(по структуре, русские) и выдержки в запросе"
+            + (
+                f"; второй этап: переписывание запроса {'✓' if agent.rag_rewrite else '—'}, "
+                f"переранжирование и порог {'✓' if agent.rag_rerank else '—'}."
+                if agent.rag_rewrite or agent.rag_rerank
+                else f" — {RAG_TOP_K} ближайших, как на дне 22."
+            )
         )
     else:
         status = (
@@ -4062,6 +4312,35 @@ def on_rag_in_request(agent: Agent | None, enabled: bool, preset_name: str):
             " Инструменты MCP включены — для сравнения «общие знания» и «по "
             "правилам» выключите и их."
         )
+    return (agent, gr.update(), *_view(agent, status))
+
+
+def on_rag_stages(agent: Agent | None, stages: list[str], preset_name: str):
+    """«RAG: второй этап поиска» (день 23, §8.2) — два независимых пункта:
+    переписать запрос и переранжировать с порогом. Оба сняты — поиск дня 22.
+    Нового агента не создаёт и ничего не пишет; сам флажок RAG не меняется."""
+    if agent is None:  # страховка на случай сессии без сработавшего load
+        agent = _new_agent(preset_name)
+
+    chosen = set(stages or ())
+    agent.set_rag_stages(RAG_STAGE_REWRITE in chosen, RAG_STAGE_RERANK in chosen)
+    parts = []
+    if agent.rag_rewrite:
+        parts.append("запрос переписывается по последнему обмену (служебный вызов)")
+    elif RAG_STAGE_REWRITE in chosen:
+        parts.append("⚠️ переписывание недоступно агенту (нет промпта) — ищем по вопросу как есть")
+    else:
+        parts.append("ищем по вопросу как есть")
+    if agent.rag_rerank:
+        parts.append(
+            f"{RAG_CANDIDATES} ближайших оценивает реранкер, ниже порога {RAG_RERANK_THRESHOLD:.2f} — "
+            f"отсев, в запрос не больше {RAG_TOP_K}"
+        )
+    else:
+        parts.append(f"в запрос — {RAG_TOP_K} ближайших")
+    status = "RAG, второй этап: " + "; ".join(parts) + "."
+    if not agent.rag_in_request:
+        status += " Флажок «RAG» снят — второй этап не действует, пока он выключен."
     return (agent, gr.update(), *_view(agent, status))
 
 
@@ -5132,6 +5411,13 @@ _RAG_QUESTION_LABELS: list[str] = [
     "К10 · Undertow (вне правил)",
 ]
 assert len(_RAG_QUESTION_LABELS) == len(RAG_CONTROL_QUESTIONS)
+# Уточняющие вопросы дня 23 — `presets.RAG_FOLLOWUP_QUESTIONS`.
+_RAG_FOLLOWUP_LABELS: list[str] = [
+    "У1 · после К4: перемещение",
+    "У2 · после К1: играю один",
+    "У3 · после К5: кто поднимет",
+]
+assert len(_RAG_FOLLOWUP_LABELS) == len(RAG_FOLLOWUP_QUESTIONS)
 
 
 # Чат и дебаг-панель — ровно пополам; кнопки компактнее дефолтных.
@@ -5142,13 +5428,15 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 22, неделя 5 — **первый RAG-запрос**: перед ответом ассистент "
-        "ищет в индексе правил дня 21 (нарезка по структуре) пять кусков, "
-        "ближайших к вопросу, прикладывает их к вопросу **выдержками со "
-        "ссылками** на документ, раздел и страницу и только потом зовёт "
-        "модель. У агента **два режима — с RAG и без**: переключатель слева; "
-        "для сравнения — **10 контрольных вопросов** с ожиданиями и "
-        "источниками (у поля ввода) и программа `./run.sh rag-eval`."
+        "День 23, неделя 5 — **второй этап поиска и переписывание запроса**: "
+        "перед поиском модель превращает вопрос и последний обмен в "
+        "самостоятельный запрос на русском, поиск берёт 20 ближайших кусков "
+        "индекса правил, **локальный реранкер** оценивает каждый, куски ниже "
+        "порога отсекаются, в запрос уходит не больше пяти — а если не прошёл "
+        "никто, модель узнаёт, что подходящего не нашлось. Пункты второго "
+        "этапа включаются отдельно (**четыре режима**: простой, фильтр, "
+        "переписывание, полный); для сравнения — 10 контрольных и 3 "
+        "уточняющих вопроса (у поля ввода) и программа `./run.sh rag-eval`."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -5217,12 +5505,30 @@ with gr.Blocks(title="TooManyRules") as demo:
                 value=True,
                 label="RAG: выдержки из правил в запросе",
                 info=(
-                    f"Включено — перед каждым ответом приложение ищет в индексе "
-                    f"правил {RAG_TOP_K} ближайших кусков (по структуре, русские) и "
-                    "прикладывает их к вопросу выдержками; выключено — модель "
-                    "отвечает без выдержек, как на дне 20. Для сравнения "
+                    "Включено — перед каждым ответом приложение ищет в индексе "
+                    "правил (по структуре, русские) и прикладывает найденные "
+                    "куски к вопросу выдержками; выключено — модель "
+                    "отвечает без выдержек, как на дне 20 (и ни переписывания, "
+                    "ни второго этапа). Для сравнения "
                     "выключите и инструменты MCP: иначе FAQ издателя "
                     "подмешивается в оба режима."
+                ),
+            )
+            # «RAG: второй этап поиска» (день 23, §8.2) — сразу под флажком
+            # RAG: два независимых пункта, четыре комбинации. Событие —
+            # `input` (правило `CheckboxGroup`, день 11), значение и
+            # активность — из `_view()`.
+            rag_stages_group = gr.CheckboxGroup(
+                choices=RAG_STAGE_CHOICES,
+                value=[RAG_STAGE_REWRITE, RAG_STAGE_RERANK],
+                label="RAG: второй этап поиска",
+                info=(
+                    "Переписать — модель делает из вопроса и последнего обмена "
+                    "самостоятельный вопрос на русском, искать по нему "
+                    "(служебный вызов). Переранжировать — "
+                    f"{RAG_CANDIDATES} ближайших кусков оценивает реранкер, ниже "
+                    f"порога {RAG_RERANK_THRESHOLD:.2f} — отсев, в запрос не больше "
+                    f"{RAG_TOP_K}. Оба сняты — поиск дня 22."
                 ),
             )
             # «Инструменты MCP в запросе» (день 17, §8.2) — теперь вторым из
@@ -5322,8 +5628,20 @@ with gr.Blocks(title="TooManyRules") as demo:
                 example_labels=_RAG_QUESTION_LABELS,
                 examples_per_page=len(RAG_CONTROL_QUESTIONS),
                 label=(
-                    "Контрольные вопросы дня 22 — каждый задавайте новому агенту; "
+                    "Контрольные вопросы — каждый задавайте новому агенту; "
                     "для сравнения выключите инструменты MCP"
+                ),
+            )
+            # Уточняющие вопросы дня 23 (§8.5) — рядом с контрольными: каждый
+            # задаётся тем же агентом сразу после своего контрольного.
+            gr.Examples(
+                examples=[[q["question"]] for q in RAG_FOLLOWUP_QUESTIONS],
+                inputs=[question_input],
+                example_labels=_RAG_FOLLOWUP_LABELS,
+                examples_per_page=len(RAG_FOLLOWUP_QUESTIONS),
+                label=(
+                    "Уточняющие (день 23) — задавайте тем же агентом сразу после "
+                    "указанного контрольного"
                 ),
             )
             with gr.Row():
@@ -5698,21 +6016,27 @@ with gr.Blocks(title="TooManyRules") as demo:
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # RAG: первый запрос (день 22, §9.3) — развёрнут наверху панели.
-            # Описание — статичный Markdown; «RAG последнего хода» и последнее
-            # сообщение запроса целиком — выходы `_view()` (38-40).
-            with gr.Accordion("RAG: первый запрос (день 22)", open=True):
+            # RAG: фильтр и переписывание запроса (день 23, §8.3) — развёрнут
+            # наверху панели. Описание — статичный Markdown; «RAG последнего
+            # хода» и последнее сообщение запроса целиком переехали сюда из
+            # блока дня 22 (правило дней 19-20: блок хода живёт в блоке
+            # текущего дня) — те же компоненты и выходы `_view()` (39-40).
+            with gr.Accordion("RAG: фильтр и переписывание запроса (день 23)", open=True):
                 gr.Markdown(
-                    "**Цепочка одного хода:** вопрос → *поиск* пяти ближайших "
-                    "кусков индекса правил → *выдержки + вопрос* одним "
-                    "сообщением → модель. Выдержки — часть последнего сообщения "
-                    "запроса, перед вопросом; **в историю идёт только вопрос**, "
-                    "ниже это видно рядом со «Стеком сообщений агента». Поиск — "
-                    "работа кода, а не решение модели: он идёт на каждом ходе с "
-                    "включённым RAG, порога близости нет, лишние выдержки "
-                    "отсекает модель по инструкции. **Качество ответов оценивает "
-                    "человек**, код сверяет только выдачу с ожидаемыми "
-                    "источниками контрольных вопросов."
+                    "**Цепочка одного хода:** вопрос → *переписывание* (служебный "
+                    "вызов модели: последний обмен + сообщение → самостоятельный "
+                    "запрос на русском) → *этап 1*: 20 ближайших кусков индекса "
+                    "(**top-K до**) → *этап 2*: локальный реранкер оценивает "
+                    "каждую пару «запрос, кусок», ниже порога — отсев, не больше "
+                    "пяти (**top-K после**) → выдержки + вопрос → модель. "
+                    "**Запрос поиска нужен только поиску:** модель видит вопрос "
+                    "игрока, в историю идёт только он. Не прошёл порог никто — в "
+                    "запрос уходит «подходящих не найдено» и инструкция пустой "
+                    "выдачи, а не чистый вопрос. Переписывание — служебный вызов "
+                    "модели (цена в «Последнем вызове»), второй этап — локальная "
+                    "модель, не API. **Качество ответов оценивает человек**, код "
+                    "сверяет только выдачу с ожидаемыми источниками — «до» и "
+                    "«после» второго этапа."
                 )
                 rag_md = gr.Markdown("")
                 with gr.Accordion(
@@ -5725,6 +6049,22 @@ with gr.Blocks(title="TooManyRules") as demo:
                         interactive=False,
                         buttons=["copy"],
                     )
+            # RAG: первый запрос (день 22, §9.3) — с дня 23 свёрнут под блоком
+            # дня 23 (§8.5); остаётся статичное описание дня 22.
+            with gr.Accordion("RAG: первый запрос (день 22)", open=False):
+                gr.Markdown(
+                    "**Цепочка одного хода (день 22):** вопрос → *поиск* пяти "
+                    "ближайших кусков индекса правил → *выдержки + вопрос* одним "
+                    "сообщением → модель. Выдержки — часть последнего сообщения "
+                    "запроса, перед вопросом; **в историю идёт только вопрос**, "
+                    "выше, в блоке дня 23, это видно рядом со «Стеком сообщений "
+                    "агента». Поиск — работа кода, а не решение модели: он идёт "
+                    "на каждом ходе с включённым RAG. Оба пункта «второго этапа» "
+                    "сняты — и это ровно день 22: порога нет, лишние выдержки "
+                    "отсекает модель по инструкции. **Качество ответов оценивает "
+                    "человек**, код сверяет только выдачу с ожидаемыми "
+                    "источниками контрольных вопросов."
+                )
             # Оркестрация MCP (день 20, §8.2) — с дня 22 свёрнут под блоком
             # дня 22 (§9.4); «Инструменты последнего хода» остаются в нём: день 22
             # не про инструменты, а сравнение идёт без них. Описание — статичный Markdown; каталог группы по кнопке
@@ -6132,6 +6472,7 @@ with gr.Blocks(title="TooManyRules") as demo:
         rag_in_request_checkbox,
         rag_md,
         rag_message_box,
+        rag_stages_group,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
     # Выходы формы редактора профиля (день 12, §7.3) — отдельно от
@@ -6371,6 +6712,15 @@ with gr.Blocks(title="TooManyRules") as demo:
     rag_in_request_checkbox.input(
         on_rag_in_request,
         inputs=[agent_state, rag_in_request_checkbox, preset_dropdown],
+        outputs=COMMON_OUTPUTS,
+    )
+
+    # «RAG: второй этап поиска» (день 23, §8.2) — `input`, как у остальных
+    # групп-флажков: приходит ровно один раз на клик и не приходит на
+    # обновление значения из `_view()`.
+    rag_stages_group.input(
+        on_rag_stages,
+        inputs=[agent_state, rag_stages_group, preset_dropdown],
         outputs=COMMON_OUTPUTS,
     )
 

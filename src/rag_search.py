@@ -1,4 +1,4 @@
-# TooManyRules — поиск по индексу правил (день 22, неделя 5).
+# TooManyRules — поиск по индексу правил (день 22, неделя 5; второй этап — день 23).
 #
 # Индекс строит `rag_index.py` (день 21), читает — этот модуль: первый RAG-запрос
 # ассистента и `--probe` программы индексации ищут одной функцией
@@ -20,6 +20,14 @@
 # состояние (перечитывание, загрузка модели, вектор вопроса), — под замком:
 # Gradio выполняет обработчики параллельно, а модель одна на процесс.
 #
+# С дня 23 (спецификация, §4) у поиска есть второй этап: этап 1 берёт
+# `candidates_k` ближайших кусков, этап 2 — `Reranker` из `embedder.py` —
+# оценивает каждую пару «запрос, кусок» (0..1); куски ниже порога отсеиваются, из
+# прошедших уходит не больше `top_k`. Реранкер грузится лениво при первом
+# поиске со вторым этапом, из кэша и без скачивания, под тем же замком, что и
+# модель эмбеддингов. Сбой второго этапа — выдача этапа 1 с пометкой, а не сбой
+# поиска; пустая выдача после порога — штатный ответ (`ok=True`, `hits=[]`).
+#
 # `search()` не бросает: сбой возвращается словарём (`ok=False`, `error`), ход
 # агента из-за него не отменяется (правило каталога инструментов, день 17).
 # Логи — logging, `[RAG]`; каждый ход агент пишет свою строку.
@@ -30,12 +38,12 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import closing
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
 
-from embedder import Embedder
+from embedder import Embedder, Reranker, in_cache
 
 logger = logging.getLogger("toomanyrules.rag")
 
@@ -85,7 +93,8 @@ def check_index(path: Path) -> int:
 @dataclass(frozen=True)
 class Hit:
     """Кусок выдачи. `tokens` — токенизатором модели эмбеддингов (из индекса),
-    `score` — косинусная близость к вопросу."""
+    `score` — косинусная близость к вопросу, `rerank_score` (с дня 23) —
+    оценка реранкера 0..1; `None` — второго этапа не было."""
 
     chunk_id: str
     doc: str
@@ -98,6 +107,7 @@ class Hit:
     text: str
     tokens: int
     score: float
+    rerank_score: float | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -134,12 +144,21 @@ class RulesIndex:
 
     def __init__(
         self, path: Path, strategy: str, lang: str, top_k: int,
+        candidates_k: int = 0, rerank_model: str = "", threshold: float = 0.0,
+        rerank_max_length: int = 1024, rerank_batch: int = 4,
         allow_download: bool = False, expected_model: str = "",
     ) -> None:
         self.path = Path(path)
         self.strategy = strategy
         self.lang = lang
         self.top_k = top_k
+        # Второй этап (день 23, §4.1): `rerank_model=""` — его нет,
+        # `candidates_k=0` — кандидатов столько же, сколько выдачи.
+        self.candidates_k = candidates_k or top_k
+        self.rerank_model = rerank_model
+        self.threshold = threshold
+        self.rerank_max_length = rerank_max_length
+        self.rerank_batch = rerank_batch
         self.allow_download = allow_download
         self.expected_model = expected_model
         self._lock = threading.RLock()
@@ -150,12 +169,18 @@ class RulesIndex:
         self._strategies = np.zeros(0, dtype=object)
         self._langs = np.zeros(0, dtype=object)
         self._embedder: Embedder | None = None
+        self._reranker: Reranker | None = None
         self._warned_model = ""
         self._last_info: dict | None = None
 
     @property
     def name(self) -> str:
-        return f"{self.strategy}/{self.lang}, top-{self.top_k} · {shown(self.path)}"
+        if not self.rerank_model:
+            return f"{self.strategy}/{self.lang}, top-{self.top_k} · {shown(self.path)}"
+        return (
+            f"{self.strategy}/{self.lang}: {self.candidates_k} → {self.rerank_model.rsplit('/', 1)[-1]} "
+            f"≥ {self.threshold:.2f} → ≤{self.top_k} · {shown(self.path)}"
+        )
 
     @property
     def device(self) -> str:
@@ -263,7 +288,59 @@ class RulesIndex:
         logger.info("[RAG] модель %s загружена за %.1f с · устройство %s", model, loaded, self._embedder.device)
         return loaded
 
+    def _load_reranker(self) -> float:
+        """Загрузка реранкера (если ещё нет); секунды загрузки, 0.0 — уже был в
+        памяти. Под замком; скачивания нет, пока `allow_download` не разрешён."""
+        if not self.rerank_model:
+            raise RagError("второй этап не настроен")
+        if self._reranker is None:
+            self._reranker = Reranker(self.rerank_model, self.rerank_max_length, self.rerank_batch)
+        if self._reranker.loaded:
+            return 0.0
+        step = time.perf_counter()
+        try:
+            self._reranker.load(
+                lambda: logger.info(
+                    "[RAG] модели реранкера %s нет в кэше — скачиваю ≈1,5 ГБ в кэш Hugging Face (один раз)",
+                    self.rerank_model,
+                ),
+                allow_download=self.allow_download,
+            )
+        except OSError as exc:
+            raise RagError(str(exc)) from exc
+        loaded = time.perf_counter() - step
+        logger.info(
+            "[RAG] реранкер %s загружен за %.1f с · устройство %s · %s",
+            self.rerank_model, loaded, self._reranker.device, self._reranker.dtype,
+        )
+        return loaded
+
+    def _rerank(self, query: str, hits: Sequence[Hit]) -> tuple[list[Hit], float, float]:
+        """Второй этап над готовыми кусками: `(куски с оценками по убыванию,
+        секунды загрузки, секунды оценки)`. Под замком (зовут `rerank()` и
+        `search()`); бросает `RagError`."""
+        load_s = self._load_reranker()
+        step = time.perf_counter()
+        scores = self._reranker.score(query, [f"{hit.section}\n{hit.text}" for hit in hits])
+        score_s = time.perf_counter() - step
+        order = sorted(range(len(hits)), key=lambda i: (-float(scores[i]), i))
+        return [replace(hits[i], rerank_score=float(scores[i])) for i in order], load_s, score_s
+
     # --- Публичное ---------------------------------------------------------------
+
+    def rerank(self, query: str, hits: Sequence[Hit]) -> list[Hit]:
+        """Второй этап над готовыми кусками (день 23, §4.1): оценки реранкера,
+        порядок по убыванию (при равенстве — исходный), `rerank_score` у
+        каждого. Отсев по порогу и потолок делает `search()`. Бросает
+        `RagError`."""
+        with self._lock:
+            try:
+                return self._rerank(query, hits)[0]
+            except RagError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("[RAG] реранкер не сработал")
+                raise RagError(f"второй этап: {exc}") from exc
 
     def info(self) -> dict:
         """Состояние индекса без модели: для строки при старте и шапки блока.
@@ -284,10 +361,10 @@ class RulesIndex:
         try:
             self._refresh()
         except RagError as exc:
-            return {"ok": False, "error": str(exc), "path": shown(self.path)}
+            return {"ok": False, "error": str(exc), "path": shown(self.path), **self._stage2_info()}
         except Exception as exc:  # noqa: BLE001 — панель не должна падать от индекса
             logger.exception("[RAG] info() не удался")
-            return {"ok": False, "error": f"индекс: {exc}", "path": shown(self.path)}
+            return {"ok": False, "error": f"индекс: {exc}", "path": shown(self.path), **self._stage2_info()}
         own = int(self._mask(self.strategy, self.lang).sum())
         counts: dict[str, int] = {}
         for strategy in self._strategies:
@@ -297,7 +374,23 @@ class RulesIndex:
             "model": self._meta["embed_model"], "device": self._meta.get("device", ""),
             "chunks": own, "total": len(self._rows), "by_strategy": counts,
             "strategy": self.strategy, "lang": self.lang, "top_k": self.top_k,
+            **self._stage2_info(),
         }
+
+    def _stage2_info(self) -> dict:
+        """Условия второго этапа для строки при старте и панели (день 23, §4.1):
+        модели не грузит."""
+        loaded = self._reranker is not None and self._reranker.loaded
+        info = {
+            "candidates_k": self.candidates_k, "rerank_model": self.rerank_model,
+            "threshold": self.threshold,
+            "rerank_cached": in_cache(self.rerank_model) if self.rerank_model else False,
+            "rerank_loaded": loaded,
+        }
+        if loaded:
+            info["rerank_device"] = self._reranker.device
+            info["rerank_dtype"] = self._reranker.dtype
+        return info
 
     def nearest(
         self, question: str, strategy: str | None = None, lang: str | None = None, top: int | None = None,
@@ -340,13 +433,23 @@ class RulesIndex:
             self.load_model()
             return self._embedder.embed_query(question)
 
-    def search(self, question: str) -> dict:
-        """Протокол `Retriever` агента: те же ближайшие куски со стратегией,
-        языком и `top_k` экземпляра, словарём, без исключений. `elapsed` — вся
-        работа поиска без загрузки модели (`load_s` отдельно)."""
+    def search(self, question: str, rerank: bool = False) -> dict:
+        """Протокол `Retriever` агента: ближайшие куски со стратегией, языком и
+        `top_k` экземпляра, словарём, без исключений. `rerank=False` — день 22:
+        `top_k` ближайших. `rerank=True` (день 23, §4.2) — этап 1 берёт
+        `candidates_k` ближайших, этап 2 оценивает их реранкером; в `hits` —
+        прошедшие порог, не больше `top_k`, по убыванию оценки. **`ok=True` с
+        пустыми `hits` — штатный ответ**: второй этап удался и отсёк всех. Сбой
+        этапа 2 — `hits` этапа 1 (`top_k` ближайших), `rerank_ok=False` и
+        причина. `elapsed` — вся работа поиска без обеих загрузок (`load_s` —
+        модель эмбеддингов, `rerank_load_s` — реранкер)."""
         started = time.perf_counter()
         result = {
             "ok": False, "error": "", "elapsed": 0.0, "load_s": 0.0, "embed_s": 0.0, "total": 0, "hits": [],
+            "query": question, "rerank": bool(rerank), "rerank_ok": False, "rerank_error": "",
+            "rerank_model": self.rerank_model, "threshold": self.threshold,
+            "candidates_k": self.candidates_k, "top_k": self.top_k,
+            "rerank_s": 0.0, "rerank_load_s": 0.0, "candidates": [],
         }
         try:
             with self._lock:
@@ -359,15 +462,60 @@ class RulesIndex:
                 step = time.perf_counter()
                 vector = self._embedder.embed_query(question)
                 result["embed_s"] = time.perf_counter() - step
-                result["hits"] = [hit.as_dict() for hit in self._ranked(mask, vector, self.top_k)]
+                if not rerank:
+                    result["hits"] = [hit.as_dict() for hit in self._ranked(mask, vector, self.top_k)]
+                else:
+                    self._second_stage(result, question, self._ranked(mask, vector, self.candidates_k))
             result["ok"] = True
         except RagError as exc:
             result["error"] = str(exc)
         except Exception as exc:  # noqa: BLE001 — сбой поиска не должен отменять ход
             logger.exception("[RAG] поиск не удался")
             result["error"] = f"поиск: {exc}"
-        result["elapsed"] = max(time.perf_counter() - started - result["load_s"], 0.0)
+        result["elapsed"] = max(
+            time.perf_counter() - started - result["load_s"] - result["rerank_load_s"], 0.0,
+        )
         return result
+
+    def _second_stage(self, result: dict, query: str, stage1: list[Hit]) -> None:
+        """Этап 2 поиска (день 23, §4.2): дописывает в `result` выдачу,
+        кандидатов и условия. Под замком; не бросает — сбой реранкера
+        превращается в выдачу этапа 1 с причиной (§2.3)."""
+        try:
+            ranked, load_s, score_s = self._rerank(query, stage1)
+        except RagError as exc:
+            result["rerank_error"] = str(exc)
+        except Exception as exc:  # noqa: BLE001 — реранкер не должен отменять поиск
+            logger.exception("[RAG] реранкер не сработал")
+            result["rerank_error"] = f"второй этап: {exc}"
+        else:
+            result["rerank_load_s"] = load_s
+            result["rerank_s"] = score_s
+            result["rerank_ok"] = True
+            kept = [hit for hit in ranked if hit.rerank_score >= self.threshold][:self.top_k]
+            kept_ids = {hit.chunk_id for hit in kept}
+            result["hits"] = [hit.as_dict() for hit in kept]
+            by_id = {hit.chunk_id: (place, hit) for place, hit in enumerate(ranked, 1)}
+            candidates = []
+            for hit in stage1:
+                place, scored = by_id[hit.chunk_id]
+                if hit.chunk_id in kept_ids:
+                    fate = "в выдаче"
+                elif scored.rerank_score < self.threshold:
+                    fate = "ниже порога"
+                else:
+                    fate = "сверх top-K"
+                candidates.append({
+                    "chunk_id": hit.chunk_id, "doc": hit.doc, "title": hit.title, "section": hit.section,
+                    "part": hit.part, "page_from": hit.page_from, "page_to": hit.page_to,
+                    "tokens": hit.tokens, "score": hit.score, "rerank_score": scored.rerank_score,
+                    "rerank_place": place, "fate": fate,
+                })
+            result["candidates"] = candidates
+            return
+        # Сбой: в запрос уходят `top_k` ближайших этапа 1, без оценок.
+        result["hits"] = [hit.as_dict() for hit in stage1[:self.top_k]]
+        logger.warning("[RAG] второй этап не удался: %s — выдача без фильтра", result["rerank_error"])
 
 
 __all__ = [

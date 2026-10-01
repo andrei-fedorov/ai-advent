@@ -113,6 +113,7 @@ import functools
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -215,6 +216,16 @@ TOOL_CHOICE_NONE = "none"
 # кусков выдачи.
 RAG_HEADER = "Выдержки из документов"
 RAG_QUESTION_LABEL = "Вопрос:"
+# Подпись пустой выдачи (день 23, §2.4, §6.5): второй этап отсёк всех
+# кандидатов — в запросе не чистый вопрос, а эта подпись, инструкция пустой
+# выдачи и вопрос.
+RAG_EMPTY_HEADER = f"{RAG_HEADER} — подходящих не найдено"
+
+# Переписывание запроса поиска (день 23, §2.2) — седьмая служебная работа,
+# подпись в `ServiceCall.memory_label`: своя цена (`rewrite_*`), не входит ни в
+# `service_*`, ни в `memory_*`, `route_*`, `tracker_*`, `guard_*`, `sampling_*`.
+REWRITE_CALL_LABEL = "Переписывание запроса"
+REWRITE_NO_HISTORY = "разговор только начинается"
 
 # Слои в запросе по умолчанию — все переключаемые. Отдельное имя, а не
 # `memory.REQUEST_LAYERS` на месте: в конструкторе и в `fork()` имя `memory`
@@ -280,9 +291,10 @@ class ServiceCall:
     """Служебный вызов модели: стратегией (день 9), моделью памяти — разбор
     памяти (день 11, `kind="memory"`), роутером профиля (день 12,
     `kind="route"`), трекером задачи (день 13, `kind="task"`), стражем
-    инвариантов (день 14, `kind="invariant"`) или сэмплингом (день 19,
-    `kind="sampling"`). Первые пять сделаны до основного запроса; сэмплинг —
-    единственный, что идёт внутри него, между раундами (§6.2).
+    инвариантов (день 14, `kind="invariant"`), переписыванием запроса поиска
+    (день 23, `kind="rewrite"`) или сэмплингом (день 19, `kind="sampling"`).
+    Все, кроме сэмплинга, сделаны до основного запроса; сэмплинг — единственный,
+    что идёт внутри него, между раундами (§6.2).
 
     Это настоящий вызов: он считается в счётчиках агента и процесса наравне с
     обычными и логируется так же. Но это не ход — он не пишет в стек
@@ -379,6 +391,38 @@ class RagRecord:
     message: str = ""
     tokens: int = 0
     question: str = ""
+    # Поля дня 23 (§6.4) — в конце и с умолчаниями. `query` — что искали
+    # (вопрос или переписанный запрос; модель его не видит), `rewrite*` —
+    # переписывание просили / удалось / почему нет, `rerank*` — то же для
+    # второго этапа, `candidates` — кандидаты этапа 1 в порядке этапа 1, как
+    # пришли от `Retriever.search()`. Смысл `ok` изменился один раз: `False` —
+    # только сбой поиска; пустая выдача после второго этапа — `ok=True`,
+    # `empty=True`.
+    query: str = ""
+    rewrite: bool = False
+    rewrite_ok: bool = False
+    rewrite_error: str = ""
+    rerank: bool = False
+    rerank_ok: bool = False
+    rerank_error: str = ""
+    rerank_model: str = ""
+    threshold: float = 0.0
+    candidates_k: int = 0
+    rerank_s: float = 0.0
+    rerank_load_s: float = 0.0
+    candidates: tuple[dict, ...] = ()
+
+    @property
+    def empty(self) -> bool:
+        """Выдача пуста по порогу: второй этап удался и отсёк всех."""
+        return self.ok and self.rerank_ok and not self.hits
+
+    @property
+    def best(self) -> float | None:
+        """Наибольшая оценка реранкера среди кандидатов; `None` — второго этапа
+        не было. С дня 24 — число, с которым сравнится порог «не знаю»."""
+        scores = [c["rerank_score"] for c in self.candidates if c.get("rerank_score") is not None]
+        return max(scores) if scores else None
 
 
 @dataclass(frozen=True)
@@ -484,6 +528,9 @@ class AgentReply:
     # выключен или его у агента нет. Есть и у неудачного хода, если поиск успел
     # пройти.
     rag: RagRecord | None = None
+    # Поле дня 23 — в конце (§6.3): переписывание запроса этого хода; `None` —
+    # не вызывалось (RAG или пункт «переписать» выключен, нет промпта).
+    rewrite_call: ServiceCall | None = None
 
 
 @dataclass(frozen=True)
@@ -576,6 +623,11 @@ class TurnStats:
     # как у остальных служебных работ (спецификация дня 19, §7.2).
     sampling_tokens: int = 0
     sampling_cost_usd: float | None = None
+    # Поля дня 23 — снова в конце: цена переписывания запроса этого хода — своя
+    # колонка (спецификация дня 23, §6.3).
+    rewrite_tokens: int = 0
+    rewrite_cost_usd: float | None = None
+    rewrite_elapsed: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -781,8 +833,15 @@ class Retriever(Protocol):
     def name(self) -> str: ...        # для лога
     # {"ok", "error", "elapsed", "load_s", "embed_s", "total",
     #  "hits": [{"chunk_id", "doc", "title", "section", "part",
-    #            "page_from", "page_to", "text", "tokens", "score"}]}
-    def search(self, question: str) -> dict: ...
+    #            "page_from", "page_to", "text", "tokens", "score",
+    #            "rerank_score"}]}
+    # С дня 23 (§4.2) `rerank=True` просит второй этап (оценка кандидатов
+    # реранкером, порог, потолок) и ответ дописывает: "query", "rerank",
+    # "rerank_ok", "rerank_error" (сбой этапа 2 — `hits` этапа 1),
+    # "rerank_model", "threshold", "candidates_k", "top_k", "rerank_s",
+    # "rerank_load_s", "candidates" (этап 1 в его порядке, без текста). `ok`
+    # с пустыми `hits` — штатный ответ: второй этап отсёк всех.
+    def search(self, question: str, rerank: bool = False) -> dict: ...
 
 
 # --- Счётчики процесса и реестр агентов ----------------------------------
@@ -1030,6 +1089,13 @@ class Agent:
         # передаёт `app.py` из `presets.py`.
         retriever: Retriever | None = None,
         rag_instruction: str = "",
+        # Параметры дня 23 (§6.1) — снова в конце, с умолчаниями: пустой промпт
+        # переписывания — переписывания нет; пустая инструкция пустой выдачи —
+        # пустая выдача уходит чистым вопросом, как сбой поиска. Настоящие
+        # передаёт `app.py` из `presets.py`.
+        rag_rewrite_prompt: str = "",
+        rag_rewrite_max_tokens: int = 100,
+        rag_empty_instruction: str = "",
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -1076,6 +1142,16 @@ class Agent:
         self._rag_instruction = rag_instruction
         self._rag_in_request: bool = True
         self._last_rag: RagRecord | None = None
+        # Второй этап (день 23): промпт переписывания, потолок его ответа,
+        # инструкция пустой выдачи и положение двух пунктов «RAG: второй этап
+        # поиска» — состояние агента, но не диалога (§6.2): на диск не едет, в
+        # checkpoint не входит, у нового, восстановленного агента и у ветки
+        # включены оба, сброс их не трогает.
+        self._rag_rewrite_prompt = rag_rewrite_prompt
+        self._rag_rewrite_max_tokens = rag_rewrite_max_tokens
+        self._rag_empty_instruction = rag_empty_instruction
+        self._rag_rewrite: bool = True
+        self._rag_rerank: bool = True
         # Схемы последнего успешно полученного каталога — только для оценки
         # корзины `tools` в панели до вопроса (§5.4): чистые методы в сеть не
         # ходят. На ход каталог запрашивается заново; это не кэш каталога.
@@ -1161,6 +1237,13 @@ class Agent:
             "sampling_calls": 0,
             "sampling_tokens": 0,
             "sampling_cost_usd": 0.0,
+            # Счётчики дня 23: переписывание запроса. Считается в общих
+            # счётчиках выше, как любой вызов, но не в `service_*`, `memory_*`,
+            # `route_*`, `tracker_*`, `guard_*` и `sampling_*` — у каждой
+            # служебной работы своя цена (спецификация дня 23, §6.3).
+            "rewrite_calls": 0,
+            "rewrite_tokens": 0,
+            "rewrite_cost_usd": 0.0,
         }
         # Журнал ходов (день 8). Ведёт себя как счётчики агента, а не как стек
         # сообщений: `reset()` его не чистит, на диск он не едет, и после
@@ -1531,14 +1614,23 @@ class Agent:
             else ""
         )
 
-        # Поиск выдержек RAG (день 22, §2.1, §6.2) — после трекера и до
-        # каталога инструментов. Это работа кода, а не решение модели и не
-        # служебный вызов LLM: выключен или поиска нет — `None`. Сбой поиска и
-        # пустая выдача ход не отменяют: запрос уходит чистым вопросом, как
-        # без RAG (правило каталога инструментов дня 17).
-        rag = self._run_rag(user_message)
+        # Переписывание запроса поиска (день 23, §2.2, §6.3) — седьмая
+        # служебная работа, последняя из служебных «до хода»: после трекера и
+        # до поиска. Выдержек она не видит — их ещё нет. Сбой ход не
+        # отменяет: ищем по вопросу как есть. Запрос нужен только поиску —
+        # модель, которая отвечает, видит вопрос игрока.
+        query, rewrite_call = self._run_query_rewrite(client, user_message)
+
+        # Поиск выдержек RAG (день 22, §2.1, §6.2; с дня 23 — по запросу и со
+        # вторым этапом) — после переписывания и до каталога инструментов. Это
+        # работа кода, а не решение модели и не служебный вызов LLM: выключен
+        # или поиска нет — `None`. Сбой поиска ход не отменяет: запрос уходит
+        # чистым вопросом, как без RAG (правило каталога инструментов дня 17).
+        # Пустая выдача по порогу — не сбой, а своя часть запроса (§2.4).
+        rag = self._run_rag(user_message, query, rewrite_call)
         self._last_rag = rag
         rag_hits = rag.hits if rag is not None and rag.ok else ()
+        rag_empty = bool(rag is not None and rag.empty and self._rag_empty_instruction)
 
         # Каталог инструментов (день 17, §5.3) — после всех служебных работ
         # (трекер остаётся последним из них) и до сборки запроса: схемы нужны
@@ -1557,17 +1649,18 @@ class Agent:
         # появляются по ходу, считать их заранее не из чего.
         messages, view = self._context_view(
             user_message, long_term, profile, mode_choice, always, tools_json,
-            rag_hits,
+            rag_hits, rag_empty,
         )
         request = view.usage.request
         budget = view.usage
         if rag is not None:
             # Что ушло в модель последним сообщением и сколько это весит —
             # известно только после сборки (§6.2). Ошибка поиска — запись без
-            # сообщения: ушёл чистый вопрос.
+            # сообщения: ушёл чистый вопрос; пустая выдача по порогу — своё
+            # сообщение «подходящих не найдено» (день 23, §6.5).
             rag = replace(
                 rag,
-                message=messages[-1]["content"] if rag_hits else "",
+                message=messages[-1]["content"] if (rag_hits or rag_empty) else "",
                 tokens=request.rag,
             )
             self._last_rag = rag
@@ -1667,6 +1760,7 @@ class Agent:
                     tool_elapsed=tool_elapsed,
                     sampling_calls=tuple(sampling_calls),
                     rag=rag,
+                    rewrite_call=rewrite_call,
                 )
             elapsed = time.perf_counter() - started
             model_elapsed += elapsed
@@ -1806,6 +1900,7 @@ class Agent:
             tool_elapsed=tool_elapsed,
             sampling_calls=tuple(sampling_calls),
             rag=rag,
+            rewrite_call=rewrite_call,
         )
 
         if self._config.keep_history:
@@ -1818,7 +1913,7 @@ class Agent:
         self._record(reply, counted=True)
         self._record_turn(
             reply, history_before, view, service, memory_call, route_call,
-            task_call, guard_call,
+            task_call, guard_call, rewrite_call,
         )
         logger.info(
             "[%s] model=%s thinking=%s finish_reason=%s time=%.2fs "
@@ -2045,6 +2140,9 @@ class Agent:
         С дня 22 (§6.1) ветка получает тот же `Retriever` и ту же инструкцию к
         выдержкам, что у родителя. Переключатель «RAG в запросе» у ветки —
         включён, как у нового агента; выдержки в checkpoint не входят.
+
+        С дня 23 (§6.1) — и тот же промпт переписывания, потолок его ответа и
+        инструкция пустой выдачи; оба пункта второго этапа у ветки включены.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -2109,6 +2207,9 @@ class Agent:
             sampling_max_chars=self._sampling_max_chars,
             retriever=self._retriever,
             rag_instruction=self._rag_instruction,
+            rag_rewrite_prompt=self._rag_rewrite_prompt,
+            rag_rewrite_max_tokens=self._rag_rewrite_max_tokens,
+            rag_empty_instruction=self._rag_empty_instruction,
         )
 
     @_locked
@@ -2447,6 +2548,43 @@ class Agent:
         return True
 
     @property
+    def rag_rewrite(self) -> bool:
+        """Пункт «переписать запрос» второго этапа (день 23, §6.2). Без поиска
+        или без промпта переписывания у агента — `False`: определение
+        «включён» одно на свойство и `debug_state()`."""
+        return self._rag_rewrite and self._retriever is not None and bool(self._rag_rewrite_prompt)
+
+    @property
+    def rag_rerank(self) -> bool:
+        """Пункт «переранжировать и отсечь по порогу» (день 23, §6.2). Без
+        поиска у агента — `False`."""
+        return self._rag_rerank and self._retriever is not None
+
+    @_locked
+    def set_rag_stages(self, rewrite: bool, rerank: bool) -> bool:
+        """Два независимых пункта «RAG: второй этап поиска» (день 23, §2.5,
+        §6.2): переписывание запроса и переранжирование с порогом. Оба сняты —
+        поиск дня 22. `False` — поиска у агента нет или ничего не изменилось.
+        Стек, файл сессии, память и задача не трогаются, на диск ничего не
+        пишется; сам флажок RAG («выдержки в запросе») этим не меняется."""
+        if self._retriever is None:
+            return False
+        before = (self._rag_rewrite, self._rag_rerank)
+        after = (bool(rewrite), bool(rerank))
+        if before == after:
+            return False
+        self._rag_rewrite, self._rag_rerank = after
+
+        def mark(value: bool) -> str:
+            return "✓" if value else "—"
+
+        logger.info(
+            "[%s] RAG, второй этап: переписывание %s → %s, фильтр %s → %s",
+            self._log_name, mark(before[0]), mark(after[0]), mark(before[1]), mark(after[1]),
+        )
+        return True
+
+    @property
     def task_in_request(self) -> bool:
         """Положение переключателя «Состояние задачи в запросе» (день 13,
         §5.6)."""
@@ -2620,7 +2758,16 @@ class Agent:
                 "available": self._retriever is not None,
                 "enabled": self.rag_in_request,
                 "name": self._retriever.name if self._retriever is not None else "",
-                "last": asdict(self._last_rag) if self._last_rag is not None else None,
+                "last": (
+                    {**asdict(self._last_rag), "empty": self._last_rag.empty, "best": self._last_rag.best}
+                    if self._last_rag is not None else None
+                ),
+                # Ключи дня 23 (§6.6): положение пунктов второго этапа
+                # (определение «включён» — то же, что у свойств) и есть ли у
+                # агента промпт переписывания.
+                "rewrite": self.rag_rewrite,
+                "rerank": self.rag_rerank,
+                "rewrite_available": self._retriever is not None and bool(self._rag_rewrite_prompt),
             },
         }
 
@@ -2634,6 +2781,7 @@ class Agent:
         mode_choice: "user_profile.ModeChoice | None" = None,
         always: list[dict] | None = None,
         rag_hits: Sequence[dict] | None = None,
+        rag_empty: bool = False,
     ) -> list[dict]:
         """Единственное место, где собирается список сообщений для запроса.
 
@@ -2673,7 +2821,9 @@ class Agent:
         вопрос» и блоков за системным промптом не трогает — порядок блоков и
         префикс запроса прежние. `rag_hits` — выдача этого хода; `None`/пусто
         — запрос без выдержек (панель до вопроса выдержек не знает: чистые
-        методы не ищут).
+        методы не ищут). День 23 (§6.5): `rag_empty` — второй этап отсёк всех
+        кандидатов, и последнее сообщение — «подходящих не найдено»,
+        инструкция пустой выдачи и вопрос, а не чистый вопрос.
         """
         if long_term is None:
             long_term = self._long_term_entries()
@@ -2690,14 +2840,20 @@ class Agent:
         messages = self._with_layers(messages, long_term)
         messages = self._with_profile(messages, profile, mode_choice)
         messages = self._with_invariants(messages, always)
-        return self._with_rag(messages, rag_hits)
+        return self._with_rag(messages, rag_hits, rag_empty)
 
-    def _rag_text(self, hits: Sequence[dict] | None) -> str:
+    def _rag_text(self, hits: Sequence[dict] | None, empty: bool = False) -> str:
         """Часть RAG последнего сообщения: заголовок, инструкция, выдержки и
         подпись «Вопрос:» — всё, что стоит перед текстом игрока (§2.3).
-        `""` — выдержек нет. Близость в запрос не уходит: модели она не
-        нужна и сбивала бы её к «первому месту»."""
+        `""` — выдержек нет. Близость и оценки реранкера в запрос не уходят:
+        модели они не нужны и сбивали бы её к «первому месту». С дня 23
+        (§6.5): `empty` и непустая инструкция пустой выдачи — часть
+        «подходящих не найдено», инструкция и «Вопрос:»."""
         if not hits:
+            if empty and self._rag_empty_instruction:
+                return "\n\n".join([
+                    RAG_EMPTY_HEADER, self._rag_empty_instruction.strip(), RAG_QUESTION_LABEL + "\n",
+                ])
             return ""
         parts = [f"{RAG_HEADER} — найдено поиском по вопросу: {len(hits)}"]
         if self._rag_instruction:
@@ -2713,14 +2869,14 @@ class Agent:
         return "\n\n".join(parts)
 
     def _with_rag(
-        self, messages: list[dict], hits: Sequence[dict] | None
+        self, messages: list[dict], hits: Sequence[dict] | None, empty: bool = False
     ) -> list[dict]:
         """Выдержки в готовом списке сообщений — единственное место, где они
         туда попадают (день 22, §6.3). Выдержки — часть последнего сообщения
         `user`, перед вопросом, а не ещё один `system`-блок: текст документов
         — данные, а не голос разработчика, и изменчивое стоит в конце, чтобы
         не сбивать кэшируемый префикс."""
-        text = self._rag_text(hits)
+        text = self._rag_text(hits, empty)
         if not text or not messages:
             return messages
         last = messages[-1]
@@ -2873,6 +3029,7 @@ class Agent:
         always: list[dict] | None = None,
         tools_json: str | None = None,
         rag_hits: Sequence[dict] | None = None,
+        rag_empty: bool = False,
     ) -> tuple[list[dict], ContextView]:
         """Сборка запроса и всё, что про неё нужно знать панели и логам, —
         одним проходом.
@@ -2892,7 +3049,7 @@ class Agent:
         строкой JSON (`""` — инструментов в запросе нет); `None` — панель, и
         тогда берутся схемы последнего полученного каталога (§5.4). `rag_hits`
         (день 22) — выдача этого хода; панель передаёт `None`: до вопроса
-        выдержек нет (§6.3).
+        выдержек нет (§6.3). `rag_empty` (день 23) — выдача пуста по порогу.
         """
         if long_term is None:
             long_term = self._long_term_entries()
@@ -2905,9 +3062,9 @@ class Agent:
         if tools_json is None:
             tools_json = self._preview_tools_json()
         messages = self._build_messages(
-            question, long_term, profile, mode_choice, always, rag_hits
+            question, long_term, profile, mode_choice, always, rag_hits, rag_empty
         )
-        rag_text = self._rag_text(rag_hits)
+        rag_text = self._rag_text(rag_hits, rag_empty)
         usage = tokens.context_usage(
             self._count_messages(messages, tools_json, rag_text),
             model=self._config.model,
@@ -2940,6 +3097,7 @@ class Agent:
                     always,
                 ),
                 rag_hits,
+                rag_empty,
             ),
             tools_json,
             rag_text,
@@ -3868,19 +4026,102 @@ class Agent:
                 self._log_name, _ratio_str(budget.ratio), budget.level,
             )
 
-    def _run_rag(self, user_message: str) -> RagRecord | None:
-        """Поиск выдержек на ход (день 22, §6.2). `None` — RAG выключен или
-        поиска у агента нет: поиска не было вовсе. Иначе запись; при сбое или
-        пустой выдаче `ok=False`, `hits` пуст — ход идёт без выдержек. Запрос
-        поиска — вопрос игрока как есть: без истории, переписывания и
-        расширения. `message` и `tokens` дописывает `ask()` после сборки."""
+    def _run_query_rewrite(
+        self, client: OpenAI, user_message: str
+    ) -> tuple[str, ServiceCall | None]:
+        """Переписывание запроса поиска (день 23, §2.2, §6.3) — седьмая
+        служебная работа: последний обмен + сообщение игрока → самостоятельный
+        вопрос на русском. Вход и разбор — `_rewrite_input()` и
+        `_parse_rewrite()`.
+
+        Нечего переписывать — `(user_message, None)`: RAG выключен, поиска
+        нет, пункт «переписать» снят, нет промпта, сообщение пустое. Кодом
+        язык и «самостоятельность» вопроса не определяются: вызов не
+        пропускается «для русских вопросов», это решает промпт. Сбой хода не
+        отменяет (правило дня 9): исключение API, пустой ответ и ответ,
+        оборванный потолком, — ищем по вопросу как есть. **Оборванный ответ не
+        применяется** (правило трекера, день 13): оборванный запрос хуже
+        вопроса как есть. Вызов в любом случае оплачен и посчитан."""
+        if not (self.rag_in_request and self.rag_rewrite) or not user_message.strip():
+            return user_message, None
+        messages = [
+            {"role": "system", "content": self._rag_rewrite_prompt},
+            {"role": "user", "content": _rewrite_input(self._messages, user_message)},
+        ]
+        started = time.perf_counter()
+        try:
+            result = self._call_service_model(client, messages, self._rag_rewrite_max_tokens)
+        except Exception as exc:
+            logger.exception("[%s] переписывание запроса упало", self._log_name)
+            call = ServiceCall(
+                kind="rewrite", label=REWRITE_CALL_LABEL, ok=False, error=str(exc),
+                elapsed=time.perf_counter() - started,
+                prompt_tokens=None, completion_tokens=None, total_tokens=None,
+                cost_usd=None, covers=0, folded_tokens=0, text="",
+                memory_label=REWRITE_CALL_LABEL,
+            )
+            self._record_rewrite(call)
+            logger.warning(
+                "[%s] RAG, переписывание: ⚠️ не удалось (%s) — ищу по вопросу как есть",
+                self._log_name, call.error,
+            )
+            return user_message, call
+
+        query = "" if result.finish_reason == "length" else _parse_rewrite(result.text)
+        if result.finish_reason == "length":
+            error = "ответ оборван по max_tokens"
+        elif not query:
+            error = "модель вернула пустой ответ"
+        else:
+            error = None
+        unchanged = query == " ".join(user_message.split())
+        call = ServiceCall(
+            kind="rewrite", label=REWRITE_CALL_LABEL, ok=error is None, error=error,
+            elapsed=result.elapsed,
+            prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens, cost_usd=result.cost_usd,
+            covers=0, folded_tokens=0, text=query, finish_reason=result.finish_reason,
+            memory_label=REWRITE_CALL_LABEL,
+            memory_update="" if error else ("без изменений" if unchanged else "переписан"),
+        )
+        self._record_rewrite(call)
+        if error is not None:
+            logger.warning(
+                "[%s] RAG, переписывание: ⚠️ %s (finish_reason=%s, начало: %r) — ищу по вопросу как есть",
+                self._log_name, error, result.finish_reason, result.text[:120],
+            )
+            return user_message, call
+        logger.info(
+            "[%s] RAG, переписывание: %s · %.2f с · ≈%s ток. · %s",
+            self._log_name, "«%s» — без изменений" % query if unchanged else "«%s»" % query,
+            result.elapsed, _num(result.total_tokens), _cost_str(result.cost_usd),
+        )
+        return query, call
+
+    def _run_rag(
+        self, user_message: str, query: str | None = None, rewrite_call: ServiceCall | None = None,
+    ) -> RagRecord | None:
+        """Поиск выдержек на ход (день 22, §6.2; день 23, §6.3). `None` — RAG
+        выключен или поиска у агента нет: поиска не было вовсе. Иначе запись.
+        `query` — что искать: вопрос игрока (день 22) или переписанный запрос;
+        `rewrite_call` — переписывание этого хода, ради полей записи. Второй
+        этап просится флагом агента (`rag_rerank`); его сбой — не сбой поиска
+        (выдача этапа 1, `rerank_ok=False` и причина), а пустая выдача после
+        порога — штатный `ok=True` с пустыми `hits` (§6.4). `ok=False` — только
+        сбой поиска и пустая выдача без второго этапа (в индексе нет кусков).
+        `message` и `tokens` дописывает `ask()` после сборки."""
         if self._retriever is None or not self._rag_in_request:
             return None
-        result = self._retriever.search(user_message)
+        query = user_message if query is None else query
+        rerank = self.rag_rerank
+        result = self._retriever.search(query, rerank=rerank)
         hits = tuple(result.get("hits") or ())
-        ok = bool(result.get("ok")) and bool(hits)
+        rerank_ok = bool(result.get("rerank_ok"))
+        searched = bool(result.get("ok"))
+        by_threshold = searched and rerank and rerank_ok and not hits
+        ok = searched and (bool(hits) or by_threshold)
         error = result.get("error") or ""
-        if result.get("ok") and not hits:
+        if searched and not ok:
             error = "поиск ничего не нашёл"
         return RagRecord(
             enabled=True,
@@ -3891,28 +4132,69 @@ class Agent:
             total=int(result.get("total") or 0),
             hits=hits if ok else (),
             question=user_message,
+            query=query,
+            rewrite=rewrite_call is not None,
+            rewrite_ok=bool(rewrite_call is not None and rewrite_call.ok),
+            rewrite_error=(rewrite_call.error or "") if rewrite_call is not None else "",
+            rerank=rerank,
+            rerank_ok=rerank and rerank_ok,
+            rerank_error=(result.get("rerank_error") or "") if rerank and not rerank_ok else "",
+            rerank_model=result.get("rerank_model") or "",
+            threshold=float(result.get("threshold") or 0.0),
+            candidates_k=int(result.get("candidates_k") or 0),
+            rerank_s=float(result.get("rerank_s") or 0.0),
+            rerank_load_s=float(result.get("rerank_load_s") or 0.0),
+            candidates=tuple(result.get("candidates") or ()) if ok else (),
         )
 
     def _log_rag(self, rag: RagRecord) -> None:
-        """Строка поиска в лог — одна на ход (§6.5)."""
+        """Строки поиска в лог — одна-две на ход (§6.5, день 23 §6.6)."""
         if not rag.ok:
             logger.warning(
                 "[%s] RAG: ⚠️ %s; запрос уходит без выдержек", self._log_name, rag.error,
             )
             return
+        if rag.rerank and not rag.rerank_ok:
+            logger.warning(
+                "[%s] RAG: ⚠️ второй этап не удался: %s — выдача без фильтра (%d ближайших)",
+                self._log_name, rag.rerank_error or "причина не названа", len(rag.hits),
+            )
+        if rag.empty:
+            best = rag.best
+            top = max(rag.candidates, key=lambda c: c["rerank_score"], default=None)
+            logger.info(
+                "[%s] RAG: этап 2 — ни один из %d кандидатов не прошёл порог %.2f (лучший %s%s) — %s",
+                self._log_name, len(rag.candidates), rag.threshold,
+                f"{best:.3f}" if best is not None else "н/д",
+                f" «{_shorten(top['section'], 40)}»" if top is not None else "",
+                (
+                    "в запрос ушло «подходящих не найдено»" if self._rag_empty_instruction
+                    else "в запрос ушёл чистый вопрос"
+                ),
+            )
+            return
         loaded = f" (загрузка модели {rag.load_s:.1f} с)" if rag.load_s else ""
         listed = ", ".join(
             "{:.3f} {} (стр. {})".format(
-                hit["score"], _shorten(hit["section"], 40),
+                hit["rerank_score"] if hit.get("rerank_score") is not None else hit["score"],
+                _shorten(hit["section"], 40),
                 hit["page_from"] if hit["page_from"] == hit["page_to"]
                 else f"{hit['page_from']}–{hit['page_to']}",
             )
             for hit in rag.hits
         )
+        if rag.rerank_ok:
+            stages = (
+                f"этап 1: {rag.candidates_k} из {rag.total} · {max(rag.elapsed - rag.rerank_s, 0.0):.2f} с{loaded} · "
+                f"этап 2: {rag.rerank_model.rsplit('/', 1)[-1]} ≥ {rag.threshold:.2f} → "
+                f"{len(rag.hits)} из {len(rag.candidates)} · {rag.rerank_s:.2f} с"
+                f"{f' (загрузка {rag.rerank_load_s:.1f} с)' if rag.rerank_load_s else ''}"
+            )
+        else:
+            stages = f"{rag.elapsed:.2f} с{loaded} · {len(rag.hits)} из {rag.total}"
         logger.info(
-            "[%s] RAG: %s · %.2f с%s · %d из %d · ≈%s ток. · %s",
-            self._log_name, self._retriever.name, rag.elapsed, loaded,
-            len(rag.hits), rag.total, _num(rag.tokens), listed,
+            "[%s] RAG: %s · %s · ≈%s ток. · %s",
+            self._log_name, self._retriever.name, stages, _num(rag.tokens), listed,
         )
 
     def _tool_catalog(self) -> tuple[list[dict], str, float]:
@@ -4663,6 +4945,7 @@ class Agent:
         tool_elapsed: float = 0.0,
         sampling_calls: tuple[ServiceCall, ...] = (),
         rag: RagRecord | None = None,
+        rewrite_call: ServiceCall | None = None,
     ) -> AgentReply:
         """Неуспешный ход. `request` есть только у ошибок API: до вызова
         запрос уже был собран и посчитан, и отклонённый запрос — как раз тот
@@ -4712,6 +4995,7 @@ class Agent:
             tool_elapsed=tool_elapsed,
             sampling_calls=sampling_calls,
             rag=rag,
+            rewrite_call=rewrite_call,
         )
         self._record(reply)
         logger.warning("[%s] ошибка: %s", self._log_name, error)
@@ -4727,6 +5011,7 @@ class Agent:
         route_call: ServiceCall | None = None,
         task_call: ServiceCall | None = None,
         guard_call: ServiceCall | None = None,
+        rewrite_call: ServiceCall | None = None,
     ) -> None:
         """Строка журнала ходов — только на успешный вызов и после `_record()`:
         накопительные числа берутся из уже обновлённых счётчиков агента.
@@ -4811,6 +5096,10 @@ class Agent:
                     sum(call.cost_usd or 0.0 for call in reply.sampling_calls)
                     if reply.sampling_calls else None
                 ),
+                # Цена переписывания запроса этого хода (день 23, §6.3).
+                rewrite_tokens=(rewrite_call.total_tokens or 0) if rewrite_call else 0,
+                rewrite_cost_usd=rewrite_call.cost_usd if rewrite_call else None,
+                rewrite_elapsed=rewrite_call.elapsed if rewrite_call else 0.0,
             )
         )
         # Экономия копится по ходам и может быть отрицательной: на коротком
@@ -4889,6 +5178,17 @@ class Agent:
         self._totals["sampling_calls"] += 1
         self._totals["sampling_tokens"] += call.total_tokens or 0
         self._totals["sampling_cost_usd"] += call.cost_usd or 0.0
+
+    def _record_rewrite(self, call: ServiceCall) -> None:
+        """Учёт переписывания запроса (день 23, §6.3): в общих счётчиках агента
+        и процесса — как любой вызов, и отдельно в своих `rewrite_*`. Не в
+        `service_*`, `memory_*`, `route_*`, `tracker_*`, `guard_*` и
+        `sampling_*` — у каждой служебной работы своя цена. В калибровку не
+        идёт по той же причине, что остальные служебные вызовы."""
+        self._record_extra_call(call)
+        self._totals["rewrite_calls"] += 1
+        self._totals["rewrite_tokens"] += call.total_tokens or 0
+        self._totals["rewrite_cost_usd"] += call.cost_usd or 0.0
 
     def _active_invariants(self) -> int:
         """Сколько инвариантов действует сейчас; 0 — книги нет."""
@@ -5163,6 +5463,47 @@ def _route_update(choice: "user_profile.ModeChoice") -> str:
     if choice.mode is None:
         return choice.note
     return f"«{choice.mode}» — {choice.note}"
+
+
+def _rewrite_input(history: Sequence[dict], question: str) -> str:
+    """Вход переписывания запроса (день 23, §2.2): последний обмен — два
+    последних сообщения стека, без выдержек (их в истории нет) — и новое
+    сообщение игрока, текстом в одном сообщении `user` (приём роутера дня 12).
+    На первом ходе вместо обмена — «разговор только начинается»."""
+    if history:
+        names = {"user": "игрок", "assistant": "ассистент"}
+        exchange = "\n".join(
+            f"[{names.get(message.get('role'), message.get('role'))}] {message.get('content') or ''}"
+            for message in history[-2:]
+        )
+    else:
+        exchange = REWRITE_NO_HISTORY
+    return f"Последний обмен:\n{exchange}\n\nНовое сообщение игрока:\n{question}"
+
+
+# Пары краёв, которые срезаются у ответа переписывания, только если стоят с
+# обеих сторон: одиночная кавычка внутри запроса («…врасплох») остаётся.
+_REWRITE_QUOTES = (
+    ('"', '"'), ("'", "'"), ("«", "»"), ("“", "”"), ("„", "“"), ("*", "*"), ("`", "`"),
+)
+_REWRITE_MARKER = re.compile(r"^(?:[-•–—]|\d+[.)])\s+")
+
+
+def _parse_rewrite(text: str) -> str:
+    """Ответ переписывания (день 23, §2.2): первая непустая строка; маркер
+    списка, кавычки, звёздочки и обратные апострофы по краям срезаются. `""` —
+    ответа нет (сбой)."""
+    line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    changed = True
+    while changed and line:
+        changed = False
+        marker = _REWRITE_MARKER.match(line)
+        if marker:
+            line, changed = line[marker.end():].strip(), True
+        for opening, closing in _REWRITE_QUOTES:
+            if len(line) > 1 and line.startswith(opening) and line.endswith(closing):
+                line, changed = line[1:-1].strip(), True
+    return " ".join(line.split())
 
 
 def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:

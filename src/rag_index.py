@@ -14,7 +14,10 @@
 #                  `os.replace()`;
 #   6. отчёт     — числа сравнения стратегий в терминале, без суждений.
 # `--probe` — пробные вопросы по готовому индексу: три ближайших куска каждой
-# стратегии, без LLM, порогов и сборки ответа.
+# стратегии, без LLM, порогов и сборки ответа. С дня 23 (§5) после них — три
+# лучших по оценке реранкера из `RAG_CANDIDATES` кандидатов стратегии поиска:
+# `--probe` — место, где реранкер скачивается (≈1,5 ГБ, один раз); сборку
+# индекса реранкер не трогает и не грузит.
 #
 # **Единственное место, где импортируется `pymupdf`**, и единственное место
 # записи базы индекса; читает и проверяет файл (`check_index()`) с дня 22
@@ -434,11 +437,15 @@ def build(db: Path, sources: Path, dump: Path | None) -> int:
 def probe(db: Path) -> int:
     """Пробные вопросы: три ближайших куска каждой стратегии. Ищет той же
     `RulesIndex.nearest()`, что и ассистент (день 22): проба и ответ не
-    расходятся. Скачивание модели разрешено — как при сборке."""
+    расходятся. Скачивание моделей — эмбеддингов и (день 23) реранкера —
+    разрешено, как при сборке."""
     index = RulesIndex(
         db, presets.RAG_SEARCH_STRATEGY, presets.RAG_SEARCH_LANG, PROBE_TOP,
-        allow_download=True, expected_model=presets.RAG_EMBED_MODEL,
+        candidates_k=presets.RAG_CANDIDATES, rerank_model=presets.RAG_RERANK_MODEL,
+        threshold=presets.RAG_RERANK_THRESHOLD, rerank_max_length=presets.RAG_RERANK_MAX_LENGTH,
+        rerank_batch=presets.RAG_RERANK_BATCH, allow_download=True, expected_model=presets.RAG_EMBED_MODEL,
     )
+    second_stage = True
     info = index.info()
     if not info["ok"]:
         logger.error("%s", info["error"])
@@ -477,6 +484,32 @@ def probe(db: Path) -> int:
                     if len(preview) > PREVIEW_CHARS:
                         preview = preview[:PREVIEW_CHARS].rstrip() + "…"
                     print(f"            «{preview}»")
+            # Второй этап (день 23, §5): та же стратегия, что ищет ассистент.
+            # Проба — без порога: «ниже порога» только помечается.
+            if second_stage and presets.RAG_SEARCH_STRATEGY in strategies:
+                try:
+                    candidates = index.nearest(
+                        question, presets.RAG_SEARCH_STRATEGY, lang, presets.RAG_CANDIDATES, vector=vector,
+                    )
+                    step = time.perf_counter()
+                    ranked = index.rerank(question, candidates)
+                    rerank_s = time.perf_counter() - step
+                except RagError as exc:
+                    second_stage = False
+                    logger.error("второй этап пропущен: %s", exc)
+                else:
+                    print(
+                        f"   после переранжирования ({presets.RAG_RERANK_MODEL.rsplit('/', 1)[-1]}, "
+                        f"порог {presets.RAG_RERANK_THRESHOLD:.2f}; {len(candidates)} кандидатов, {rerank_s:.2f} с)"
+                    )
+                    places = {hit.chunk_id: place for place, hit in enumerate(candidates, 1)}
+                    for hit in ranked[:PROBE_TOP]:
+                        part = f" · часть {hit.part}" if hit.part else ""
+                        below = "  ниже порога" if hit.rerank_score < presets.RAG_RERANK_THRESHOLD else ""
+                        print(
+                            f"     {hit.rerank_score:.3f}  место этапа 1: {places[hit.chunk_id]} · "
+                            f"{hit.section}{part} · {pages_text(hit.page_from, hit.page_to)}{below}"
+                        )
     except RagError as exc:
         logger.error("%s", exc)
         return 2
