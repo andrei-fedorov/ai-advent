@@ -227,6 +227,12 @@ RAG_EMPTY_HEADER = f"{RAG_HEADER} — подходящих не найдено"
 # `service_*`, ни в `memory_*`, `route_*`, `tracker_*`, `guard_*`, `sampling_*`.
 REWRITE_CALL_LABEL = "Переписывание запроса"
 REWRITE_NO_HISTORY = "разговор только начинается"
+# День 25 (§2.3, §4.2): память задачи — первый абзац входа переписывания и
+# подписи слоёв у записей памяти в «Источниках:» (подпись — данные агента,
+# `rag_answer.py` про слои не знает).
+REWRITE_MEMORY_HEADER = "Память задачи:"
+MEMORY_LABEL_WORKING = "память задачи"
+MEMORY_LABEL_LONG_TERM = "долговременная память"
 
 # Слои в запросе по умолчанию — все переключаемые. Отдельное имя, а не
 # `memory.REQUEST_LAYERS` на месте: в конструкторе и в `fork()` имя `memory`
@@ -428,6 +434,15 @@ class RagRecord:
     answer_first: "rag_answer.AnswerCheck | None" = None
     repair_note: str = ""
     repair_message: str = ""
+    # Поля дня 25 (§4.1) — в конце и с умолчаниями. `rewrite_memory` — память
+    # задачи, ушедшая во вход переписывания (`""` — не уходила: слой выключен,
+    # памяти нет или переписывания не было), `memory_note` — инструкция памяти
+    # ушла в последнее сообщение, `memory_entries` — записи памяти этого
+    # запроса, на которые можно ссылаться `[ключом]` (рабочие и, если их блок
+    # ушёл в запрос, долговременные).
+    rewrite_memory: str = ""
+    memory_note: bool = False
+    memory_entries: "tuple[rag_answer.MemoryEntry, ...]" = ()
 
     @property
     def repaired(self) -> bool:
@@ -1128,6 +1143,10 @@ class Agent:
         # `presets.py`.
         rag_answer_format: "rag_answer.AnswerFormat | None" = None,
         rag_repair_instruction: str = "",
+        # Параметр дня 25 (§4.1) — снова в конце, с умолчанием: пустая
+        # инструкция — инструкции памяти нет, ход как на дне 24. Настоящую
+        # передаёт `app.py` из `presets.py`.
+        rag_memory_instruction: str = "",
     ) -> None:
         self._config = config
         self._session_id = session_id
@@ -1189,6 +1208,11 @@ class Agent:
         # не едут, в checkpoint не входят, ветка получает те же.
         self._rag_answer_format = rag_answer_format
         self._rag_repair_instruction = rag_repair_instruction
+        # Память задачи в RAG (день 25): инструкция памяти — настройка агента,
+        # как инструкции выше: на диск не едет, в checkpoint не входит, ветка
+        # получает ту же. Уходит в запрос только вместе с блоком рабочей
+        # памяти (`_memory_note()`).
+        self._rag_memory_instruction = rag_memory_instruction
         # Схемы последнего успешно полученного каталога — только для оценки
         # корзины `tools` в панели до вопроса (§5.4): чистые методы в сеть не
         # ходят. На ход каталог запрашивается заново; это не кэш каталога.
@@ -1655,8 +1679,14 @@ class Agent:
         # служебная работа, последняя из служебных «до хода»: после трекера и
         # до поиска. Выдержек она не видит — их ещё нет. Сбой ход не
         # отменяет: ищем по вопросу как есть. Запрос нужен только поиску —
-        # модель, которая отвечает, видит вопрос игрока.
-        query, rewrite_call = self._run_query_rewrite(client, user_message)
+        # модель, которая отвечает, видит вопрос игрока. С дня 25 (§2.3)
+        # переписывание видит и память задачи — рабочий слой, если его блок
+        # уходит в запрос: слово игрока из «термины» и имя героя оно заменяет
+        # словом правил, продолжение разговора дополняет из памяти. Разбор
+        # памяти по этому же сообщению уже идёт выше, поэтому поиск видит
+        # свежую память.
+        task_memory = self._task_memory_text()
+        query, rewrite_call = self._run_query_rewrite(client, user_message, task_memory)
 
         # Поиск выдержек RAG (день 22, §2.1, §6.2; с дня 23 — по запросу и со
         # вторым этапом) — после переписывания и до каталога инструментов. Это
@@ -1664,7 +1694,7 @@ class Agent:
         # или поиска нет — `None`. Сбой поиска ход не отменяет: запрос уходит
         # чистым вопросом, как без RAG (правило каталога инструментов дня 17).
         # Пустая выдача по порогу — не сбой, а своя часть запроса (§2.4).
-        rag = self._run_rag(user_message, query, rewrite_call)
+        rag = self._run_rag(user_message, query, rewrite_call, task_memory)
         self._last_rag = rag
         rag_hits = rag.hits if rag is not None and rag.ok else ()
         rag_empty = bool(rag is not None and rag.empty and self._rag_empty_instruction)
@@ -1696,10 +1726,16 @@ class Agent:
             # известно только после сборки (§6.2). Ошибка поиска — запись без
             # сообщения: ушёл чистый вопрос; пустая выдача по порогу — своё
             # сообщение «подходящих не найдено» (день 23, §6.5).
+            # С дня 25 (§4.2): инструкция памяти ушла, только если в последнем
+            # сообщении была часть RAG и блок рабочей памяти в запросе; записи
+            # памяти — те блоки, что ушли в запрос, на них можно ссылаться.
+            rag_in_message = bool(rag_hits or rag_empty)
             rag = replace(
                 rag,
-                message=messages[-1]["content"] if (rag_hits or rag_empty) else "",
+                message=messages[-1]["content"] if rag_in_message else "",
                 tokens=request.rag,
+                memory_note=rag_in_message and self._memory_note(),
+                memory_entries=self._memory_entries(long_term),
             )
             self._last_rag = rag
             self._log_rag(rag)
@@ -1890,8 +1926,15 @@ class Agent:
         repair_note = ""
         repair_message = ""
         answer_fmt = self._rag_answer_format
+        # Память задачи как источник (день 25, §2.4, §4.2): записи, ушедшие в
+        # запрос этого хода, и все ключи карты — ссылка `[ключ]` проверяется по
+        # ним. Нет модели памяти — ключей нет, и проверка ровно дня 24.
+        memory_entries = rag.memory_entries if rag is not None else ()
+        memory_keys = self._memory_keys()
         if rag is not None and answer_fmt is not None and (rag_hits or rag_empty):
-            answer = rag_answer.check(text, rag_hits, rag_empty, answer_fmt)
+            answer = rag_answer.check(
+                text, rag_hits, rag_empty, answer_fmt, memory_entries, memory_keys
+            )
             if answer.ok:
                 self._log_answer(answer, rag, "ответ")
             else:
@@ -1938,7 +1981,8 @@ class Agent:
                         else:
                             text = retry_text
                             answer_first, answer = answer, rag_answer.check(
-                                retry_text, rag_hits, rag_empty, answer_fmt
+                                retry_text, rag_hits, rag_empty, answer_fmt,
+                                memory_entries, memory_keys,
                             )
                             self._log_answer(
                                 answer, rag, "ответ после повтора",
@@ -1951,13 +1995,38 @@ class Agent:
             # и в чат; ответ модели как пришёл — `rag.answer.raw`.
             text = rag_answer.render(
                 answer, rag_hits, answer_fmt,
-                rag.threshold if rag.rerank_ok else None, rag.best,
+                rag.threshold if rag.rerank_ok else None, rag.best, memory_entries,
             )
             rag = replace(
                 rag, answer=answer, answer_first=answer_first, repair_note=repair_note,
                 repair_message=repair_message,
             )
             self._last_rag = rag
+        elif rag is not None and answer_fmt is not None:
+            # Части RAG в последнем сообщении не было (день 25, §2.4, §4.2):
+            # поиск не удался или — правка по ревью — выдача пуста по порогу, а
+            # инструкции пустой выдачи у агента нет. Проверки и повтора нет:
+            # запрос ушёл чистым вопросом, и модель не видела ни инструкций
+            # формата, ни памяти. Но «Источники:» у ответа хода с RAG есть
+            # всегда: код дописывает строку «не найдены», иначе ответ из общих
+            # знаний был бы неотличим от ответа по правилам. Выключенный RAG
+            # (`rag is None`) — режим сравнения, а не сбой: ответ как есть.
+            if rag.ok:
+                text = rag_answer.render_unchecked(
+                    text, answer_fmt,
+                    rag_answer.empty_reason(rag.threshold if rag.rerank_ok else None, rag.best),
+                )
+                logger.warning(
+                    "[%s] RAG, ответ: проверки нет — выдача пуста, а инструкции пустой выдачи нет · "
+                    "в «%s» — строка о пороге",
+                    self._log_name, answer_fmt.sources_header,
+                )
+            else:
+                text = rag_answer.render_failed(text, answer_fmt, rag.error)
+                logger.warning(
+                    "[%s] RAG, ответ: проверки нет — поиск не удался · в «%s» — строка о сбое",
+                    self._log_name, answer_fmt.sources_header,
+                )
         # reasoning_content отдаём в AgentReply для дебага, но в стек не
         # кладём (§5.6). Раундов несколько — рассуждения всех подряд, с
         # разделителями.
@@ -2263,6 +2332,8 @@ class Agent:
         инструкция пустой выдачи; оба пункта второго этапа у ветки включены.
 
         С дня 24 (§4.1) — и те же маркеры формата ответа и инструкция повтора.
+
+        С дня 25 (§4.1) — и та же инструкция памяти.
         """
         checkpoint = next(
             (cp for cp in self._checkpoints if cp.id == checkpoint_id), None
@@ -2332,6 +2403,7 @@ class Agent:
             rag_empty_instruction=self._rag_empty_instruction,
             rag_answer_format=self._rag_answer_format,
             rag_repair_instruction=self._rag_repair_instruction,
+            rag_memory_instruction=self._rag_memory_instruction,
         )
 
     @_locked
@@ -2896,6 +2968,13 @@ class Agent:
                     and bool(self._rag_repair_instruction)
                 ),
             },
+            # Ключ дня 25 (§4.3) — в конце. `None` — модели памяти у агента нет.
+            # `entries` — рабочая память в порядке карты с разделами (пункты
+            # задания: цель, уточнено, ограничения и термины), `in_request` —
+            # блок рабочей памяти уходит в запрос (то же определение, что у
+            # переписывания и инструкции), `instruction` — уйдёт и инструкция
+            # памяти.
+            "task_memory": self._task_memory_state(),
         }
 
     # --- Внутреннее ------------------------------------------------------
@@ -2975,16 +3054,24 @@ class Agent:
         `""` — выдержек нет. Близость и оценки реранкера в запрос не уходят:
         модели они не нужны и сбивали бы её к «первому месту». С дня 23
         (§6.5): `empty` и непустая инструкция пустой выдачи — часть
-        «подходящих не найдено», инструкция и «Вопрос:»."""
+        «подходящих не найдено», инструкция и «Вопрос:». С дня 25 (§4.2): если
+        блок рабочей памяти ушёл в запрос, сразу за инструкцией к выдержкам
+        (или пустой выдачи) стоит инструкция памяти — часть RAG последнего
+        сообщения, поэтому корзина `rag` считает её без правок `tokens.py`."""
+        memory_instruction = (
+            [self._rag_memory_instruction.strip()] if self._memory_note() else []
+        )
         if not hits:
             if empty and self._rag_empty_instruction:
                 return "\n\n".join([
-                    RAG_EMPTY_HEADER, self._rag_empty_instruction.strip(), RAG_QUESTION_LABEL + "\n",
+                    RAG_EMPTY_HEADER, self._rag_empty_instruction.strip(), *memory_instruction,
+                    RAG_QUESTION_LABEL + "\n",
                 ])
             return ""
         parts = [f"{RAG_HEADER} — найдено поиском по вопросу: {len(hits)}"]
         if self._rag_instruction:
             parts.append(self._rag_instruction.strip())
+        parts.extend(memory_instruction)
         for number, hit in enumerate(hits, 1):
             label = f"[{number}] {hit['title']} · {hit['section']}"
             if hit.get("part"):
@@ -3081,13 +3168,87 @@ class Agent:
             block = memory.long_term_block(long_term, self._memory.slots)
             if block is not None:
                 blocks.append(block)
-        if memory.LAYER_WORKING in self._request_layers:
-            block = self._memory.working_block()
-            if block is not None:
-                blocks.append(block)
+        block = self._working_block()
+        if block is not None:
+            blocks.append(block)
         if not blocks:
             return messages
         return messages[:1] + blocks + messages[1:]
+
+    def _working_block(self) -> dict | None:
+        """Блок рабочей памяти, который уходит в запрос, — **одно определение**
+        «рабочий блок в запросе» (день 25, §4.2): модель памяти есть, слой
+        `рабочая` в запросе, блок не пуст. По нему решают переписывание (память
+        задачи во входе), инструкция памяти и записи для проверки ссылок — и
+        `_with_layers()`: тот же блок. Один переключатель — «рабочая» в «Слоях
+        памяти в запросе»: выключенный убирает память задачи отовсюду."""
+        if self._memory is None or memory.LAYER_WORKING not in self._request_layers:
+            return None
+        return self._memory.working_block()
+
+    def _task_memory_text(self) -> str:
+        """Память задачи для входа переписывания (день 25, §2.3, §4.2): строки
+        `ключ: значение` рабочей памяти в порядке карты — те же, что
+        `MemoryState.working_text`. `""` — рабочего блока в запросе нет."""
+        if self._working_block() is None:
+            return ""
+        return self._memory.describe(self._messages).working_text
+
+    def _memory_note(self) -> bool:
+        """Уйдёт ли в запрос инструкция памяти (день 25, §2.4): только вместе с
+        блоком рабочей памяти. Без памяти в запросе модель не должна узнавать
+        про ключи, которых не видит — на черновике она их выдумывала."""
+        return bool(self._rag_memory_instruction.strip()) and self._working_block() is not None
+
+    def _task_memory_state(self) -> dict | None:
+        """Память задачи для панели (день 25, §4.3): записи рабочей памяти в
+        порядке карты с разделом, положение в запросе и инструкция памяти; `None`
+        — модели памяти нет. Чистый метод: ни сети, ни записи."""
+        if self._memory is None:
+            return None
+        sections = {slot.key: slot.section for slot in self._memory.slots}
+        return {
+            "entries": [
+                {"key": key, "value": value, "section": sections.get(key, "")}
+                for key, value in self._working_entries().items()
+            ],
+            "in_request": self._working_block() is not None,
+            "instruction": self._memory_note(),
+        }
+
+    def _memory_keys(self) -> tuple[str, ...]:
+        """Все ключи карты модели памяти — по ним `rag_answer.check()` узнаёт
+        ссылку `[ключ]` (день 25, §4.2); модели памяти нет — пусто, и ссылки не
+        разбираются."""
+        if self._memory is None:
+            return ()
+        return tuple(slot.key for slot in self._memory.slots)
+
+    def _memory_entries(self, long_term: dict) -> "tuple[rag_answer.MemoryEntry, ...]":
+        """Записи памяти этого запроса — те блоки, что ушли в запрос (день 25,
+        §4.2): долговременные (если их слой в запросе; тот же снимок `long_term`,
+        что ушёл в блок) и рабочие. Подписи слоёв — константы агента. На эти
+        записи можно ссылаться `[ключом]`; значения читает `render()` — на
+        момент ответа."""
+        if self._memory is None:
+            return ()
+        entries: list[rag_answer.MemoryEntry] = []
+        if memory.LAYER_LONG_TERM in self._request_layers:
+            for key, value in memory.long_term_values(long_term, self._memory.slots).items():
+                entries.append(rag_answer.MemoryEntry(key, value, MEMORY_LABEL_LONG_TERM))
+        if self._working_block() is not None:
+            for key, value in self._working_entries().items():
+                entries.append(rag_answer.MemoryEntry(key, value, MEMORY_LABEL_WORKING))
+        return tuple(entries)
+
+    def _working_entries(self) -> dict[str, str]:
+        """Записи рабочей памяти словарём «ключ → значение» в порядке карты —
+        из `dump()`, а не разбором текста `working_text` обратно (правка по
+        ревью дня 25): значение с переносом строки разбор текста резал бы на
+        ложные записи. `{}` — модели памяти нет или память пуста."""
+        if self._memory is None:
+            return {}
+        return dict(self._memory.dump().get("entries") or {})
 
     def _with_profile(
         self,
@@ -4154,12 +4315,14 @@ class Agent:
             )
 
     def _run_query_rewrite(
-        self, client: OpenAI, user_message: str
+        self, client: OpenAI, user_message: str, task_memory: str = "",
     ) -> tuple[str, ServiceCall | None]:
         """Переписывание запроса поиска (день 23, §2.2, §6.3) — седьмая
         служебная работа: последний обмен + сообщение игрока → самостоятельный
         вопрос на русском. Вход и разбор — `_rewrite_input()` и
-        `_parse_rewrite()`.
+        `_parse_rewrite()`. С дня 25 (§2.3) во входе первым абзацем — память
+        задачи (`task_memory`: рабочий слой, если его блок в запросе; `""` —
+        абзаца нет, вход ровно дня 23).
 
         Нечего переписывать — `(user_message, None)`: RAG выключен, поиска
         нет, пункт «переписать» снят, нет промпта, сообщение пустое. Кодом
@@ -4173,7 +4336,10 @@ class Agent:
             return user_message, None
         messages = [
             {"role": "system", "content": self._rag_rewrite_prompt},
-            {"role": "user", "content": _rewrite_input(self._messages, user_message)},
+            {
+                "role": "user",
+                "content": _rewrite_input(self._messages, user_message, task_memory),
+            },
         ]
         started = time.perf_counter()
         try:
@@ -4219,19 +4385,23 @@ class Agent:
             )
             return user_message, call
         logger.info(
-            "[%s] RAG, переписывание: %s · %.2f с · ≈%s ток. · %s",
+            "[%s] RAG, переписывание: %s · память задачи: %s · %.2f с · ≈%s ток. · %s",
             self._log_name, "«%s» — без изменений" % query if unchanged else "«%s»" % query,
+            task_memory_records(task_memory),
             result.elapsed, _num(result.total_tokens), _cost_str(result.cost_usd),
         )
         return query, call
 
     def _run_rag(
         self, user_message: str, query: str | None = None, rewrite_call: ServiceCall | None = None,
+        task_memory: str = "",
     ) -> RagRecord | None:
         """Поиск выдержек на ход (день 22, §6.2; день 23, §6.3). `None` — RAG
         выключен или поиска у агента нет: поиска не было вовсе. Иначе запись.
         `query` — что искать: вопрос игрока (день 22) или переписанный запрос;
-        `rewrite_call` — переписывание этого хода, ради полей записи. Второй
+        `rewrite_call` — переписывание этого хода, ради полей записи; с дня 25
+        `task_memory` — память задачи, ушедшая в его вход (в записи — только если
+        переписывание было). Второй
         этап просится флагом агента (`rag_rerank`); его сбой — не сбой поиска
         (выдача этапа 1, `rerank_ok=False` и причина), а пустая выдача после
         порога — штатный `ok=True` с пустыми `hits` (§6.4). `ok=False` — только
@@ -4263,6 +4433,7 @@ class Agent:
             rewrite=rewrite_call is not None,
             rewrite_ok=bool(rewrite_call is not None and rewrite_call.ok),
             rewrite_error=(rewrite_call.error or "") if rewrite_call is not None else "",
+            rewrite_memory=task_memory if rewrite_call is not None else "",
             rerank=rerank,
             rerank_ok=rerank and rerank_ok,
             rerank_error=(result.get("rerank_error") or "") if rerank and not rerank_ok else "",
@@ -4409,8 +4580,9 @@ class Agent:
         self, check: "rag_answer.AnswerCheck", rag: RagRecord, label: str, tail: str = "",
     ) -> None:
         """Строка проверки ответа RAG в лог (день 24, §4.3): вид, источники,
-        цитаты, «не знаю», нарушения; `tail` — повтор, его цена или причина,
-        почему повтора нет. С нарушениями — WARNING."""
+        память задачи (день 25, §4.3 — ключи записей, на которые ссылается
+        ответ), цитаты, «не знаю», нарушения; `tail` — повтор, его цена или
+        причина, почему повтора нет. С нарушениями — WARNING."""
         if label == "ответ" and check.violations:
             text = "⚠️ нарушения: " + "; ".join(check.violations)
             if tail:
@@ -4418,14 +4590,16 @@ class Agent:
             logger.warning("[%s] RAG, %s: %s", self._log_name, label, text)
             return
         parts = [check.kind]
+        if not check.empty and check.sources:
+            parts.append("источники [" + ", ".join(str(n) for n in check.sources) + "]")
+        if check.memory_refs:
+            parts.append("память [" + ", ".join(check.memory_refs) + "]")
         if check.empty:
             best = rag.best
             parts.append(
                 f"выдача пуста по порогу {rag.threshold:.2f}"
                 + (f" (лучший {best:.3f})" if best is not None else "")
             )
-        elif check.sources:
-            parts.append("источники [" + ", ".join(str(n) for n in check.sources) + "]")
         if check.quotes:
             parts.append(f"цитат {len(check.quotes)}, дословно {check.verbatim}")
         if check.kind == rag_answer.KIND_IDK:
@@ -5738,11 +5912,35 @@ def _reply_dict(reply: AgentReply) -> dict:
     return data
 
 
-def _rewrite_input(history: Sequence[dict], question: str) -> str:
+def task_memory_records(task_memory: str) -> str:
+    """Сколько записей памяти задачи во входе переписывания (`RagRecord.
+    rewrite_memory`) — словами для лога, панели и отчёта `rag-dialog` (день 25,
+    §4.3): «7 записей» / «нет». Одна функция на всех (правка по ревью)."""
+    count = sum(1 for line in task_memory.splitlines() if line.strip())
+    return f"{count} {_records_word(count)}" if count else "нет"
+
+
+def _records_word(count: int) -> str:
+    """«1 запись» / «3 записи» / «7 записей»."""
+    if 11 <= count % 100 <= 14:
+        return "записей"
+    match count % 10:
+        case 1:
+            return "запись"
+        case 2 | 3 | 4:
+            return "записи"
+        case _:
+            return "записей"
+
+
+def _rewrite_input(history: Sequence[dict], question: str, task_memory: str = "") -> str:
     """Вход переписывания запроса (день 23, §2.2): последний обмен — два
     последних сообщения стека, без выдержек (их в истории нет) — и новое
     сообщение игрока, текстом в одном сообщении `user` (приём роутера дня 12).
-    На первом ходе вместо обмена — «разговор только начинается»."""
+    На первом ходе вместо обмена — «разговор только начинается». С дня 25
+    (§2.3) первым абзацем — память задачи (`REWRITE_MEMORY_HEADER` и строки
+    `ключ: значение` в порядке карты), если она есть; долговременная память,
+    профиль и состояние задачи во вход не идут."""
     if history:
         names = {"user": "игрок", "assistant": "ассистент"}
         exchange = "\n".join(
@@ -5751,7 +5949,8 @@ def _rewrite_input(history: Sequence[dict], question: str) -> str:
         )
     else:
         exchange = REWRITE_NO_HISTORY
-    return f"Последний обмен:\n{exchange}\n\nНовое сообщение игрока:\n{question}"
+    memory_part = f"{REWRITE_MEMORY_HEADER}\n{task_memory.strip()}\n\n" if task_memory.strip() else ""
+    return f"{memory_part}Последний обмен:\n{exchange}\n\nНовое сообщение игрока:\n{question}"
 
 
 # Пары краёв, которые срезаются у ответа переписывания, только если стоят с

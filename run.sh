@@ -23,6 +23,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")/src"
 #                               простой,полный, --only К1,У1,Ф1, --threshold,
 #                               --candidates, --top-k, --preset <имя>, --db <путь>,
 #                               --out <файл.md>
+#   ./run.sh rag-dialog [...] — два длинных сценария (А — 14 сообщений, Б — 13) на
+#                               «Скользящем окне» в режимах «с памятью задачи» и
+#                               «без памяти задачи» (день 25); отчёт Markdown в
+#                               src/data/rag/dialog/ (нужны ключ DeepSeek, индекс и
+#                               реранкер в кэше): --scenarios А,Б, --modes память,без,
+#                               --strategy <имя>, --preset <имя>, --db <путь>,
+#                               --out <файл.md>
 APP="app.py"
 case "${1:-}" in
     "")        APP="app.py" ;;
@@ -30,8 +37,9 @@ case "${1:-}" in
     faq-watch) APP="" ;;
     index)     APP="rag_index.py" ;;
     rag-eval)  APP="rag_eval.py" ;;
+    rag-dialog) APP="rag_dialog.py" ;;
     *)
-        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера], ./run.sh index [аргументы индекса] или ./run.sh rag-eval [аргументы прогона]" >&2
+        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера], ./run.sh index [аргументы индекса], ./run.sh rag-eval [аргументы прогона] или ./run.sh rag-dialog [аргументы прогона]" >&2
         exit 1
         ;;
 esac
@@ -66,6 +74,12 @@ if [ "$APP" = "rag_eval.py" ]; then
     # Программе сравнения ключ нужен (она ходит к модели через агента), поэтому
     # src/.env проверяется выше, как у приложения.
     exec python rag_eval.py "${@:2}"
+fi
+
+if [ "$APP" = "rag_dialog.py" ]; then
+    # Программе длинных сценариев ключ тоже нужен (ходит к модели через агента);
+    # src/.env проверяется выше, как у приложения.
+    exec python rag_dialog.py "${@:2}"
 fi
 
 python "$APP"

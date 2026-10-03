@@ -7,11 +7,19 @@
 источников из метаданных куска. Подтверждает ли цитата утверждение — смысл, его
 оценивает человек: модуль форму проверяет, смысл не трогает.
 
+День 25 (§2.4, §3) добавляет второй вид источника — запись памяти задачи: после
+утверждения, опирающегося на неё, модель ставит ключ записи в квадратных
+скобках, `[тиран]`. Код проверяет, что запись с таким ключом была в запросе
+этого хода, и пишет её значение в «Источники:». Верно ли записано в памяти и
+подтверждает ли запись утверждение — смысл, его оценивает человек. Без
+`memory_keys` ссылки на память не разбираются вовсе: проверка ровно дня 24.
+
 Чистые функции: ни сети, ни диска, ни логов, ни модели, ни Too Many Bones. Лист
 графа — из проекта не импортирует ничего. Работает со словарями выдачи
 (`chunk_id`, `title`, `section`, `part`, `page_from`, `page_to`, `text`), про
-индекс не знает; маркеры формата («Цитаты:», «Не знаю») приходят данными —
-`AnswerFormat`, языковых условий в коде нет (правило дня 21).
+индекс и про память агента не знает: записи и ключи приходят данными;
+маркеры формата («Цитаты:», «Не знаю») — тоже, `AnswerFormat`, языковых условий
+в коде нет (правило дня 21).
 """
 
 from __future__ import annotations
@@ -24,6 +32,9 @@ from dataclasses import dataclass
 KIND_ANSWER = "по выдержкам"
 KIND_IDK = "не знаю"
 KIND_NO_REFS = "без ссылок"
+# День 25 (§2.4): нет ни номеров выдержек, ни цитат, есть хотя бы одна верная
+# ссылка на запись памяти задачи, и тело не начинается с «Не знаю».
+KIND_MEMORY = "по памяти задачи"
 
 # Статус цитаты (§2.3). Нарушение — всё, кроме `QUOTE_OK`.
 QUOTE_OK = "дословно"
@@ -64,13 +75,30 @@ class Quote:
 
 
 @dataclass(frozen=True)
+class MemoryEntry:
+    """Запись памяти, ушедшая в запрос (день 25, §3): ключ, значение и подпись
+    слоя — «память задачи», «долговременная память». Подпись — данные от
+    агента: модуль про слои не знает."""
+
+    key: str
+    value: str
+    label: str
+
+
+@dataclass(frozen=True)
 class AnswerCheck:
     """Результат `check()` (§3). `raw` — ответ модели как пришёл, `body` — текст
     до первого служебного раздела, `empty`/`excerpts` — выдача пуста по порогу и
     сколько выдержек было в запросе, `refs` — номера из тела в порядке первого
     упоминания, `claims` — на каждый номер предложения тела с ним, `asks` — в
     теле есть «?», `own_sources` — модель написала свой раздел «Источники:»
-    (он выброшен), `violations` — фразы для панели, лога и сообщения повтора."""
+    (он выброшен), `violations` — фразы для панели, лога и сообщения повтора.
+
+    День 25 (§3), в конце и с умолчаниями: `memory_refs` — ключи записей памяти
+    из тела, которые в запросе были, в порядке первого упоминания;
+    `memory_missing` — ключи карты в скобках, записи с которыми в запросе не
+    было; `memory_claims` — на каждый упомянутый ключ предложения тела с ним
+    (тем же разрезом, что `claims`)."""
 
     raw: str
     body: str
@@ -83,6 +111,9 @@ class AnswerCheck:
     asks: bool
     own_sources: bool
     violations: tuple[str, ...]
+    memory_refs: tuple[str, ...] = ()
+    memory_missing: tuple[str, ...] = ()
+    memory_claims: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -147,8 +178,6 @@ def _contains(excerpt: Sequence[str], parts: Sequence[Sequence[str]]) -> bool:
 # («Цитаты:»), и модель на прогоне в приложении так его и написала; без них
 # цитаты не разбирались, а повтор писал то же самое.
 _HEADER_NOISE = re.compile(r"[*_#>«»\"“”„]")
-_REFS = re.compile(r"\[(\d+(?:\s*[,;]\s*\d+)*)\]")
-_LEADING_REFS = re.compile(r"^\s*(?:\[\d+(?:\s*[,;]\s*\d+)*\]\s*)+")
 _QUOTE_LINE = re.compile(r"^\s*(?:(?:[-*•]|\d+[.)])\s+)?\[(\d+)\]\s*[:—–-]?\s*(.*)$")
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|\n+")
 _QUOTE_PAIRS = (("«", "»"), ('"', '"'), ("“", "”"), ("„", "“"), ("„", "”"))
@@ -160,10 +189,6 @@ def _norm_header(line: str) -> str:
     """Строка без markdown-разметки, кавычек, регистра и двоеточия — для
     сравнения с заголовком раздела."""
     return _HEADER_NOISE.sub("", line).strip().rstrip(":").strip().casefold()
-
-
-def _numbers(group: str) -> list[int]:
-    return [int(n) for n in re.findall(r"\d+", group)]
 
 
 def _strip_quotes(text: str) -> str:
@@ -231,28 +256,128 @@ def _starts_with_idk(body: str, fmt: AnswerFormat) -> bool:
     )
 
 
-def _ref_numbers(text: str) -> set[int]:
-    return {n for match in _REFS.finditer(text) for n in _numbers(match.group(1))}
+# --- Скобки-ссылки: номера выдержек (день 24) и ключи памяти (день 25, §2.4) ----
+# Одна грамматика на номера в тексте, ключи памяти и ссылку в начале
+# предложения (правка по ревью: разборов было три, и номер из смешанной скобки
+# `[1, тиран]` не попадал в номера ответа, а `[¹]` в начале предложения ронял
+# `int()` — `str.isdigit()` верен и для надстрочных цифр, а `\d` нет).
+# - Скобка из одних номеров через запятую или `;` — номера, ровно как на дне 24
+#   (в том числе перед `(`).
+# - С ключами карты (`canon` непуст) — скобка, каждая часть которой номер или
+#   ключ карты: `[тиран]`, `[тиран, сложность]`, `[1, состав партии]`. Ссылка
+#   markdown `[текст](…)` ключом не считается.
+# - Скобка, где есть хоть одна другая часть (`[см. выше]`, `[тиран, см. выше]`),
+#   ссылкой не считается вовсе. Без `canon` это ровно ссылки дня 24.
+_BRACKET = re.compile(r"\[([^\[\]]+)\]")
+_LEADING_BRACKET = re.compile(r"\s*\[([^\[\]]+)\]")
+_NUMBERS_ONLY = re.compile(r"\d+(?:\s*[,;]\s*\d+)*")
+_NUMBER = re.compile(r"\d+")
+_KEY_SEPARATORS = re.compile(r"[,;]")
+
+# Предложение тела: текст, номера выдержек и ключи памяти в нём.
+_Sentence = tuple[str, set[int], set[str]]
 
 
-def _claims(body: str, refs: Sequence[int]) -> tuple[tuple[int, tuple[str, ...]], ...]:
-    """На каждый номер — предложения тела с ним. Режутся по `.`/`!`/`?` и
-    переносам строк; номер в начале предложения относится к предыдущему."""
-    sentences: list[tuple[str, set[int]]] = []
+def _norm_key(text: str) -> str:
+    """Ключ карты для сравнения: регистр, ё → е, пробелы. Своя функция, а не
+    `context.normalize_key()`: модуль — лист графа и `context.py` не импортирует
+    (§3)."""
+    return " ".join(text.lower().replace("ё", "е").split())
+
+
+def _bracket(
+    content: str, linked: bool, canon: Mapping[str, str],
+) -> tuple[list[int], list[str]] | None:
+    """Скобка-ссылка: номера выдержек и ключи памяти в порядке записи; `None` —
+    скобка не ссылка. `linked` — сразу за скобкой `(` (ссылка markdown),
+    `canon` — «нормализованный ключ → ключ карты»; пуст — только номера дня 24."""
+    if _NUMBERS_ONLY.fullmatch(content):
+        return [int(n) for n in _NUMBER.findall(content)], []
+    if not canon or linked:
+        return None
+    numbers: list[int] = []
+    keys: list[str] = []
+    for part in _KEY_SEPARATORS.split(content):
+        part = part.strip()
+        if _NUMBER.fullmatch(part):
+            numbers.append(int(part))
+        elif _norm_key(part) in canon:
+            keys.append(canon[_norm_key(part)])
+        else:
+            return None
+    return numbers, keys
+
+
+def _refs_in(text: str, canon: Mapping[str, str]) -> tuple[list[int], list[str]]:
+    """Номера выдержек и ключи памяти всех скобок-ссылок текста в порядке
+    упоминания, с повторами."""
+    numbers: list[int] = []
+    keys: list[str] = []
+    for match in _BRACKET.finditer(text):
+        found = _bracket(match.group(1), text.startswith("(", match.end()), canon)
+        if found is not None:
+            numbers += found[0]
+            keys += found[1]
+    return numbers, keys
+
+
+def _leading_refs(chunk: str, canon: Mapping[str, str]) -> tuple[int, list[int], list[str]]:
+    """Скобки-ссылки в самом начале предложения: где они кончаются, номера и
+    ключи. Скобка, которая не ссылка, обрывает ряд."""
+    position = 0
+    numbers: list[int] = []
+    keys: list[str] = []
+    while True:
+        match = _LEADING_BRACKET.match(chunk, position)
+        if match is None:
+            break
+        found = _bracket(match.group(1), chunk.startswith("(", match.end()), canon)
+        if found is None:
+            break
+        numbers += found[0]
+        keys += found[1]
+        position = match.end()
+    return position, numbers, keys
+
+
+def _sentences(body: str, canon: Mapping[str, str]) -> list[_Sentence]:
+    """Предложения тела с номерами выдержек и ключами памяти в них. Режутся по
+    `.`/`!`/`?` и переносам строк; ссылка в начале предложения относится к
+    предыдущему."""
+    sentences: list[_Sentence] = []
     for chunk in _SENTENCE_BREAK.split(body):
         chunk = chunk.strip()
         if not chunk:
             continue
-        leading = _LEADING_REFS.match(chunk)
-        if leading and sentences:
-            sentences[-1][1].update(_ref_numbers(leading.group(0)))
-            chunk = chunk[leading.end():].strip()
+        end, numbers, keys = _leading_refs(chunk, canon)
+        if end and sentences:
+            sentences[-1][1].update(numbers)
+            sentences[-1][2].update(keys)
+            chunk = chunk[end:].strip()
             if not chunk:
                 continue
-        sentences.append((chunk, _ref_numbers(chunk)))
+        numbers, keys = _refs_in(chunk, canon)
+        sentences.append((chunk, set(numbers), set(keys)))
+    return sentences
+
+
+def _claims(
+    sentences: Sequence[_Sentence], refs: Sequence[int],
+) -> tuple[tuple[int, tuple[str, ...]], ...]:
+    """На каждый номер — предложения тела с ним."""
     return tuple(
-        (number, tuple(text for text, numbers in sentences if number in numbers))
+        (number, tuple(text for text, numbers, _ in sentences if number in numbers))
         for number in refs
+    )
+
+
+def _memory_claims(
+    sentences: Sequence[_Sentence], keys: Sequence[str],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """На каждый ключ памяти — предложения тела с ним, тем же разрезом."""
+    return tuple(
+        (key, tuple(text for text, _, mentioned in sentences if key in mentioned))
+        for key in keys
     )
 
 
@@ -293,23 +418,45 @@ def _quote_violation(quote: Quote, fmt: AnswerFormat) -> str:
     )
 
 
+def _memory_violation(key: str) -> str:
+    return (
+        f"в тексте [{key}] — записи с таким ключом в памяти этого запроса нет: "
+        "ставь в скобки только ключи из блока «Рабочая память»"
+    )
+
+
 def check(
     raw: str, hits: Sequence[Mapping], empty: bool, fmt: AnswerFormat,
+    memory: Sequence[MemoryEntry] = (), memory_keys: Sequence[str] = (),
 ) -> AnswerCheck:
     """Разбор и проверка ответа по §2.3: `hits` — выдача хода (с `text`), `empty`
-    — выдача пуста по порогу. Смысл не проверяется."""
+    — выдача пуста по порогу. Смысл не проверяется.
+
+    День 25 (§2.4): `memory` — записи памяти, ушедшие в запрос этого хода,
+    `memory_keys` — все ключи карты памяти. Ключ карты в квадратных скобках —
+    ссылка на память: верная, если запись с ним в запросе была, иначе
+    нарушение. Без `memory_keys` ссылки на память не разбираются — проверка
+    ровно дня 24 (голый агент `rag-eval`)."""
     hits = tuple(hits)
     excerpts = [words(str(hit.get("text") or "")) for hit in hits]
     body, raw_quotes, had_quotes, own_sources = _split(raw or "", fmt)
-    refs: list[int] = []
-    for match in _REFS.finditer(body):
-        for number in _numbers(match.group(1)):
-            if number not in refs:
-                refs.append(number)
+    # Номера выдержек и ключи памяти — одним разбором скобок (правка по ревью),
+    # в порядке первого упоминания.
+    canon = {_norm_key(key): key for key in memory_keys if _norm_key(key)}
+    numbers, keys = _refs_in(body, canon)
+    refs = list(dict.fromkeys(numbers))
+    mentioned = list(dict.fromkeys(keys))
     quotes = tuple(_check_quote(n, text, excerpts, fmt) for n, text in raw_quotes)
     idk = _starts_with_idk(body, fmt)
     asks = "?" in body
     violations: list[str] = []
+
+    available = {_norm_key(entry.key) for entry in memory}
+    memory_refs = tuple(key for key in mentioned if _norm_key(key) in available)
+    memory_missing = tuple(key for key in mentioned if _norm_key(key) not in available)
+    # Ответ только по памяти (§2.4): ни номеров выдержек, ни цитат, есть верная
+    # ссылка на запись.
+    memory_only = bool(memory_refs) and not (refs or quotes)
 
     if empty or not hits:
         if idk:
@@ -320,6 +467,10 @@ def check(
                 violations.append(
                     "номера выдержек или цитаты при пустой выдаче — выдержек в запросе нет"
                 )
+        elif memory_only:
+            # «Не начинается с «Не знаю»» здесь не нарушение: ответ опирается на
+            # слова игрока, а не на правила (вопрос о разговоре, итог).
+            kind = KIND_MEMORY
         else:
             kind = KIND_NO_REFS
             if refs or quotes:
@@ -335,12 +486,19 @@ def check(
             kind = KIND_IDK
         elif refs or quotes:
             kind = KIND_ANSWER
+        elif memory_only:
+            kind = KIND_MEMORY
         else:
             kind = KIND_NO_REFS
         if kind == KIND_NO_REFS:
             violations.append(
                 "ответ не ссылается ни на одну выдержку и не начинается с «Не знаю»"
             )
+        elif kind == KIND_MEMORY:
+            # Выдержки прошли порог, а ответ на них не ссылается — не нарушение:
+            # код не отличает «напомни, что решили» от вопроса о правилах (урок
+            # «Спасибо, понятно!» дня 24); панель показывает строку «сверьте».
+            pass
         else:
             for number in refs:
                 if not 1 <= number <= k:
@@ -377,6 +535,12 @@ def check(
                 if quote.status != QUOTE_OK:
                     violations.append(_quote_violation(quote, fmt))
 
+    # Ссылка на память без записи в запросе — нарушение при любом виде ответа
+    # (§2.4): ловится не значение, а сам факт выдуманной записи.
+    violations.extend(_memory_violation(key) for key in memory_missing)
+
+    # Предложения тела режутся один раз — на утверждения с номерами и с ключами.
+    sentences = _sentences(body, canon)
     return AnswerCheck(
         raw=raw or "",
         body=body,
@@ -385,10 +549,13 @@ def check(
         kind=kind,
         refs=tuple(refs),
         quotes=quotes,
-        claims=_claims(body, refs),
+        claims=_claims(sentences, refs),
         asks=asks,
         own_sources=own_sources,
         violations=tuple(violations),
+        memory_refs=memory_refs,
+        memory_missing=memory_missing,
+        memory_claims=_memory_claims(sentences, mentioned),
     )
 
 
@@ -417,49 +584,106 @@ def source_label(hit: Mapping) -> str:
     return f"{label} · `{hit['chunk_id']}`"
 
 
+# Значение записи памяти в «Источниках» — целиком; длину держит промпт разбора
+# памяти (`MEMORY_VALUE_WORDS`), а обрезка по 120 символов резала бы почти
+# каждое `уточнено` (§2.4). С «…» режется только значение длиннее этого числа —
+# страховка от сбоя разбора.
+MEMORY_VALUE_MAX_CHARS = 300
+
+
+def memory_value_text(value: str) -> str:
+    """Значение записи памяти для «Источников» и таблиц: пробелы схлопнуты,
+    длиннее `MEMORY_VALUE_MAX_CHARS` — с «…»."""
+    text = " ".join(str(value).split())
+    if len(text) > MEMORY_VALUE_MAX_CHARS:
+        text = text[:MEMORY_VALUE_MAX_CHARS].rstrip() + "…"
+    return text
+
+
+# Строка «Источники:» у ответа, который не ссылается ни на одну выдержку (день 24).
+_NO_REFS_NOTE = "⚠️ ответ не ссылается ни на одну выдержку — сверить его с правилами нельзя"
+
+
+def _threshold_tail(threshold: float | None, best: float | None) -> str:
+    """« 0.10 (лучший — 0.007)» — порог и лучшая оценка для строк пустой выдачи."""
+    tail = f" {threshold:.2f}" if threshold is not None else ""
+    if best is not None:
+        tail += f" (лучший — {best:.3f})"
+    return tail
+
+
+def empty_reason(threshold: float | None = None, best: float | None = None) -> str:
+    """Почему источников нет при пустой выдаче: «ни один кусок правил не прошёл
+    порог релевантности 0.10 (лучший — 0.007)» — для `render()` и
+    `render_unchecked()`."""
+    return f"ни один кусок правил не прошёл порог релевантности{_threshold_tail(threshold, best)}"
+
+
 def render(
     check: AnswerCheck,
     hits: Sequence[Mapping],
     fmt: AnswerFormat,
     threshold: float | None = None,
     best: float | None = None,
+    memory: Sequence[MemoryEntry] = (),
 ) -> str:
     """Ответ для игрока по §2.2 (Markdown): тело как есть, «Источники:» из
     метаданных куска и «Цитаты:» с пометками ⚠️. `threshold` и `best` — для
     строки пустой выдачи. Раздел «Источники:», написанный моделью, уже
-    выброшен разбором."""
+    выброшен разбором.
+
+    День 25 (§2.4): после строк выдержек — строки записей памяти по порядку
+    первого упоминания, значение — на момент ответа (память меняется дальше, а
+    собранный ответ в истории остаётся каким был). Ключ без записи — строка с
+    ⚠️. Ответ только по памяти при пустой выдаче или при выдержках, на которые он
+    не ссылается, получает ещё строку про правила."""
     hits = tuple(hits)
     sources_title = f"**{fmt.sources_header.rstrip(':')}:**"
     quotes_title = f"**{fmt.quotes_header.rstrip(':')}:**"
     numbers = sorted({*check.refs, *(quote.number for quote in check.quotes)})
+    entries = {_norm_key(entry.key): entry for entry in memory}
+    memory_lines: list[str] = []
+    for key, _ in check.memory_claims:
+        entry = entries.get(_norm_key(key))
+        if entry is None:
+            memory_lines.append(f"- [{key}] ⚠️ записи с таким ключом в памяти этого запроса не было")
+        else:
+            memory_lines.append(f"- [{key}] {entry.label} · «{memory_value_text(entry.value)}»")
     parts: list[str] = []
     if check.body:
         parts.append(check.body)
 
-    if numbers:
+    if numbers or memory_lines:
         lines = [sources_title]
         for number in numbers:
             if 1 <= number <= len(hits):
                 lines.append(f"- [{number}] {source_label(hits[number - 1])}")
             else:
                 lines.append(f"- [{number}] ⚠️ выдержки с таким номером в запросе не было")
+        lines.extend(memory_lines)
+        if not numbers:
+            if check.empty:
+                lines.append(
+                    f"- правила: не найдены — ни один кусок не прошёл порог{_threshold_tail(threshold, best)}"
+                )
+            elif check.kind == KIND_NO_REFS:
+                # Ответ без ссылок, в котором только ключи без записи, — нарушение
+                # дня 24, и строка у него та же (правка по ревью: иначе он
+                # выглядел бы нейтрально, как ответ по памяти).
+                lines.append(f"- {_NO_REFS_NOTE}")
+            else:
+                lines.append(
+                    f"- выдержки: в запросе было {check.excerpts}, ответ на них не ссылается"
+                )
         parts.append("\n".join(lines))
     elif check.empty:
-        reason = "ни один кусок правил не прошёл порог релевантности"
-        if threshold is not None:
-            reason += f" {threshold:.2f}"
-        if best is not None:
-            reason += f" (лучший — {best:.3f})"
-        parts.append(f"{sources_title} не найдены — {reason}.")
+        parts.append(f"{sources_title} не найдены — {empty_reason(threshold, best)}.")
     elif check.kind == KIND_IDK:
         parts.append(
             f"{sources_title} ответ не ссылается на выдержки (в запросе их было {check.excerpts})."
         )
     else:
-        parts.append(
-            f"{sources_title} ⚠️ ответ не ссылается ни на одну выдержку — "
-            "сверить его с правилами нельзя."
-        )
+        parts.append(f"{sources_title} {_NO_REFS_NOTE}.")
 
     if check.quotes:
         lines = [quotes_title]
@@ -468,6 +692,28 @@ def render(
             lines.append(f"- [{quote.number}] «{quote.text}»" + (f" — {mark}" if mark else ""))
         parts.append("\n".join(lines))
     return "\n\n".join(parts)
+
+
+def render_unchecked(raw: str, fmt: AnswerFormat, reason: str) -> str:
+    """Ответ для игрока без проверки (день 25, §2.4, §3): части RAG в последнем
+    сообщении не было — запрос ушёл чистым вопросом, и инструкций формата модель
+    не видела. Текст модели как есть и одна строка «Источники: не найдены —
+    <reason>; ответ не сверен с правилами.» — ответ из общих знаний не должен
+    быть неотличим от ответа по правилам. Выключенный RAG — режим сравнения, а
+    не сбой: эту функцию для него не зовут."""
+    title = f"**{fmt.sources_header.rstrip(':')}:**"
+    note = f"{title} не найдены — {reason}; ответ не сверен с правилами."
+    body = (raw or "").strip()
+    return f"{body}\n\n{note}" if body else note
+
+
+def render_failed(raw: str, fmt: AnswerFormat, reason: str) -> str:
+    """Ответ для игрока, когда поиск не удался (день 25, §2.4): строка
+    «Источники: не найдены — поиск по правилам не удался (…); ответ не сверен с
+    правилами.»."""
+    return render_unchecked(
+        raw, fmt, f"поиск по правилам не удался ({reason or 'причина не названа'})"
+    )
 
 
 def repair_message(check: AnswerCheck, instruction: str) -> str:

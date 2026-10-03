@@ -135,6 +135,18 @@
 # дня 23 — в аккордеоне прошлых дней. Панель проверку только рисует: код
 # проверяет форму, смысл ответа сверяет человек.
 #
+# День 25 (спецификация дня 25, §6) — мини-чат с RAG и памятью задачи: память
+# задачи — рабочий слой памяти дня 11 по трём пунктам задания (цель, уточнено,
+# ограничения и термины), а не новое хранилище; её видят переписывание запроса
+# поиска и ответ (ссылки `[ключ]` — второй вид источника рядом с выдержками, код
+# проверяет, что запись была в запросе). Агенты получают `RAG_MEMORY_INSTRUCTION`
+# из `presets.py`. Блок «Мини-чат: RAG + память задачи (день 25)» развёрнут
+# наверху панели — описание, «Память задачи» (новое 43-е значение `_view()`) и
+# переехавшие «Проверка ответа», «RAG последнего хода» и последнее сообщение
+# запроса целиком; блок дня 24 свёрнут. У поля ввода — сценарии А и Б; контрольные
+# вопросы дней 22 и 24 — в аккордеоне прошлых дней. Переключатель памяти задачи
+# один — «рабочая» в «Слоях памяти в запросе».
+#
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
 # словами, текст памяти и числа. День 10 добавил в переключатель ещё две
@@ -186,6 +198,7 @@ from agent import (
     delete_agent,
     estimate_cost_usd,
     process_stats,
+    task_memory_records,
 )
 from invariants import (
     ID_PREFIX,
@@ -258,11 +271,13 @@ from presets import (
     RAG_ANSWER_QUESTIONS,
     RAG_CANDIDATES,
     RAG_CONTROL_QUESTIONS,
+    RAG_DIALOG_SCENARIOS,
     RAG_EMBED_MODEL,
     RAG_EMPTY_INSTRUCTION,
     RAG_FOLLOWUP_QUESTIONS,
     RAG_INDEX_DB,
     RAG_INSTRUCTION,
+    RAG_MEMORY_INSTRUCTION,
     RAG_REPAIR_INSTRUCTION,
     RAG_RERANK_BATCH,
     RAG_RERANK_MAX_LENGTH,
@@ -278,6 +293,7 @@ from presets import (
     SAMPLING_MAX_CHARS,
     SAMPLING_MAX_TOKENS,
     STRATEGIES,
+    TASK_MEMORY_SECTIONS,
     TASK_SCENARIO,
     TOOL_MAX_ROUNDS,
     TOOL_RESULT_MAX_CHARS,
@@ -322,7 +338,7 @@ from task_state import (
     STAGE_VALIDATION,
     TRANSITIONS,
 )
-from rag_answer import KIND_IDK, Quote, quote_mark
+from rag_answer import KIND_IDK, KIND_MEMORY, Quote, memory_value_text, quote_mark
 from rag_search import RulesIndex, source_status
 from tokens import FILLER_MAX_TOKENS, estimate_tokens, filler_text
 from user_profile import (
@@ -2833,6 +2849,14 @@ def _rag_md(state: dict) -> str:
         return "\n".join(lines)
     rewrite_call = (last_call or {}).get("rewrite_call")
     lines.append(_rag_query_line(last, rewrite_call))
+    # День 25 (§6.3): видела ли переписывание память задачи — слово игрока из
+    # «термины» и имя героя оно заменяет словом правил только с ней.
+    if last["rewrite_memory"]:
+        lines.append(
+            f"- **Переписывание видело память задачи:** да — {task_memory_records(last['rewrite_memory'])}"
+        )
+    else:
+        lines.append("- **Переписывание видело память задачи:** нет")
     if not last["ok"]:
         lines.append(
             f"- ⚠️ **Поиск не удался:** {last['error']} — запрос ушёл без выдержек."
@@ -2913,6 +2937,98 @@ def _rag_md(state: dict) -> str:
     return "\n".join(lines)
 
 
+# --- Блок «Память задачи» (день 25, §6.3) ---------------------------------------
+# Память задачи — рабочий слой памяти дня 11 по трём пунктам задания: панель
+# группирует его записи по разделам карты (`TASK_MEMORY_SECTIONS`), а что и как
+# уходит в запрос, в поиск и в ответ, берёт из `debug_state()` — своей копии
+# памяти и проверки у интерфейса нет.
+
+def _task_memory_md(state: dict) -> str:
+    """Блок «Память задачи» (день 25, §6.3): состояние (в запросе, в поиске,
+    инструкция), три группы по пунктам задания, что изменил последний разбор,
+    видело ли память переписывание этого хода и ссылается ли на неё ответ."""
+    task_memory = state["task_memory"]
+    lines = ["### Память задачи", ""]
+    if task_memory is None:
+        return "\n".join(lines + ["У агента нет модели памяти — памяти задачи нет."])
+    rag_state = state["rag"]
+    view = state["context_view"]
+    entries = task_memory["entries"]
+    layer_on = LAYER_WORKING in state["request_layers"]
+    mark = lambda on: "✓" if on else "✗"  # noqa: E731 — одна строка ради трёх вызовов
+    if not layer_on:
+        lines.append(
+            "- **Состояние:** рабочий слой выключен в «Слоях памяти в запросе» — память задачи ведётся, "
+            "но в запрос и поиск не уходит"
+        )
+    elif not entries:
+        lines.append(
+            "- **Состояние:** слой включён, память пуста — блока в запросе пока нет; её заполнит разбор "
+            "памяти перед ответом"
+        )
+    else:
+        in_search = rag_state["enabled"] and rag_state["rewrite"] and rag_state["rewrite_available"]
+        lines.append(
+            f"- **Состояние:** в запросе {mark(task_memory['in_request'])} · в поиске {mark(in_search)} · "
+            f"инструкция {mark(task_memory['instruction'] and rag_state['enabled'])}"
+        )
+    sent, total = view["sent_messages"], view["history_messages"]
+    carried = "остальное несёт память задачи" if layer_on and entries else "остальное в запрос не уходит"
+    lines.append(
+        f"- **Стратегия:** «{view['strategy']}» — "
+        + (f"в запросе {sent} сообщений истории из {total}: {carried}" if sent < total
+           else f"в запросе вся история ({total} сообщений)")
+    )
+
+    known = list(TASK_MEMORY_SECTIONS)
+    extra = list(dict.fromkeys(e["section"] for e in entries if e["section"] not in known))
+    for section in [*known, *extra]:
+        # Заголовок группы — имя раздела карты с заглавной буквы (правило
+        # `memory._sections_text()`), раздел вне `TASK_MEMORY_SECTIONS` — «Прочее».
+        title = section[:1].upper() + section[1:] if section in known else f"Прочее ({section or 'без раздела'})"
+        mine = [e for e in entries if e["section"] == section]
+        lines += ["", f"**{title}**"]
+        lines += [f"- {_md_cell(e['key'])}: {_md_cell(e['value'])}" for e in mine] or ["- —"]
+
+    memory_state = state["memory"] or {}
+    lines += [
+        "",
+        f"- **Последний разбор памяти:** {memory_state.get('last_update') or 'в этом процессе разборов ещё не было'}",
+    ]
+    last = rag_state["last"]
+    if last is None:
+        lines.append("- **Переписывание этого хода:** ходов с RAG ещё не было")
+        return "\n".join(lines)
+    if last["rewrite_memory"]:
+        lines.append(
+            f"- **Переписывание этого хода:** видело память задачи ({task_memory_records(last['rewrite_memory'])}) "
+            f"→ запрос «{_md_cell(last.get('query') or last['question'])}»"
+        )
+    elif last["rewrite"]:
+        lines.append(
+            f"- **Переписывание этого хода:** памяти задачи во входе не было → запрос "
+            f"«{_md_cell(last.get('query') or last['question'])}»"
+        )
+    else:
+        lines.append("- **Переписывание этого хода:** не было (пункт «переписать» снят или RAG выключен)")
+    answer = last["answer"]
+    if not last["ok"]:
+        lines.append("- **Ответ:** поиск не удался — проверки ссылок на память нет")
+    elif answer is None:
+        lines.append("- **Ответ:** проверки не было")
+    else:
+        refs, missing = answer["memory_refs"], answer["memory_missing"]
+        lines.append(
+            "- **Ответ:** "
+            + ("ссылается на память: " + ", ".join(f"[{key}]" for key in refs) if refs else "на память не ссылается")
+        )
+        if missing:
+            lines.append(
+                "- ⚠️ **Ключи без записи в запросе:** " + ", ".join(f"[{key}]" for key in missing)
+            )
+    return "\n".join(lines)
+
+
 # --- Блок «RAG: источники, цитаты и «не знаю» (день 24)» (§6.3) -------------
 # Проверку ответа делает агент (`rag_answer.check()` внутри `ask()`), панель её
 # только рисует: берёт `debug_state()["rag"]["last"]["answer"]`, свою копию
@@ -2971,7 +3087,10 @@ def _answer_repair_lines(last: dict, last_call: dict | None) -> list[str]:
 def _answer_md(state: dict) -> str:
     """Блок «Проверка ответа» (день 24, §6.3): что знал код о релевантности,
     итог проверки, повтор формата, таблицы «Источники ответа» и «Утверждения и
-    цитаты (смысл сверяет человек)», ответ модели как пришёл."""
+    источники (смысл сверяет человек)», ответ модели как пришёл. С дня 25
+    (§6.3) источники — ещё и записи памяти задачи: ключи `[тиран]` в ответе,
+    их значения на момент ответа и проверка, что запись была в запросе; при
+    сбое поиска — две строки вместо «проверки нет»."""
     rag_state = state["rag"]
     lines = ["### Проверка ответа", ""]
     if not rag_state["available"]:
@@ -2984,14 +3103,22 @@ def _answer_md(state: dict) -> str:
             "Ходов ещё не было. После каждого хода с выдержками (или «подходящих не найдено») "
             "здесь — проверка номеров, цитат и «Не знаю»."
         ])
-    if last is None or not last["ok"]:
+    if last is None:
         return "\n".join(lines + ["RAG выключен или поиск не удался — проверки нет."])
+    if not last["ok"]:
+        # День 25 (§6.3): поиск не удался — в чат ушёл ответ из общих знаний, и
+        # код дописал к нему строку о сбое, чтобы он не выглядел ответом по правилам.
+        return "\n".join(lines + [
+            f"- ⚠️ **Поиск не удался:** {last['error']} — проверки нет",
+            "- К ответу дописана строка «Источники: … поиск не удался» — ответ не сверен с правилами",
+        ])
     lines.append(f"- **Что знал код о релевантности:** {_answer_relevance_line(last)}")
     answer = last["answer"]
     if answer is None:
         lines.append(
             "- **Итог:** проверки не было — ход оборвался или в запрос ушёл чистый вопрос "
-            "(выдача пуста, а инструкции пустой выдачи нет)."
+            "(выдача пуста, а инструкции пустой выдачи нет; с дня 25 к такому ответу дописана "
+            "строка «Источники: не найдены — … ответ не сверен с правилами»)."
         )
         return "\n".join(lines)
 
@@ -3020,6 +3147,13 @@ def _answer_md(state: dict) -> str:
         lines.append(
             f"- **«Не знаю» при выдержках выше порога — сверьте:** лучшая оценка {(last['best'] or 0.0):.2f}"
         )
+    if answer["kind"] == KIND_MEMORY and not answer["empty"] and last["rerank_ok"]:
+        # День 25 (§2.4): не нарушение — код не отличает «напомни, что решили» от
+        # вопроса о правилах; решает человек.
+        lines.append(
+            f"- **Сверьте:** выдержки прошли порог (лучшая {(last['best'] or 0.0):.2f}), ответ опирается "
+            "только на память задачи"
+        )
     if answer["own_sources"]:
         lines.append("- Модель написала свой раздел «Источники:» — он заменён списком приложения")
     if last_call is not None and last_call.get("tool_calls"):
@@ -3030,7 +3164,9 @@ def _answer_md(state: dict) -> str:
 
     numbers = sorted({*answer["refs"], *(q["number"] for q in quotes)})
     claims = {number: sentences for number, sentences in answer["claims"]}
-    if numbers:
+    memory_claims = {key: sentences for key, sentences in answer["memory_claims"]}
+    entries = {entry["key"]: entry for entry in last["memory_entries"]}
+    if numbers or memory_claims:
         table = [
             "**Источники ответа:**", "",
             "| № | документ | раздел | стр. | chunk_id | оценка | ссылок в тексте | цитат |",
@@ -3051,10 +3187,24 @@ def _answer_md(state: dict) -> str:
                 table.append(
                     f"| [{number}] | ⚠️ выдержки с таким номером в запросе не было | — | — | — | — | {cited} | {quoted} |"
                 )
+        # Записи памяти задачи (день 25, §6.3): ключ · подпись слоя · значение
+        # на момент ответа · ссылок в тексте — в той же таблице.
+        for key, sentences in memory_claims.items():
+            entry = entries.get(key)
+            if entry is None:
+                table.append(
+                    f"| [{key}] | ⚠️ записи с таким ключом в памяти этого запроса не было | — | — | — | — "
+                    f"| {len(sentences)} | — |"
+                )
+            else:
+                table.append(
+                    f"| [{key}] | {_md_cell(entry['label'])} | «{_md_cell(memory_value_text(entry['value']))}» "
+                    f"| — | — | — | {len(sentences)} | — |"
+                )
         lines += ["", "\n".join(table)]
         table = [
-            "**Утверждения и цитаты (смысл сверяет человек):**", "",
-            "| № | утверждения ответа с этим номером | цитаты | проверка |",
+            "**Утверждения и источники (смысл сверяет человек):**", "",
+            "| № или ключ | утверждения ответа с этим источником | цитаты или значение записи | проверка |",
             "| --- | --- | --- | --- |",
         ]
         for number in numbers:
@@ -3063,6 +3213,16 @@ def _answer_md(state: dict) -> str:
             texts = "<br>".join(_md_cell(f"«{q['text']}»") for q in own) or "—"
             marks = "<br>".join(_md_cell(_answer_quote_mark(q)) for q in own) or "—"
             table.append(f"| [{number}] | {sentences} | {texts} | {marks} |")
+        for key, sentences in memory_claims.items():
+            text = "<br>".join(_md_cell(item) for item in sentences) or "—"
+            entry = entries.get(key)
+            if entry is None:
+                table.append(f"| [{key}] | {text} | — | ⚠️ записи в запросе не было |")
+            else:
+                table.append(
+                    f"| [{key}] | {text} | «{_md_cell(memory_value_text(entry['value']))}» "
+                    "| ✓ запись была в запросе |"
+                )
         lines += ["", "\n".join(table)]
 
     # Сообщение повтора — то, что ушло в модель (`repair_message`), а не
@@ -3236,10 +3396,10 @@ def _profile_choice_options(choices: list[str]) -> list[tuple[str, str]]:
 
 
 def _view(agent: Agent, status: str, question: str = "") -> tuple:
-    """Полный вид на состояние агента — фиксированный кортеж из 42 значений
+    """Полный вид на состояние агента — фиксированный кортеж из 43 значений
     (18 — до дня 10, 22 — до дня 11, 26 — до дня 12, 29 — до дня 13, 31 — до
-    дня 14, 34 — до дня 17, 37 — до дня 22, 40 — до дня 23, 41 — до дня 24;
-    дни 14, 17 и 22 добавляют по три, дни 23 и 24 — по одному),
+    дня 14, 34 — до дня 17, 37 — до дня 22, 40 — до дня 23, 41 — до дня 24, 42
+    — до дня 25; дни 14, 17 и 22 добавляют по три, дни 23, 24 и 25 — по одному),
     позиционно раскладывающийся в `VIEW_OUTPUTS`. Порядок — часть контракта
     обработчиков ниже.
 
@@ -3422,6 +3582,10 @@ def _view(agent: Agent, status: str, question: str = "") -> tuple:
         # Значение дня 24 — в конце кортежа и в конце VIEW_OUTPUTS (§6.3).
         # 42. блок «Проверка ответа» — источники, цитаты, «не знаю», повтор
         _answer_md(state),
+        # Значение дня 25 — в конце кортежа и в конце VIEW_OUTPUTS (§6.3).
+        # 43. блок «Память задачи» — три пункта задания, видела ли её
+        #     переписывание, ссылается ли на неё ответ
+        _task_memory_md(state),
     )
 
 
@@ -3484,6 +3648,10 @@ def _new_agent(preset_name: str) -> Agent:
         # `presets.py` (день 24, §6.1). Ветку `fork()` собирает с теми же.
         rag_answer_format=RAG_ANSWER_FORMAT,
         rag_repair_instruction=RAG_REPAIR_INSTRUCTION,
+        # Инструкция памяти задачи — из `presets.py` (день 25, §6.1): уходит в
+        # запрос, только пока блок рабочей памяти в запросе. Ветку `fork()`
+        # собирает с той же.
+        rag_memory_instruction=RAG_MEMORY_INSTRUCTION,
     )
 
 
@@ -3581,6 +3749,9 @@ def _restore_agents() -> int:
             rag_empty_instruction=RAG_EMPTY_INSTRUCTION,
             rag_answer_format=RAG_ANSWER_FORMAT,
             rag_repair_instruction=RAG_REPAIR_INSTRUCTION,
+            # Рабочая память старых сессий лежит по ключам, которые в карте
+            # остались (день 25, §6.1): читается как есть.
+            rag_memory_instruction=RAG_MEMORY_INSTRUCTION,
         )
         restored += 1
     logger.info(
@@ -5611,6 +5782,45 @@ _RAG_ANSWER_LABELS: list[str] = [
 ]
 assert len(_RAG_ANSWER_LABELS) == len(RAG_ANSWER_QUESTIONS)
 
+# Сценарии дня 25 — `presets.RAG_DIALOG_SCENARIOS`: тексты оттуда, подписи — здесь.
+# Каждый сценарий проходится по порядку одним агентом на «Скользящем окне».
+_DIALOG_LABELS: dict[str, list[str]] = {
+    "А": [
+        "А1 · цель и условия",
+        "А2 · сложность",
+        "А3 · термины: босс, мобы",
+        "А4 · колода под босса",
+        "А5 · мобы (термин из А3)",
+        "А6 · что на стол (расплывчато)",
+        "А7 · уточнение: кубики и фишки",
+        "А8 · первый день",
+        "А9 · награда",
+        "А10 · очко опыта",
+        "А11 · напомни, что решили",
+        "А12 · «босс» девятью ходами позже",
+        "А13 · не успею за дни",
+        "А14 · итог вечера",
+    ],
+    "Б": [
+        "Б1 · цель, состав, коробка",
+        "Б2 · боевая очередь",
+        "Б3 · второй день: сила злодеев",
+        "Б4 · термин «хиты»",
+        "Б5 · кто ходит первым",
+        "Б6 · Бумер: сколько кубиков",
+        "Б7 · 3 ЛОВ и сдвиг",
+        "Б8 · отравление поверх отравления",
+        "Б9 · «хиты» кончились",
+        "Б10 · кто поднимет",
+        "Б11 · если и Бумер в нокауте",
+        "Б12 · напомни цель и что осталось",
+        "Б13 · допустим, бой выиграли",
+    ],
+}
+assert all(
+    len(_DIALOG_LABELS[scenario["id"]]) == len(scenario["steps"]) for scenario in RAG_DIALOG_SCENARIOS
+)
+
 
 # Чат и дебаг-панель — ровно пополам; кнопки компактнее дефолтных.
 APP_CSS = """
@@ -5620,16 +5830,16 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 24, неделя 5 — **источники, цитаты и «не знаю»**: модель "
-        "отвечает только по выдержкам, ставит после утверждений номера "
-        "`[1]` и в конце пишет «Цитаты:» дословными фрагментами; **код** "
-        "проверяет номера и дословность цитат, при нарушении просит один "
-        "повтор и сам собирает под ответом список источников — документ, "
-        "раздел, страница, `chunk_id`. Если ни один кусок не прошёл порог "
-        "релевантности, ответ обязан начинаться с «Не знаю» и спрашивать "
-        "уточнение. Для проверки — 10 контрольных вопросов и 3 вопроса "
-        "проверки ответа (у поля ввода), программа `./run.sh rag-eval`; "
-        "смысл ответа сверяет человек."
+        "День 25, неделя 5 — **мини-чат с RAG и памятью задачи**: история "
+        "диалога, поиск по правилам на каждый вопрос, ответ с источниками. "
+        "**Память задачи** — цель, что игрок уже уточнил, ограничения и "
+        "термины; её видит переписывание запроса (слова игрока и имена героев "
+        "заменяются словами правил, продолжение разговора дополняется) и "
+        "ответ: после утверждения по памяти модель ставит ключ `[тиран]`, а "
+        "**код** проверяет, что такая запись была в запросе, и пишет её в "
+        "«Источники:» рядом с выдержками. Для длинного разговора — «Скользящее "
+        "окно»: цель несёт память. Два сценария — у поля ввода, программа "
+        "`./run.sh rag-dialog`; не теряет ли ассистент цель, решает человек."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -5751,7 +5961,9 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "Выключенный слой не уходит в модель, но продолжает "
                     "записываться: разбор памяти идёт при любом положении, и "
                     "включённый обратно слой сразу полон. Краткосрочную "
-                    "память (разговор) урезает стратегия контекста."
+                    "память (разговор) урезает стратегия контекста. Рабочая — "
+                    "это и память задачи дня 25: выключенная не уходит ни в "
+                    "запрос, ни в поиск."
                 ),
             )
             # «Инварианты в запросе» (день 14, §8.2) — над «Профилем в
@@ -5812,28 +6024,21 @@ with gr.Blocks(title="TooManyRules") as demo:
                 placeholder="Например: из каких фаз состоит ход игрока?",
                 lines=2,
             )
-            # Контрольные вопросы дня 22 (§9.4) — у поля ввода, в кадре. Клик
-            # кладёт текст в поле, отправляет человек; каждый вопрос — новому
-            # агенту (кнопка «Новый агент»), в каждом режиме.
-            gr.Examples(
-                examples=[[q["question"]] for q in RAG_CONTROL_QUESTIONS],
-                inputs=[question_input],
-                example_labels=_RAG_QUESTION_LABELS,
-                examples_per_page=len(RAG_CONTROL_QUESTIONS),
-                label=(
-                    "Контрольные вопросы — каждый задавайте новому агенту; "
-                    "инструменты MCP выключите"
-                ),
-            )
-            # Вопросы проверки ответа дня 24 (§6.4) — рядом с контрольными:
-            # «не знаю» по порогу на двух языках и просьба против формата.
-            gr.Examples(
-                examples=[[q["question"]] for q in RAG_ANSWER_QUESTIONS],
-                inputs=[question_input],
-                example_labels=_RAG_ANSWER_LABELS,
-                examples_per_page=len(RAG_ANSWER_QUESTIONS),
-                label="Проверка ответа (день 24) — каждый новому агенту",
-            )
+            # Сценарии дня 25 (§6.4) — у поля ввода, в кадре: клик кладёт текст в
+            # поле, отправляет человек, по порядку одним агентом. Контрольные
+            # вопросы дня 22 и вопросы проверки ответа дня 24 ушли в аккордеон
+            # прошлых дней.
+            for scenario in RAG_DIALOG_SCENARIOS:
+                gr.Examples(
+                    examples=[[step["message"]] for step in scenario["steps"]],
+                    inputs=[question_input],
+                    example_labels=_DIALOG_LABELS[scenario["id"]],
+                    examples_per_page=len(scenario["steps"]),
+                    label=(
+                        f"Сценарий {scenario['id']} (день 25) — {scenario['title']}: по порядку одним агентом "
+                        "на «Скользящем окне»; инструменты MCP выключите"
+                    ),
+                )
             with gr.Row():
                 send_btn = gr.Button("Отправить", size="sm", variant="primary", scale=2)
                 reset_btn = gr.Button("Сбросить диалог", size="sm", scale=1)
@@ -6042,9 +6247,29 @@ with gr.Blocks(title="TooManyRules") as demo:
                 )
 
             # Свёрнуто: сценарии прошлых дней. У дня 16 сценария в чате не
-            # было, контрольные вопросы дня 22 стоят у поля ввода (правило «на
-            # экране — текущий день»).
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-20, 23)", open=False):
+            # было; у поля ввода — сценарии текущего дня (правило «на экране —
+            # текущий день»), контрольные вопросы дня 22 и вопросы проверки
+            # ответа дня 24 — здесь.
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-20, 22-24)", open=False):
+                # Контрольные вопросы дня 22 и вопросы проверки ответа дня 24 —
+                # с дня 25 здесь (день 25, §6.4): у поля ввода стоят сценарии.
+                gr.Examples(
+                    examples=[[q["question"]] for q in RAG_CONTROL_QUESTIONS],
+                    inputs=[question_input],
+                    example_labels=_RAG_QUESTION_LABELS,
+                    examples_per_page=len(RAG_CONTROL_QUESTIONS),
+                    label=(
+                        "Контрольные вопросы (день 22) — каждый задавайте новому агенту; "
+                        "инструменты MCP выключите"
+                    ),
+                )
+                gr.Examples(
+                    examples=[[q["question"]] for q in RAG_ANSWER_QUESTIONS],
+                    inputs=[question_input],
+                    example_labels=_RAG_ANSWER_LABELS,
+                    examples_per_page=len(RAG_ANSWER_QUESTIONS),
+                    label="Проверка ответа (день 24) — каждый новому агенту",
+                )
                 # Уточняющие вопросы дня 23 (§6.4): каждый задаётся тем же
                 # агентом сразу после своего контрольного.
                 gr.Examples(
@@ -6218,13 +6443,49 @@ with gr.Blocks(title="TooManyRules") as demo:
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # RAG: источники, цитаты и «не знаю» (день 24, §6.2) — развёрнут
-            # наверху панели. Описание — статичный Markdown; «Проверка ответа»
-            # — новое 42-е значение `_view()`; «RAG последнего хода» и
-            # последнее сообщение запроса целиком переехали сюда из блока дня
-            # 23 (правило дней 19-20: блок хода живёт в блоке текущего дня) —
-            # те же компоненты и выходы `_view()` (39-40).
-            with gr.Accordion("RAG: источники, цитаты и «не знаю» (день 24)", open=True):
+            # Мини-чат: RAG + память задачи (день 25, §6.2) — развёрнут наверху
+            # панели. Описание — статичный Markdown; «Память задачи» — новое
+            # 43-е значение `_view()`; «Проверка ответа», «RAG последнего
+            # хода» и последнее сообщение запроса целиком переехали сюда из
+            # блока дня 24 (правило дней 19-24: блок хода живёт в блоке
+            # текущего дня) — те же компоненты и выходы `_view()` (39-40, 42).
+            with gr.Accordion("Мини-чат: RAG + память задачи (день 25)", open=True):
+                gr.Markdown(
+                    "**Память задачи** — рабочий слой памяти дня 11 по трём "
+                    "пунктам задания: *цель*, *что уже уточнено*, *ограничения "
+                    "и термины*. Её видит **переписывание запроса** (слова "
+                    "игрока из «термины» и имена героев заменяются словами "
+                    "правил, продолжение разговора дополняется) и **ответ**: "
+                    "после утверждения по памяти модель ставит ключ записи "
+                    "`[тиран]`, а код проверяет, что такая запись была в "
+                    "запросе, и пишет её в «Источники:» рядом с выдержками. "
+                    "У каждого ответа хода с RAG есть строка «Источники:» — "
+                    "выдержки, записи памяти задачи, «не найдены» или «поиск "
+                    "не удался». Для длинного разговора — «Скользящее окно»: "
+                    "историю режут, цель несёт память задачи. Выключить память "
+                    "задачи — снять «рабочая» в «Слоях памяти в запросе». "
+                    "**Не потеряна ли цель и совпадает ли смысл ответа с "
+                    "источниками, решает человек.**\n\n"
+                    "«Состояние задачи» дня 13 (автомат этапов, «Начать "
+                    "задачу…») — другое, день 25 его не использует; «task "
+                    "state» задания — это память задачи."
+                )
+                task_memory_md = gr.Markdown("")
+                answer_md = gr.Markdown("")
+                rag_md = gr.Markdown("")
+                with gr.Accordion(
+                    "Последнее сообщение запроса целиком (выдержки + вопрос)", open=False
+                ):
+                    rag_message_box = gr.Textbox(
+                        label="Последнее сообщение запроса целиком (выдержки + вопрос)",
+                        lines=12,
+                        max_lines=40,
+                        interactive=False,
+                        buttons=["copy"],
+                    )
+            # RAG: источники, цитаты и «не знаю» (день 24, §6.2) — с дня 25
+            # свёрнут под блоком дня 25 (§6.4); остаётся статичное описание.
+            with gr.Accordion("RAG: источники, цитаты и «не знаю» (день 24)", open=False):
                 gr.Markdown(
                     "**Модель отвечает только по выдержкам** и ставит после "
                     "утверждений номер выдержки `[N]`; в конце — раздел "
@@ -6238,20 +6499,8 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "начинаться с «Не знаю» и спрашивать уточнение**, общих "
                     "знаний нет. Код проверяет форму; **совпадает ли смысл "
                     "ответа с цитатами, решает человек** — по таблице "
-                    "«Утверждения и цитаты»."
+                    "«Утверждения и источники»."
                 )
-                answer_md = gr.Markdown("")
-                rag_md = gr.Markdown("")
-                with gr.Accordion(
-                    "Последнее сообщение запроса целиком (выдержки + вопрос)", open=False
-                ):
-                    rag_message_box = gr.Textbox(
-                        label="Последнее сообщение запроса целиком (выдержки + вопрос)",
-                        lines=12,
-                        max_lines=40,
-                        interactive=False,
-                        buttons=["copy"],
-                    )
             # RAG: фильтр и переписывание запроса (день 23, §8.3) — с дня 24
             # свёрнут под блоком дня 24 (§6.4); остаётся статичное описание
             # дня 23.
@@ -6697,6 +6946,7 @@ with gr.Blocks(title="TooManyRules") as demo:
         rag_message_box,
         rag_stages_group,
         answer_md,
+        task_memory_md,
     ]
     COMMON_OUTPUTS = [agent_state, question_input] + VIEW_OUTPUTS
     # Выходы формы редактора профиля (день 12, §7.3) — отдельно от
