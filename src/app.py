@@ -728,7 +728,8 @@ def _rewrite_call_lines(last_call: dict) -> list[str]:
             f"искали по вопросу как есть, ход состоялся. Потрачено {_fmt_int(call['total_tokens'] or 0)} токенов."
         ]
     return [
-        f"- **✏️ Переписывание запроса:** «{_md_cell(call['text'])}» "
+        # С дня 25 (§2.10) в ответе две строки — запрос и он же словами книги.
+        f"- **✏️ Переписывание запроса:** «{'» + «'.join(_md_cell(q) for q in call['text'].splitlines())}» "
         f"({call.get('memory_update') or 'ок'}), вызов {_fmt_int(call['total_tokens'])} токенов, "
         f"{_fmt_cost(call['cost_usd'])}, {call['elapsed']:.2f} s"
     ]
@@ -2792,9 +2793,15 @@ def _rag_query_line(last: dict, rewrite_call: dict | None) -> str:
             f" · {rewrite_call['elapsed']:.2f} с · ≈{_fmt_int(rewrite_call['total_tokens'])} ток. · "
             f"{_fmt_cost(rewrite_call['cost_usd'])}"
         )
+    # Вторая строка переписывания (день 25, §2.10): тот же вопрос словами книги
+    # правил, поиск шёл по обоим запросам — кусок брал лучшую оценку.
+    extra = "".join(f" + словами книги: «{_md_cell(other)}»" for other in (last.get("queries") or ())[1:])
     if " ".join(query.split()) == " ".join(last["question"].split()):
-        return f"- **Запрос поиска:** «{_md_cell(query)}» (без изменений{cost})"
-    return f"- **Запрос поиска:** «{_md_cell(query)}» (переписан{cost}) — модель видит вопрос игрока, а не этот запрос"
+        return f"- **Запрос поиска:** «{_md_cell(query)}» (без изменений{cost}){extra}"
+    return (
+        f"- **Запрос поиска:** «{_md_cell(query)}» (переписан{cost}){extra} — модель видит вопрос игрока, "
+        "а не этот запрос"
+    )
 
 
 def _rag_md(state: dict) -> str:

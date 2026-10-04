@@ -86,7 +86,18 @@ class CleanRules:
     - `default_group` — имя раздела (группы) до первого заголовка;
     - `columns` — пары «страница, x границы колонок»: на этих страницах блоки
       идут по колонкам (сначала левее границы, потом правее), в колонке —
-      сверху вниз; на остальных страницах — в порядке PyMuPDF.
+      сверху вниз; на остальных страницах — в порядке PyMuPDF;
+    - `image_headings` — тройки «страница, начало строки, заголовок»: заголовок
+      набран в PDF картинкой (текста у него нет), и без него текст под ним
+      продолжал бы прежний раздел. Перед первой строкой страницы, которая
+      начинается так (пробелы схлопнуты), очистка ставит заголовок, как если
+      бы он был набран текстом. Строки нет — сборка отказывает: правило
+      разошлось с документом (день 25, правка после проверки автора);
+    - `heading_names` — тройки «страница, заголовок, имя»: заголовок
+      подраздела, чьё имя без раздела над ним ничего не говорит («Приключение»
+      — пункт «Уровней сложности»), получает имя с уточнением («Приключение
+      (уровень сложности)»); оно же — первая строка куска. Заголовка нет —
+      сборка отказывает.
     """
 
     min_size: float
@@ -95,6 +106,8 @@ class CleanRules:
     entry_font: str = ""
     default_group: str = ""
     columns: tuple[tuple[int, float], ...] = ()
+    image_headings: tuple[tuple[int, str, str], ...] = ()
+    heading_names: tuple[tuple[int, str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -143,6 +156,18 @@ def check_documents(docs: list[SourceDoc] | tuple[SourceDoc, ...], langs: tuple[
         if (source.doc, source.lang) in seen:
             raise ValueError(f"документ {source.key} описан дважды")
         seen.add((source.doc, source.lang))
+        for page, anchor, heading in source.rules.image_headings:
+            if not isinstance(page, int) or page < 1 or not anchor.strip() or not heading.strip():
+                raise ValueError(
+                    f"{source.key}: заголовок-картинка ({page!r}, {anchor!r}, {heading!r}) — нужны страница "
+                    "с единицы, начало строки и текст заголовка"
+                )
+        for page, heading, name in source.rules.heading_names:
+            if not isinstance(page, int) or page < 1 or not heading.strip() or not name.strip():
+                raise ValueError(
+                    f"{source.key}: имя заголовка ({page!r}, {heading!r}, {name!r}) — нужны страница "
+                    "с единицы, заголовок и новое имя"
+                )
 
 
 # --- Вход очистки ------------------------------------------------------------
@@ -215,7 +240,14 @@ def pages_label(pages: tuple[int, ...]) -> str:
     return "стр. " + ", ".join(parts)
 
 
+# Шрифт строки, которую очистка вставила вместо заголовка-картинки
+# (`CleanRules.image_headings`): такая строка — заголовок при любых правилах.
+IMAGE_HEADING_FONT = "<заголовок-картинка>"
+
+
 def _is_heading(line: Line, rules: CleanRules) -> bool:
+    if line.font == IMAGE_HEADING_FONT:
+        return True
     return any(
         line.font == font and abs(line.size - size) <= HEADING_SIZE_TOLERANCE
         for font, size in rules.heading_fonts
@@ -277,6 +309,49 @@ def _reading_order(lines: list[Line], columns: dict[int, float]) -> list[Line]:
             ordered.extend(blocks[key])
         i = j
     return ordered
+
+
+def _apply_heading_names(drafts: list["_Draft"], source: SourceDoc) -> None:
+    """Имена подразделов с уточнением (`CleanRules.heading_names`): заголовок
+    страницы с этим текстом получает новое имя. Заголовка нет — `ValueError`."""
+    for page, heading, name in source.rules.heading_names:
+        wanted = " ".join(heading.split())
+        draft = next(
+            (d for d in drafts if d.kind == "heading" and d.pages[0][1] == page and " ".join(d.text.split()) == wanted),
+            None,
+        )
+        if draft is None:
+            raise ValueError(f"{source.key}: имя «{name}» — на стр. {page} нет заголовка «{heading}»")
+        draft.text = " ".join(name.split())
+
+
+def _with_image_headings(lines: list[Line], source: SourceDoc) -> list[Line]:
+    """Строки в порядке чтения со вставленными заголовками-картинками
+    (`CleanRules.image_headings`): каждый — своя строка в своём блоке перед
+    первой строкой страницы, начинающейся с якоря. Якоря нет — `ValueError`."""
+    rules = source.rules
+    if not rules.image_headings:
+        return lines
+    out = list(lines)
+    for number, (page, anchor, heading) in enumerate(rules.image_headings, 1):
+        wanted = " ".join(anchor.split())
+        index = next(
+            (i for i, line in enumerate(out)
+             if line.page == page and line.font != IMAGE_HEADING_FONT
+             and " ".join(line.text.split()).startswith(wanted)),
+            None,
+        )
+        if index is None:
+            raise ValueError(
+                f"{source.key}: заголовок-картинка «{heading}» — на стр. {page} нет строки, "
+                f"начинающейся с «{anchor}»"
+            )
+        line = out[index]
+        out.insert(index, Line(
+            page, -number, " ".join(heading.split()), IMAGE_HEADING_FONT, 0.0, IMAGE_HEADING_FONT,
+            line.x, line.y,
+        ))
+    return out
 
 
 # Строки заголовка одного блока — один заголовок, если набраны тем же шрифтом
@@ -365,7 +440,7 @@ def clean(source: SourceDoc, lines: list[Line], pages: int) -> CleanDoc:
             draft.pages.append((len(draft.text), line.page))
         draft.text += text
 
-    for line in _reading_order(kept, dict(rules.columns)):
+    for line in _with_image_headings(_reading_order(kept, dict(rules.columns)), source):
         block = (line.page, line.block)
         new_block = block != previous_block
         previous_block = block
@@ -390,6 +465,7 @@ def clean(source: SourceDoc, lines: list[Line], pages: int) -> CleanDoc:
         else:
             append(current, line)
 
+    _apply_heading_names(drafts, source)
     paragraphs: list[Paragraph] = []
     marks: list[tuple[int, int]] = []
     pieces: list[str] = []

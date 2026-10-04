@@ -234,9 +234,12 @@ def search_line(run: Run) -> str:
     query = record.query or record.question
     if record.rewrite and not record.rewrite_ok:
         return f"⚠️ переписывание не удалось ({record.rewrite_error}) — искали по вопросу"
+    # Вторая строка переписывания (день 25, §2.10) — тот же вопрос словами книги
+    # правил; поиск шёл и по ней.
+    extra = "".join(f" + словами книги: «{other}»" for other in record.queries[1:])
     if record.rewrite and " ".join(query.split()) == " ".join(record.question.split()):
-        return "без изменений"
-    return f"«{query}»" if record.rewrite else "вопрос как есть"
+        return "без изменений" + extra
+    return (f"«{query}»" + extra) if record.rewrite else "вопрос как есть"
 
 
 def answer_block(run: Run, mode: Mode, question: dict) -> list[str]:

@@ -476,7 +476,7 @@ class RulesIndex:
             self.load_model()
             return self._embedder.embed_query(question)
 
-    def search(self, question: str, rerank: bool = False) -> dict:
+    def search(self, question: str, rerank: bool = False, alternatives: Sequence[str] = ()) -> dict:
         """Протокол `Retriever` агента: ближайшие куски со стратегией, языком и
         `top_k` экземпляра, словарём, без исключений. `rerank=False` — день 22:
         `top_k` ближайших. `rerank=True` (день 23, §4.2) — этап 1 берёт
@@ -485,11 +485,24 @@ class RulesIndex:
         пустыми `hits` — штатный ответ**: второй этап удался и отсёк всех. Сбой
         этапа 2 — `hits` этапа 1 (`top_k` ближайших), `rerank_ok=False` и
         причина. `elapsed` — вся работа поиска без обеих загрузок (`load_s` —
-        модель эмбеддингов, `rerank_load_s` — реранкер)."""
+        модель эмбеддингов, `rerank_load_s` — реранкер).
+
+        С дня 25 (§2.10) `alternatives` — ещё запросы того же вопроса (вторая
+        строка переписывания, словами книги правил): каждый запрос берёт своих
+        кандидатов и оценивает их со своим текстом, кусок получает лучшую
+        оценку (без второго этапа — лучшую близость), дальше порог и `top_k`
+        как раньше. Дословный запрос держит то, что ломает перефраз, перефраз
+        находит то, что дословный не находит. Пусто — ровно день 23; у
+        кандидата `query` — номер запроса, давшего лучшую оценку."""
         started = time.perf_counter()
+        queries = [question]
+        for extra in alternatives:
+            extra = " ".join((extra or "").split())
+            if extra and extra not in queries:
+                queries.append(extra)
         result = {
             "ok": False, "error": "", "elapsed": 0.0, "load_s": 0.0, "embed_s": 0.0, "total": 0, "hits": [],
-            "query": question, "rerank": bool(rerank), "rerank_ok": False, "rerank_error": "",
+            "query": question, "queries": queries, "rerank": bool(rerank), "rerank_ok": False, "rerank_error": "",
             "rerank_model": self.rerank_model, "threshold": self.threshold,
             "candidates_k": self.candidates_k, "top_k": self.top_k,
             "rerank_s": 0.0, "rerank_load_s": 0.0, "candidates": [],
@@ -503,12 +516,16 @@ class RulesIndex:
                     raise RagError(f"в индексе нет кусков {self.strategy}/{self.lang}")
                 result["load_s"] = self._load_model()
                 step = time.perf_counter()
-                vector = self._embedder.embed_query(question)
+                vectors = [self._embedder.embed_query(query) for query in queries]
                 result["embed_s"] = time.perf_counter() - step
                 if not rerank:
-                    result["hits"] = [hit.as_dict() for hit in self._ranked(mask, vector, self.top_k)]
+                    stages = [self._ranked(mask, vector, self.top_k) for vector in vectors]
+                    union = _union(stages)
+                    union.sort(key=lambda hit: -hit.score)
+                    result["hits"] = [hit.as_dict() for hit in union[:self.top_k]]
                 else:
-                    self._second_stage(result, question, self._ranked(mask, vector, self.candidates_k))
+                    stages = [self._ranked(mask, vector, self.candidates_k) for vector in vectors]
+                    self._second_stage(result, queries, stages)
             result["ok"] = True
         except RagError as exc:
             result["error"] = str(exc)
@@ -520,12 +537,24 @@ class RulesIndex:
         )
         return result
 
-    def _second_stage(self, result: dict, query: str, stage1: list[Hit]) -> None:
+    def _second_stage(self, result: dict, queries: Sequence[str], stages: Sequence[list[Hit]]) -> None:
         """Этап 2 поиска (день 23, §4.2): дописывает в `result` выдачу,
         кандидатов и условия. Под замком; не бросает — сбой реранкера
-        превращается в выдачу этапа 1 с причиной (§2.3)."""
+        превращается в выдачу этапа 1 первого запроса с причиной (§2.3). С дня
+        25 (§2.10) запросов может быть несколько: кандидаты каждого
+        оцениваются с его текстом, кусок берёт лучшую оценку."""
         try:
-            ranked, load_s, score_s = self._rerank(query, stage1)
+            load_s = score_s = 0.0
+            best: dict[str, Hit] = {}
+            origin: dict[str, int] = {}
+            for number, (query, stage1) in enumerate(zip(queries, stages), 1):
+                ranked_one, loaded, scored_s = self._rerank(query, stage1)
+                load_s += loaded
+                score_s += scored_s
+                for hit in ranked_one:
+                    if hit.chunk_id not in best or hit.rerank_score > best[hit.chunk_id].rerank_score:
+                        best[hit.chunk_id] = hit
+                        origin[hit.chunk_id] = number
         except RagError as exc:
             result["rerank_error"] = str(exc)
         except Exception as exc:  # noqa: BLE001 — реранкер не должен отменять поиск
@@ -535,6 +564,9 @@ class RulesIndex:
             result["rerank_load_s"] = load_s
             result["rerank_s"] = score_s
             result["rerank_ok"] = True
+            stage1 = _union(stages)
+            order = {hit.chunk_id: position for position, hit in enumerate(stage1)}
+            ranked = sorted(best.values(), key=lambda hit: (-hit.rerank_score, order[hit.chunk_id]))
             kept = [hit for hit in ranked if hit.rerank_score >= self.threshold][:self.top_k]
             kept_ids = {hit.chunk_id for hit in kept}
             result["hits"] = [hit.as_dict() for hit in kept]
@@ -552,13 +584,26 @@ class RulesIndex:
                     "chunk_id": hit.chunk_id, "doc": hit.doc, "title": hit.title, "section": hit.section,
                     "part": hit.part, "page_from": hit.page_from, "page_to": hit.page_to,
                     "tokens": hit.tokens, "score": hit.score, "rerank_score": scored.rerank_score,
-                    "rerank_place": place, "fate": fate,
+                    "rerank_place": place, "fate": fate, "query": origin[hit.chunk_id],
                 })
             result["candidates"] = candidates
             return
-        # Сбой: в запрос уходят `top_k` ближайших этапа 1, без оценок.
-        result["hits"] = [hit.as_dict() for hit in stage1[:self.top_k]]
+        # Сбой: в запрос уходят `top_k` ближайших этапа 1 первого запроса, без оценок.
+        result["hits"] = [hit.as_dict() for hit in stages[0][:self.top_k]]
         logger.warning("[RAG] второй этап не удался: %s — выдача без фильтра", result["rerank_error"])
+
+
+def _union(stages: Sequence[list[Hit]]) -> list[Hit]:
+    """Кандидаты нескольких запросов одним списком (день 25, §2.10): порядок
+    первого запроса, затем новые куски следующих; у куска, найденного
+    несколькими запросами, — лучшая близость. Один запрос — его список как есть."""
+    merged: dict[str, Hit] = {}
+    for stage in stages:
+        for hit in stage:
+            known = merged.get(hit.chunk_id)
+            if known is None or hit.score > known.score:
+                merged[hit.chunk_id] = hit if known is None else replace(known, score=hit.score)
+    return list(merged.values())
 
 
 __all__ = [

@@ -621,6 +621,7 @@ def log_turn(turn: Turn, mode: DialogMode) -> None:
         query = record.query or record.question
         same = " ".join(query.split()) == " ".join(record.question.split())
         line += f"запрос «{query}»{' (без изменений)' if same else ''}"
+        line += "".join(f" + «{other}»" for other in record.queries[1:])
         if record.ok:
             line += f" · выдержек {len(record.hits)}"
             if turn.step["sources"]:

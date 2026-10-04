@@ -226,6 +226,10 @@ RAG_EMPTY_HEADER = f"{RAG_HEADER} — подходящих не найдено"
 # подпись в `ServiceCall.memory_label`: своя цена (`rewrite_*`), не входит ни в
 # `service_*`, ни в `memory_*`, `route_*`, `tracker_*`, `guard_*`, `sampling_*`.
 REWRITE_CALL_LABEL = "Переписывание запроса"
+# Сколько запросов поиска берётся из ответа переписывания (день 25, §2.10):
+# первая строка — запрос по правилам промпта, вторая — тот же вопрос словами
+# книги правил; поиск идёт по обоим, кусок берёт лучшую оценку.
+REWRITE_MAX_QUERIES = 2
 REWRITE_NO_HISTORY = "разговор только начинается"
 # День 25 (§2.3, §4.2): память задачи — первый абзац входа переписывания и
 # подписи слоёв у записей памяти в «Источниках:» (подпись — данные агента,
@@ -280,6 +284,10 @@ class AgentConfig:
     stop: list[str] | None = None
     keep_history: bool = True          # ведёт ли агент стек сообщений между вызовами
     base_url: str = DEEPSEEK_BASE_URL  # задел на неделю 6 (локальная модель)
+    # Температура служебных работ (день 25, §2.10): `None` — не передаётся,
+    # как на днях 9-24. Служебные вызовы всегда без thinking, поэтому
+    # проверка ниже её не касается.
+    service_temperature: float | None = None
 
     def __post_init__(self) -> None:
         # DeepSeek не поддерживает temperature/top_p в режиме рассуждения
@@ -443,6 +451,10 @@ class RagRecord:
     rewrite_memory: str = ""
     memory_note: bool = False
     memory_entries: "tuple[rag_answer.MemoryEntry, ...]" = ()
+    # Правка после проверки автора (день 25, §2.10): все запросы поиска хода —
+    # первая строка переписывания (она же `query`) и вторая, словами книги
+    # правил, если она есть и отличается; пусто — переписывания не было.
+    queries: tuple[str, ...] = ()
 
     @property
     def repaired(self) -> bool:
@@ -881,8 +893,13 @@ class Retriever(Protocol):
     # "rerank_ok", "rerank_error" (сбой этапа 2 — `hits` этапа 1),
     # "rerank_model", "threshold", "candidates_k", "top_k", "rerank_s",
     # "rerank_load_s", "candidates" (этап 1 в его порядке, без текста). `ok`
-    # с пустыми `hits` — штатный ответ: второй этап отсёк всех.
-    def search(self, question: str, rerank: bool = False) -> dict: ...
+    # с пустыми `hits` — штатный ответ: второй этап отсёк всех. С дня 25
+    # (§2.10) `alternatives` — ещё запросы того же вопроса (вторая строка
+    # переписывания): каждый ищет своих кандидатов, кусок берёт лучшую оценку;
+    # пусто — ровно день 23. Ответ дописывает "queries" — все запросы.
+    def search(
+        self, question: str, rerank: bool = False, alternatives: Sequence[str] = ()
+    ) -> dict: ...
 
 
 # --- Счётчики процесса и реестр агентов ----------------------------------
@@ -1686,7 +1703,7 @@ class Agent:
         # памяти по этому же сообщению уже идёт выше, поэтому поиск видит
         # свежую память.
         task_memory = self._task_memory_text()
-        query, rewrite_call = self._run_query_rewrite(client, user_message, task_memory)
+        queries, rewrite_call = self._run_query_rewrite(client, user_message, task_memory)
 
         # Поиск выдержек RAG (день 22, §2.1, §6.2; с дня 23 — по запросу и со
         # вторым этапом) — после переписывания и до каталога инструментов. Это
@@ -1694,7 +1711,7 @@ class Agent:
         # или поиска нет — `None`. Сбой поиска ход не отменяет: запрос уходит
         # чистым вопросом, как без RAG (правило каталога инструментов дня 17).
         # Пустая выдача по порогу — не сбой, а своя часть запроса (§2.4).
-        rag = self._run_rag(user_message, query, rewrite_call, task_memory)
+        rag = self._run_rag(user_message, queries, rewrite_call, task_memory)
         self._last_rag = rag
         rag_hits = rag.hits if rag is not None and rag.ok else ()
         rag_empty = bool(rag is not None and rag.empty and self._rag_empty_instruction)
@@ -3557,8 +3574,12 @@ class Agent:
         (день 9): сообщения из задачи, `thinking` всегда выключен (скрытые
         reasoning-токены тратят тот же бюджет `max_tokens`, что и видимый
         ответ, и на маленьком лимите ответ пришёл бы пустым), `max_tokens` из
-        задачи, ни температуры, ни `stop`. Модель — из конфига агента:
-        отдельной модели под служебные работы нет (правило дня 9).
+        задачи, без `stop`. Температура — `AgentConfig.service_temperature`
+        (день 25, §2.10: на температуре API по умолчанию разбор памяти и
+        переписывание запроса давали от прогона к прогону разное, и поиск то
+        находил раздел, то нет); `None` — не передаётся, как на днях 9-24.
+        Модель — из конфига агента: отдельной модели под служебные работы нет
+        (правило дня 9).
 
         Исключение API пробрасывается вызывающему: что сбой значит для
         памяти, знает работа вокруг вызова, а не вызов.
@@ -3569,6 +3590,11 @@ class Agent:
             messages=messages,
             extra_body={"thinking": {"type": "disabled"}},
             **({"max_tokens": max_tokens} if max_tokens else {}),
+            **(
+                {"temperature": self._config.service_temperature}
+                if self._config.service_temperature is not None
+                else {}
+            ),
         )
         elapsed = time.perf_counter() - started
         choice = response.choices[0]
@@ -4316,7 +4342,7 @@ class Agent:
 
     def _run_query_rewrite(
         self, client: OpenAI, user_message: str, task_memory: str = "",
-    ) -> tuple[str, ServiceCall | None]:
+    ) -> tuple[tuple[str, ...], ServiceCall | None]:
         """Переписывание запроса поиска (день 23, §2.2, §6.3) — седьмая
         служебная работа: последний обмен + сообщение игрока → самостоятельный
         вопрос на русском. Вход и разбор — `_rewrite_input()` и
@@ -4324,7 +4350,11 @@ class Agent:
         задачи (`task_memory`: рабочий слой, если его блок в запросе; `""` —
         абзаца нет, вход ровно дня 23).
 
-        Нечего переписывать — `(user_message, None)`: RAG выключен, поиска
+        С дня 25 (§2.10) возвращает запросы поиска: до `REWRITE_MAX_QUERIES`
+        разных строк ответа (`_parse_rewrite_queries()`); при сбое — вопрос
+        как есть, одним запросом.
+
+        Нечего переписывать — `((user_message,), None)`: RAG выключен, поиска
         нет, пункт «переписать» снят, нет промпта, сообщение пустое. Кодом
         язык и «самостоятельность» вопроса не определяются: вызов не
         пропускается «для русских вопросов», это решает промпт. Сбой хода не
@@ -4333,7 +4363,7 @@ class Agent:
         применяется** (правило трекера, день 13): оборванный запрос хуже
         вопроса как есть. Вызов в любом случае оплачен и посчитан."""
         if not (self.rag_in_request and self.rag_rewrite) or not user_message.strip():
-            return user_message, None
+            return (user_message,), None
         messages = [
             {"role": "system", "content": self._rag_rewrite_prompt},
             {
@@ -4358,9 +4388,10 @@ class Agent:
                 "[%s] RAG, переписывание: ⚠️ не удалось (%s) — ищу по вопросу как есть",
                 self._log_name, call.error,
             )
-            return user_message, call
+            return (user_message,), call
 
-        query = "" if result.finish_reason == "length" else _parse_rewrite(result.text)
+        queries = () if result.finish_reason == "length" else _parse_rewrite_queries(result.text)
+        query = queries[0] if queries else ""
         if result.finish_reason == "length":
             error = "ответ оборван по max_tokens"
         elif not query:
@@ -4373,7 +4404,7 @@ class Agent:
             elapsed=result.elapsed,
             prompt_tokens=result.prompt_tokens, completion_tokens=result.completion_tokens,
             total_tokens=result.total_tokens, cost_usd=result.cost_usd,
-            covers=0, folded_tokens=0, text=query, finish_reason=result.finish_reason,
+            covers=0, folded_tokens=0, text="\n".join(queries), finish_reason=result.finish_reason,
             memory_label=REWRITE_CALL_LABEL,
             memory_update="" if error else ("без изменений" if unchanged else "переписан"),
         )
@@ -4383,18 +4414,19 @@ class Agent:
                 "[%s] RAG, переписывание: ⚠️ %s (finish_reason=%s, начало: %r) — ищу по вопросу как есть",
                 self._log_name, error, result.finish_reason, result.text[:120],
             )
-            return user_message, call
+            return (user_message,), call
         logger.info(
-            "[%s] RAG, переписывание: %s · память задачи: %s · %.2f с · ≈%s ток. · %s",
+            "[%s] RAG, переписывание: %s%s · память задачи: %s · %.2f с · ≈%s ток. · %s",
             self._log_name, "«%s» — без изменений" % query if unchanged else "«%s»" % query,
+            "".join(f" + «{extra}»" for extra in queries[1:]),
             task_memory_records(task_memory),
             result.elapsed, _num(result.total_tokens), _cost_str(result.cost_usd),
         )
-        return query, call
+        return queries, call
 
     def _run_rag(
-        self, user_message: str, query: str | None = None, rewrite_call: ServiceCall | None = None,
-        task_memory: str = "",
+        self, user_message: str, queries: Sequence[str] | None = None,
+        rewrite_call: ServiceCall | None = None, task_memory: str = "",
     ) -> RagRecord | None:
         """Поиск выдержек на ход (день 22, §6.2; день 23, §6.3). `None` — RAG
         выключен или поиска у агента нет: поиска не было вовсе. Иначе запись.
@@ -4406,12 +4438,18 @@ class Agent:
         (выдача этапа 1, `rerank_ok=False` и причина), а пустая выдача после
         порога — штатный `ok=True` с пустыми `hits` (§6.4). `ok=False` — только
         сбой поиска и пустая выдача без второго этапа (в индексе нет кусков).
-        `message` и `tokens` дописывает `ask()` после сборки."""
+        `message` и `tokens` дописывает `ask()` после сборки. С дня 25 (§2.10)
+        `queries` — запросы переписывания: первый — основной, остальные уходят
+        в поиск как `alternatives` (один запрос — ровно день 23)."""
         if self._retriever is None or not self._rag_in_request:
             return None
-        query = user_message if query is None else query
+        queries = tuple(queries or (user_message,))
+        query = queries[0]
         rerank = self.rag_rerank
-        result = self._retriever.search(query, rerank=rerank)
+        if len(queries) > 1:
+            result = self._retriever.search(query, rerank=rerank, alternatives=queries[1:])
+        else:
+            result = self._retriever.search(query, rerank=rerank)
         hits = tuple(result.get("hits") or ())
         rerank_ok = bool(result.get("rerank_ok"))
         searched = bool(result.get("ok"))
@@ -4430,6 +4468,7 @@ class Agent:
             hits=hits if ok else (),
             question=user_message,
             query=query,
+            queries=queries if rewrite_call is not None else (),
             rewrite=rewrite_call is not None,
             rewrite_ok=bool(rewrite_call is not None and rewrite_call.ok),
             rewrite_error=(rewrite_call.error or "") if rewrite_call is not None else "",
@@ -5976,6 +6015,21 @@ def _parse_rewrite(text: str) -> str:
             if len(line) > 1 and line.startswith(opening) and line.endswith(closing):
                 line, changed = line[1:-1].strip(), True
     return " ".join(line.split())
+
+
+def _parse_rewrite_queries(text: str) -> tuple[str, ...]:
+    """Запросы поиска из ответа переписывания (день 25, §2.10): до
+    `REWRITE_MAX_QUERIES` разных непустых строк, каждая разобрана
+    `_parse_rewrite()`. Одна строка — один запрос, как на днях 23-25; `()` —
+    ответа нет (сбой)."""
+    queries: list[str] = []
+    for line in text.splitlines():
+        query = _parse_rewrite(line)
+        if query and query not in queries:
+            queries.append(query)
+        if len(queries) == REWRITE_MAX_QUERIES:
+            break
+    return tuple(queries)
 
 
 def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:

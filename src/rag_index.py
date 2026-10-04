@@ -338,7 +338,13 @@ def build(db: Path, sources: Path, dump: Path | None) -> int:
         path = sources / source.path
         shas[source.key] = file_sha256(path)
         lines, pages = extract(path)
-        clean_doc = rag_chunks.clean(source, lines, pages)
+        try:
+            clean_doc = rag_chunks.clean(source, lines, pages)
+        except ValueError as exc:
+            # Правило очистки разошлось с документом (с дня 25 — якорь
+            # заголовка-картинки или заголовок для нового имени не найден).
+            logger.error("%s — сборка отменена, %s не изменён", exc, shown(db))
+            return 2
         cleans.append(clean_doc)
         logger.info(
             "%s: %d стр. · %s → %s симв. · абзацев %d · выброшено: %s · %.2f с",
