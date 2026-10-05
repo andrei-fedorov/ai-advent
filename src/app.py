@@ -147,6 +147,16 @@
 # вопросы дней 22 и 24 — в аккордеоне прошлых дней. Переключатель памяти задачи
 # один — «рабочая» в «Слоях памяти в запросе».
 #
+# День 26 (спецификация дня 26, §6) — локальная модель: пресет «Локальный» из
+# `presets.py` (тот же агент, другой адрес, без ключа) появляется в списке
+# пресетов сам. Блок «Локальная модель (день 26)» развёрнут наверху панели — как
+# блоки MCP дней 16-20, он вне `_view()` (свои выходы `LOCAL_OUTPUTS`, обработчик
+# без `agent_state`; `_view()` остаётся на 43 значениях): кнопка «Проверить
+# сервер» спрашивает у `local_server.check()`, какая модель загружена. В
+# «Последнем вызове» строка «Модель» показывает фактическую модель из ответа API.
+# Блок дня 25 свёрнут; у поля ввода — Л1 и К5, сценарии А и Б — в аккордеоне
+# прошлых дней.
+#
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
 # словами, текст памяти и числа. День 10 добавил в переключатель ещё две
@@ -211,6 +221,7 @@ from invariants import (
     parse_invariants,
     validate,
 )
+import local_server
 from mcp_client import (
     AUTOSTART_ANSWERS,
     AUTOSTART_NOT_STARTED,
@@ -258,6 +269,9 @@ from presets import (
     INVARIANT_MAX_ITEMS,
     INVARIANT_SCENARIO,
     INVARIANT_TEXT_WORDS,
+    LOCAL_BASE_URL,
+    LOCAL_CHECK_TIMEOUT_S,
+    LOCAL_QUESTIONS,
     MCP_TIMEOUT_S,
     MEMORY_CONTROL_QUESTIONS,
     MEMORY_MAP,
@@ -698,7 +712,7 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
         f"- **💲 Стоимость{' (сумма по раундам)' if several else ''}:** "
         f"{_fmt_cost(last_call['cost_usd'])}",
         f"- **finish_reason:** `{last_call['finish_reason']}`",
-        f"- **Модель:** `{last_call['model']}`",
+        _model_line(last_call),
     ]
     if rounds:
         lines.append(_rounds_line(last_call))
@@ -713,6 +727,19 @@ def _metrics_md(last_call: dict | None, invariants_state: dict | None = None) ->
     lines += _task_tracker_lines(last_call)
     lines += _sampling_lines(last_call)
     return "\n".join(lines)
+
+
+def _model_line(last_call: dict) -> str:
+    """Строка «Модель» последнего вызова. С дня 26 (§3.3, §6.2): если сервер
+    назвал в ответе другую модель, чем в конфиге (локальный сервер: в запросе
+    заглушка `local`, отвечает загруженная модель), показываются обе — «`local`
+    → ответила `qwen3.5-2b-mlx`». Цена и окно считаются по модели конфига — у
+    заглушки их нет, поэтому «н/д»."""
+    model = last_call["model"]
+    answered = last_call.get("answered_model")
+    if answered and answered != model:
+        return f"- **Модель:** `{model}` → ответила `{answered}`"
+    return f"- **Модель:** `{model}`"
 
 
 def _rewrite_call_lines(last_call: dict) -> list[str]:
@@ -5570,6 +5597,86 @@ def on_watch_digest(days):
     return _watch_digest_status(call), f"```text\n{call.text}\n```"
 
 
+# --- Локальная модель: проверка сервера по кнопке (день 26, §6.2) -----------
+# Какая модель сейчас загружена в LM Studio — спрашивает у сервера
+# `local_server.check()`; приложение id модели не хранит. Вне `_view()`, как
+# блоки MCP дней 16-20: свои выходы `LOCAL_OUTPUTS`, обработчик без
+# `agent_state` — агента не трогает.
+
+LOCAL_TABLE_COLUMNS = [
+    "id", "тип", "состояние", "формат", "квантование", "контекст: загруженный / максимальный",
+]
+LOCAL_STATUS_INITIAL = (
+    "Ещё не проверяли. Кнопка спрашивает у сервера, какие модели у него есть и какая загружена."
+)
+
+
+def _local_model_text(model: local_server.ModelInfo) -> str:
+    """«`qwen3.5-2b-mlx` (MLX, 4bit, qwen3_5)» — формат, квантование, архитектура."""
+    details = [part for part in (model.format.upper(), model.quantization, model.arch) if part]
+    return f"`{model.id}`" + (f" ({', '.join(details)})" if details else "")
+
+
+def _local_context_text(model: local_server.ModelInfo) -> str:
+    if model.loaded_context and model.max_context:
+        return f"контекст {_fmt_int(model.loaded_context)} из {_fmt_int(model.max_context)}"
+    if model.max_context:
+        return f"контекст до {_fmt_int(model.max_context)}"
+    return ""
+
+
+def _local_status_md(check: local_server.ServerCheck, at: str) -> str:
+    """Строка статуса и активная модель (§6.2): пять состояний."""
+    if not check.ok:
+        hint = " — `lms server start`" if check.error.startswith("сервер не отвечает") else ""
+        return f"⛔ **{_md_cell(check.error)}**{hint} · {at}"
+    head = f"сервер отвечает · {check.elapsed:.2f} с"
+    if not check.extended:
+        return f"⚠️ {head} · сервер не сообщает, какая модель загружена · {at}"
+    loaded = check.loaded
+    if not loaded:
+        return f"⚠️ {head}, но модель не загружена — `lms load <id>` · {at}"
+    if len(loaded) > 1:
+        names = ", ".join(f"`{model.id}`" for model in loaded)
+        return (
+            f"⚠️ {head} · загружено несколько моделей: {names} — что LM Studio берёт для запроса без "
+            f"id, не проверялось: держите загруженной одну LLM · {at}"
+        )
+    model = loaded[0]
+    context = _local_context_text(model)
+    return f"✅ {head} · загружена {_local_model_text(model)}" + (f" · {context}" if context else "") + f" · {at}"
+
+
+def _local_models_table(check: local_server.ServerCheck | None) -> pd.DataFrame:
+    """Модели сервера; загруженные выделены."""
+    rows = []
+    for model in (check.models if check is not None and check.ok else ()):
+        loaded = model in (check.loaded if check is not None else ())
+        rows.append([
+            f"**{model.id}** ✅" if loaded else model.id,
+            model.type or "—",
+            model.state or "не сообщается",
+            model.format or "—",
+            model.quantization or "—",
+            f"{_fmt_int(model.loaded_context) if model.loaded_context else '—'} / "
+            f"{_fmt_int(model.max_context) if model.max_context else '—'}",
+        ])
+    return pd.DataFrame(rows, columns=LOCAL_TABLE_COLUMNS)
+
+
+def on_local_check():
+    """Кнопка «🔌 Проверить сервер» (день 26, §6.2). Без `agent_state`: агента не
+    трогает. Сбой — не исключение, а `ServerCheck` с причиной; при сбое таблица
+    очищается, чтобы старый список не выглядел результатом этого нажатия."""
+    at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    check = local_server.check(LOCAL_BASE_URL, LOCAL_CHECK_TIMEOUT_S)
+    status = _local_status_md(check, at)
+    (logger.info if check.ok else logger.warning)(
+        "локальный сервер: %s", status.replace("**", "").replace("`", "")
+    )
+    return status, _local_models_table(check)
+
+
 # --- Старт процесса ------------------------------------------------------
 # Восстановление агентов происходит здесь, при импорте модуля, — один раз на
 # процесс и до `demo.launch()`. Кнопки «восстановить» в интерфейсе нет и не
@@ -5837,16 +5944,17 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 25, неделя 5 — **мини-чат с RAG и памятью задачи**: история "
-        "диалога, поиск по правилам на каждый вопрос, ответ с источниками. "
-        "**Память задачи** — цель, что игрок уже уточнил, ограничения и "
-        "термины; её видит переписывание запроса (слова игрока и имена героев "
-        "заменяются словами правил, продолжение разговора дополняется) и "
-        "ответ: после утверждения по памяти модель ставит ключ `[тиран]`, а "
-        "**код** проверяет, что такая запись была в запросе, и пишет её в "
-        "«Источники:» рядом с выдержками. Для длинного разговора — «Скользящее "
-        "окно»: цель несёт память. Два сценария — у поля ввода, программа "
-        "`./run.sh rag-dialog`; не теряет ли ассистент цель, решает человек."
+        "День 26, неделя 6 — **локальная модель**: тот же ассистент, только "
+        "ответ даёт модель, загруженная в LM Studio на этой машине, а не "
+        "облачный DeepSeek. Выберите пресет **«Локальный»**: ключ не нужен, "
+        "цена и окно контекста — «н/д». Какую модель загрузить, решаете вы в "
+        "LM Studio; приложение знает только адрес сервера, а кнопка «Проверить "
+        "сервер» (в блоке дня 26 справа) показывает, какая модель загружена. "
+        "У поля ввода — Л1 и К5: **Л2** — флажок RAG выключен, **Л3** — "
+        "включён. Поиск и реранкер локальные с дня 21, поэтому весь путь "
+        "«вопрос → правила → ответ» может идти без интернета; программа "
+        "`./run.sh local` задаёт те же три запроса. Верно ли ответила "
+        "маленькая модель, решает человек."
     )
 
     # Экземпляр агента живёт в состоянии сессии: у каждой открытой вкладки
@@ -6031,21 +6139,23 @@ with gr.Blocks(title="TooManyRules") as demo:
                 placeholder="Например: из каких фаз состоит ход игрока?",
                 lines=2,
             )
-            # Сценарии дня 25 (§6.4) — у поля ввода, в кадре: клик кладёт текст в
-            # поле, отправляет человек, по порядку одним агентом. Контрольные
-            # вопросы дня 22 и вопросы проверки ответа дня 24 ушли в аккордеон
-            # прошлых дней.
-            for scenario in RAG_DIALOG_SCENARIOS:
-                gr.Examples(
-                    examples=[[step["message"]] for step in scenario["steps"]],
-                    inputs=[question_input],
-                    example_labels=_DIALOG_LABELS[scenario["id"]],
-                    examples_per_page=len(scenario["steps"]),
-                    label=(
-                        f"Сценарий {scenario['id']} (день 25) — {scenario['title']}: по порядку одним агентом "
-                        "на «Скользящем окне»; инструменты MCP выключите"
-                    ),
-                )
+            # Примеры дня 26 (§6.3) — у поля ввода, в кадре: Л1 и К5 (одна
+            # строка на Л2 и Л3: Л2 — флажок RAG выключен, Л3 — включён). Клик
+            # кладёт текст в поле, отправляет человек. Сценарии дня 25 ушли в
+            # аккордеон прошлых дней.
+            gr.Examples(
+                examples=[[LOCAL_QUESTIONS[0]["question"]], [LOCAL_QUESTIONS[1]["question"]]],
+                inputs=[question_input],
+                example_labels=[
+                    "Л1 · простой: что ты умеешь",
+                    "К5 · Л2 — RAG выключен, Л3 — RAG включён",
+                ],
+                examples_per_page=2,
+                label=(
+                    "Запросы дня 26 — пресет «Локальный», новый агент на вопрос; "
+                    "инструменты MCP выключите"
+                ),
+            )
             with gr.Row():
                 send_btn = gr.Button("Отправить", size="sm", variant="primary", scale=2)
                 reset_btn = gr.Button("Сбросить диалог", size="sm", scale=1)
@@ -6254,10 +6364,24 @@ with gr.Blocks(title="TooManyRules") as demo:
                 )
 
             # Свёрнуто: сценарии прошлых дней. У дня 16 сценария в чате не
-            # было; у поля ввода — сценарии текущего дня (правило «на экране —
-            # текущий день»), контрольные вопросы дня 22 и вопросы проверки
-            # ответа дня 24 — здесь.
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-20, 22-24)", open=False):
+            # было; у поля ввода — примеры текущего дня (правило «на экране —
+            # текущий день»), сценарии дня 25, контрольные вопросы дня 22 и
+            # вопросы проверки ответа дня 24 — здесь.
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-20, 22-25)", open=False):
+                # Сценарии дня 25 (§6.3) — с дня 26 здесь: у поля ввода стоят
+                # примеры дня 26. Каждый сценарий — по порядку одним агентом на
+                # «Скользящем окне».
+                for scenario in RAG_DIALOG_SCENARIOS:
+                    gr.Examples(
+                        examples=[[step["message"]] for step in scenario["steps"]],
+                        inputs=[question_input],
+                        example_labels=_DIALOG_LABELS[scenario["id"]],
+                        examples_per_page=len(scenario["steps"]),
+                        label=(
+                            f"Сценарий {scenario['id']} (день 25) — {scenario['title']}: по порядку одним агентом "
+                            "на «Скользящем окне»; инструменты MCP выключите"
+                        ),
+                    )
                 # Контрольные вопросы дня 22 и вопросы проверки ответа дня 24 —
                 # с дня 25 здесь (день 25, §6.4): у поля ввода стоят сценарии.
                 gr.Examples(
@@ -6450,13 +6574,55 @@ with gr.Blocks(title="TooManyRules") as demo:
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # Мини-чат: RAG + память задачи (день 25, §6.2) — развёрнут наверху
-            # панели. Описание — статичный Markdown; «Память задачи» — новое
+            # Локальная модель (день 26, §6.2) — развёрнут наверху панели. Не
+            # входит в `_view()` (третье исключение после блоков MCP дней
+            # 16-20): свои выходы `LOCAL_OUTPUTS`, обработчик без
+            # `agent_state`. Описание статично; «Последний вызов» с ответившей
+            # моделью — общий блок, его строка «Модель» с дня 26 показывает
+            # фактическую модель.
+            with gr.Accordion("Локальная модель (день 26)", open=True):
+                gr.Markdown(
+                    f"**Модель работает на этой машине**, в LM Studio; сервер "
+                    f"OpenAI-совместимый, адрес — `{LOCAL_BASE_URL}` "
+                    "(заменяется `TOOMANYRULES_LOCAL_URL` в `src/.env`). "
+                    "**Какая модель отвечает, решаете вы в LM Studio:** "
+                    "приложение не хранит её id, в запрос уходит заглушка "
+                    "`local`, а сервер отвечает загруженной моделью и называет "
+                    "её в ответе — она видна в «Последнем вызове» и в логе. "
+                    "Загруженной держите одну LLM.\n\n"
+                    "Подготовка (делает человек; пример — Qwen3.5-2B, MLX, 4 бита):\n"
+                    "```bash\n"
+                    "lms get https://huggingface.co/lmstudio-community/Qwen3.5-2B-MLX-4bit\n"
+                    "lms load qwen3.5-2b-mlx\n"
+                    "lms server start\n"
+                    "```\n"
+                    "Другая модель — `lms unload --all`, `lms load <id>` или окно "
+                    "LM Studio; приложение перезапускать не нужно.\n\n"
+                    "Выберите пресет **«Локальный»**; флажок RAG выключен — **Л2** "
+                    "(вопрос из общих знаний), включён — **Л3** (поиск, реранкер, "
+                    "ответ с цитатами). Цена и бюджет контекста — «н/д»: модели "
+                    "`local` нет в таблицах цен и окон, ноль в таблице цен сказал "
+                    "бы «бесплатно», а платим электричеством и временем; окно "
+                    "загруженной модели показывает кнопка. **Верно ли отвечает "
+                    "маленькая модель, решает человек.**"
+                )
+                local_check_btn = gr.Button("🔌 Проверить сервер", variant="primary")
+                local_status_md = gr.Markdown(LOCAL_STATUS_INITIAL)
+                local_models_table = gr.Dataframe(
+                    value=_local_models_table(None),
+                    label="Модели сервера (загруженные выделены)",
+                    datatype=["markdown", "str", "str", "str", "str", "str"],
+                    column_widths=["26%", "10%", "14%", "10%", "14%", "26%"],
+                    max_height=240,
+                    wrap=True,
+                )
+            # Мини-чат: RAG + память задачи (день 25, §6.2) — с дня 26 свёрнут
+            # под блоком дня 26 (§6.3); его компоненты и выходы `_view()` те же. Описание — статичный Markdown; «Память задачи» — новое
             # 43-е значение `_view()`; «Проверка ответа», «RAG последнего
             # хода» и последнее сообщение запроса целиком переехали сюда из
             # блока дня 24 (правило дней 19-24: блок хода живёт в блоке
             # текущего дня) — те же компоненты и выходы `_view()` (39-40, 42).
-            with gr.Accordion("Мини-чат: RAG + память задачи (день 25)", open=True):
+            with gr.Accordion("Мини-чат: RAG + память задачи (день 25)", open=False):
                 gr.Markdown(
                     "**Память задачи** — рабочий слой памяти дня 11 по трём "
                     "пунктам задания: *цель*, *что уже уточнено*, *ограничения "
@@ -6987,6 +7153,10 @@ with gr.Blocks(title="TooManyRules") as demo:
     # без входов, агента не трогает; остальные обработчики блок не трогают.
     MCP_OUTPUTS = [mcp_status_md, mcp_tools_table, mcp_pages_json]
     mcp_list_btn.click(on_mcp_list, inputs=None, outputs=MCP_OUTPUTS)
+    # Проверка локального сервера по кнопке (день 26, §6.2) — тем же правилом:
+    # вне `_view()`, без `agent_state`; `_view()` остаётся на 43 значениях.
+    LOCAL_OUTPUTS = [local_status_md, local_models_table]
+    local_check_btn.click(on_local_check, inputs=None, outputs=LOCAL_OUTPUTS)
     # Каталог группы по кнопке (день 20, §8.2) — тем же правилом: вне
     # `_view()`, свои выходы, обработчик без `agent_state`.
     GROUP_MCP_OUTPUTS = [group_status_md, group_tools_table]

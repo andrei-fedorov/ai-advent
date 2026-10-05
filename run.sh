@@ -30,6 +30,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")/src"
 #                               реранкер в кэше): --scenarios А,Б, --modes память,без,
 #                               --strategy <имя>, --preset <имя>, --db <путь>,
 #                               --out <файл.md>
+#   ./run.sh local [...]      — три запроса к локальной модели (день 26): Л1 —
+#                               простой, Л2 — вопрос К5 из общих знаний, Л3 — он же
+#                               с полным RAG; отвечает модель, загруженная в LM
+#                               Studio (lms load <id>, lms server start), ключ не
+#                               нужен; отчёт Markdown в src/data/local/ (для Л3 —
+#                               индекс и реранкер в кэше): --only Л1,Л3, --url
+#                               <адрес>, --db <путь>, --out <файл.md>
 APP="app.py"
 case "${1:-}" in
     "")        APP="app.py" ;;
@@ -38,8 +45,9 @@ case "${1:-}" in
     index)     APP="rag_index.py" ;;
     rag-eval)  APP="rag_eval.py" ;;
     rag-dialog) APP="rag_dialog.py" ;;
+    local)     APP="local_llm.py" ;;
     *)
-        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера], ./run.sh index [аргументы индекса], ./run.sh rag-eval [аргументы прогона] или ./run.sh rag-dialog [аргументы прогона]" >&2
+        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера], ./run.sh index [аргументы индекса], ./run.sh rag-eval [аргументы прогона], ./run.sh rag-dialog [аргументы прогона] или ./run.sh local [аргументы прогона]" >&2
         exit 1
         ;;
 esac
@@ -64,6 +72,12 @@ if [ "$APP" = "rag_index.py" ]; then
     # Индексу ключ DeepSeek не нужен: LLM он не вызывает, эмбеддинги считает
     # локальная модель. Поэтому src/.env здесь не проверяется.
     exec python rag_index.py "${@:2}"
+fi
+
+if [ "$APP" = "local_llm.py" ]; then
+    # Локальной модели ключ не нужен (api_key_env=None): LLM отвечает LM Studio
+    # на этой машине. Поэтому src/.env здесь не проверяется, как у index.
+    exec python local_llm.py "${@:2}"
 fi
 
 if [ ! -f ".env" ]; then

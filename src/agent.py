@@ -173,6 +173,17 @@ _NO_API_KEY_ERROR = (
     "и перезапустите приложение."
 )
 
+# Заглушка ключа для сервера, которому ключ не нужен (день 26, §3.1).
+_NO_KEY_PLACEHOLDER = "not-needed"
+
+
+def _no_key_error(env_name: str) -> str:
+    return (
+        f"Не задан {env_name}. Положите значение в файл src/.env строкой "
+        f"{env_name}=... и перезапустите приложение."
+    )
+
+
 # Признаки переполнения контекста в тексте ошибки API (день 8). Ищутся без
 # учёта регистра; у DeepSeek это ошибка с кодом 400 и текстом вида «This
 # model's maximum context length is 1048576 tokens. However, you requested
@@ -283,7 +294,11 @@ class AgentConfig:
     max_tokens: int | None = None
     stop: list[str] | None = None
     keep_history: bool = True          # ведёт ли агент стек сообщений между вызовами
-    base_url: str = DEEPSEEK_BASE_URL  # задел на неделю 6 (локальная модель)
+    base_url: str = DEEPSEEK_BASE_URL  # с дня 26 — и адрес локального сервера
+    # Имя переменной окружения с ключом (день 26, §3.1). `None` — ключ не
+    # нужен (локальный сервер): клиенту уходит заглушка, ключ DeepSeek на чужой
+    # адрес не отправляется.
+    api_key_env: str | None = "DEEPSEEK_API_KEY"
     # Температура служебных работ (день 25, §2.10): `None` — не передаётся,
     # как на днях 9-24. Служебные вызовы всегда без thinking, поэтому
     # проверка ниже её не касается.
@@ -584,6 +599,11 @@ class AgentReply:
     # Поле дня 23 — в конце (§6.3): переписывание запроса этого хода; `None` —
     # не вызывалось (RAG или пункт «переписать» выключен, нет промпта).
     rewrite_call: ServiceCall | None = None
+    # Поле дня 26 — в конце (§3.3): `model` из ответа API последнего раунда
+    # основного запроса, как есть. `None` — ответа не было (сбой) или сервер
+    # поле не прислал. `model` остаётся моделью конфига: по ней считаются цена
+    # и окно. Служебные вызовы фактическую модель не записывают.
+    answered_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1424,9 +1444,10 @@ class Agent:
             )
         else:
             logger.info(
-                "[%s] агент создан: model=%s thinking=%s стратегия=«%s» "
+                "[%s] агент создан: model=%s%s thinking=%s стратегия=«%s» "
                 "восстановлено из хранилища=%d сообщ.%s%s%s%s%s%s, живых агентов: %d",
-                self._log_name, config.model, _thinking_label(config.thinking),
+                self._log_name, config.model, _api_note(config.base_url),
+                _thinking_label(config.thinking),
                 self._strategy_name, self._restored_messages,
                 _memory_note(self.strategy.describe(self._messages)),
                 self._layers_note(), self._profile_note(), self._task_note(),
@@ -1795,6 +1816,7 @@ class Agent:
         cache_miss: list[int | None] = []
         model_elapsed = 0.0
         response = None
+        answered_model: str | None = None
         while True:
             number = len(rounds) + 1
             params: dict = {}
@@ -1828,7 +1850,7 @@ class Agent:
                 # вызовы инструментов едут в ответ — в панели видно, на чём
                 # оборвалось; их счётчики уже учтены (`_record_round`).
                 return self._failed_reply(
-                    _explain_api_error(exc, budget),
+                    _explain_api_error(exc, budget, self._config.base_url),
                     elapsed=model_elapsed,
                     request=request,
                     service=service,
@@ -1859,6 +1881,7 @@ class Agent:
             choice = response.choices[0]
             message = choice.message
             usage = response.usage
+            answered_model = getattr(response, "model", None) or None
             prompt_tokens = getattr(usage, "prompt_tokens", None)
             completion_tokens = getattr(usage, "completion_tokens", None)
             requested = list(message.tool_calls or [])
@@ -1988,6 +2011,7 @@ class Agent:
                         # первый — иначе оценка первой попытки сравнивалась бы с
                         # `completion_tokens` повтора (правка по ревью).
                         choice = retry.choices[0]
+                        answered_model = getattr(retry, "model", None) or answered_model
                         model_text = retry_text
                         if not retry_text.strip():
                             repair_note = "не удался: повтор вернул пустой ответ — остаётся первый"
@@ -2105,6 +2129,7 @@ class Agent:
             sampling_calls=tuple(sampling_calls),
             rag=rag,
             rewrite_call=rewrite_call,
+            answered_model=answered_model,
         )
 
         if self._config.keep_history:
@@ -2120,12 +2145,16 @@ class Agent:
             task_call, guard_call, rewrite_call,
         )
         logger.info(
-            "[%s] model=%s thinking=%s finish_reason=%s time=%.2fs "
+            "[%s] model=%s%s thinking=%s finish_reason=%s time=%.2fs "
             "tokens(prompt/completion/total)=%s/%s/%s "
             "оценка/факт prompt=%s/%s (%s) ответ=%s/%s (%s) cost=%s "
             "раундов=%d вызовов=%d инструменты %.2f с "
             "стек=%d сообщ., %d символов: %s",
             self._log_name, self._config.model,
+            (
+                f" → {answered_model}"
+                if answered_model and answered_model != self._config.model else ""
+            ),
             _thinking_label(self._config.thinking),
             reply.finish_reason, reply.elapsed,
             prompt_tokens, completion_tokens, total_tokens,
@@ -4915,9 +4944,18 @@ class Agent:
         при отсутствующем ключе бросает RuntimeError с понятным текстом,
         который `ask()` превращает в `AgentReply(ok=False)`."""
         if self._client is None:
-            api_key = os.getenv("DEEPSEEK_API_KEY")
-            if not api_key:
-                raise RuntimeError(_NO_API_KEY_ERROR)
+            env_name = self._config.api_key_env
+            if env_name is None:
+                # SDK `openai` требует непустой ключ; локальный сервер его не
+                # проверяет (день 26, §3.1).
+                api_key = _NO_KEY_PLACEHOLDER
+            else:
+                api_key = os.getenv(env_name)
+                if not api_key:
+                    raise RuntimeError(
+                        _NO_API_KEY_ERROR if env_name == "DEEPSEEK_API_KEY"
+                        else _no_key_error(env_name)
+                    )
             self._client = OpenAI(api_key=api_key, base_url=self._config.base_url)
         return self._client
 
@@ -6032,8 +6070,14 @@ def _parse_rewrite_queries(text: str) -> tuple[str, ...]:
     return tuple(queries)
 
 
-def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:
+def _explain_api_error(
+    exc: Exception, budget: tokens.ContextUsage, base_url: str = DEEPSEEK_BASE_URL
+) -> str:
     """Текст ошибки API для `AgentReply.error`.
+
+    С дня 26 (§3.2) подпись «DeepSeek API» остаётся только за адресом DeepSeek,
+    у любого другого — «API <адрес>»; агент не знает, что за сервер стоит по
+    адресу, и подсказок «запустите …» не даёт.
 
     Переполнение контекста узнаётся по признакам из `CONTEXT_OVERFLOW_MARKERS`
     и объясняется по-человечески: с API это не «модель забудет начало
@@ -6043,7 +6087,8 @@ def _explain_api_error(exc: Exception, budget: tokens.ContextUsage) -> str:
     text = str(exc)
     lowered = text.lower()
     if not any(marker in lowered for marker in CONTEXT_OVERFLOW_MARKERS):
-        return f"Ошибка при обращении к DeepSeek API: {text}"
+        label = "DeepSeek API" if base_url == DEEPSEEK_BASE_URL else f"API {base_url}"
+        return f"Ошибка при обращении к {label}: {text}"
     # Что делать дальше, зависит от того, что переполнило окно. Сжатие и сброс
     # укорачивают историю, но не сам вопрос: заполнитель на 1.2 млн токенов
     # не влезет ни в какой запрос, и обещать обратное было бы неправдой.
@@ -6096,6 +6141,12 @@ def _saved_str(saved: int, full_total: int) -> str:
         return "н/д"
     sign = "−" if saved >= 0 else "+"
     return f"{sign}{abs(saved) / full_total * 100:.0f}%"
+
+
+def _api_note(base_url: str) -> str:
+    """` api=<адрес>` в строке «агент создан» — только для адреса не DeepSeek
+    (день 26, §3.4): по логу видно, что ход уйдёт на другой сервер."""
+    return "" if base_url == DEEPSEEK_BASE_URL else f" api={base_url}"
 
 
 def _thinking_label(thinking: bool) -> str:
