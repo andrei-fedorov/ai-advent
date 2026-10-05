@@ -16,7 +16,9 @@
 #   OpenAI-совместимый сервер) — не сбой: состояние моделей неизвестно.
 #
 # Исключений наружу не бросает, логов у модуля нет — логируют вызывающие (как
-# `rag_answer.py`).
+# `rag_answer.py`). Состояние сервера (`ServerCheck.status`) и подписи модели
+# определены здесь один раз: блок дня и программа решают по ним, а не по тексту
+# ошибки и не своими копиями (правка по ревью).
 
 import time
 from dataclasses import dataclass
@@ -27,6 +29,15 @@ import httpx
 # Тип записи REST LM Studio, который не считается языковой моделью.
 _EMBEDDINGS = "embeddings"
 _LOADED = "loaded"
+
+# Состояние сервера (`ServerCheck.status`): по нему блок дня выбирает строку
+# статуса, а программа — отказ или предупреждение.
+STATUS_NO_ANSWER = "не отвечает"         # отказ соединения или таймаут
+STATUS_FAILED = "сбой"                   # ответил, но не как OpenAI-совместимый сервер
+STATUS_UNKNOWN = "состояние неизвестно"  # нет REST LM Studio: какая загружена, неизвестно
+STATUS_NOT_LOADED = "модель не загружена"
+STATUS_SEVERAL = "загружено несколько"
+STATUS_LOADED = "загружена"
 
 
 @dataclass(frozen=True)
@@ -42,6 +53,21 @@ class ModelInfo:
     max_context: int | None = None
     loaded_context: int | None = None
 
+    @property
+    def label(self) -> str:
+        """«`qwen3.5-2b-mlx` (MLX, 4bit, qwen3_5)» — формат, квантование, архитектура."""
+        parts = [part for part in (self.format.upper(), self.quantization, self.arch) if part]
+        return f"`{self.id}`" + (f" ({', '.join(parts)})" if parts else "")
+
+    @property
+    def context_text(self) -> str:
+        """«контекст 132 096 из 262 144»; сервер не назвал — пусто."""
+        if self.loaded_context and self.max_context:
+            return f"контекст {_int_text(self.loaded_context)} из {_int_text(self.max_context)}"
+        if self.max_context:
+            return f"контекст до {_int_text(self.max_context)}"
+        return ""
+
 
 @dataclass(frozen=True)
 class ServerCheck:
@@ -53,6 +79,15 @@ class ServerCheck:
     error: str = ""
     models: tuple[ModelInfo, ...] = ()
     extended: bool = False
+    # Сбой — отказ соединения или таймаут: сервер не запущен, помочь может
+    # `lms server start`. Остальные сбои (ответ не тот, обрыв посреди ответа) —
+    # на порту что-то отвечает, и подсказка не поможет.
+    no_answer: bool = False
+
+    @property
+    def llms(self) -> tuple[ModelInfo, ...]:
+        """Языковые модели сервера — все, кроме эмбеддингов."""
+        return tuple(model for model in self.models if model.type != _EMBEDDINGS)
 
     @property
     def loaded(self) -> tuple[ModelInfo, ...]:
@@ -60,16 +95,29 @@ class ServerCheck:
         пусто."""
         if not self.extended:
             return ()
-        return tuple(
-            model for model in self.models
-            if model.state == _LOADED and model.type != _EMBEDDINGS
-        )
+        return tuple(model for model in self.llms if model.state == _LOADED)
+
+    @property
+    def status(self) -> str:
+        """Состояние сервера — одна из констант `STATUS_*`."""
+        if not self.ok:
+            return STATUS_NO_ANSWER if self.no_answer else STATUS_FAILED
+        if not self.extended:
+            return STATUS_UNKNOWN
+        count = len(self.loaded)
+        if count == 0:
+            return STATUS_NOT_LOADED
+        return STATUS_SEVERAL if count > 1 else STATUS_LOADED
 
 
 def origin(base_url: str) -> str:
     """Адрес сервера без пути (`http://127.0.0.1:1234/v1` → `http://127.0.0.1:1234`)."""
     parts = urlsplit(base_url)
     return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
+def _int_text(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
 
 
 def _int(value: object) -> int | None:
@@ -80,12 +128,16 @@ def _text(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _has_data(payload: object) -> bool:
+    """Ответ вида `{"data": [...]}` — список моделей (может быть и пустым)."""
+    return isinstance(payload, dict) and isinstance(payload.get("data"), list)
+
+
 def _rows(payload: object) -> list[dict]:
     """Записи моделей из ответа `{"data": [...]}`; не то, что ждали, — `[]`."""
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, list):
+    if not _has_data(payload):
         return []
-    return [row for row in data if isinstance(row, dict) and isinstance(row.get("id"), str)]
+    return [row for row in payload["data"] if isinstance(row, dict) and isinstance(row.get("id"), str)]
 
 
 def _get_json(client: httpx.Client, url: str) -> object:
@@ -98,31 +150,39 @@ def check(base_url: str, timeout_s: float) -> ServerCheck:
     """Спросить сервер, какие модели у него есть и какая загружена.
 
     Без исключений: сбой — `ok=False` с причиной. Нет ответа на `/models` —
-    «сервер не отвечает по <адрес>» для ошибки соединения, текст ошибки для
-    остального. REST LM Studio, которого нет (404, не JSON, иной сбой), — не
-    сбой: `extended=False`, модели из первого ответа, `state` = `None`.
+    «сервер не отвечает по <адрес>» и `no_answer` для отказа соединения и
+    таймаута, текст ошибки для остального; ответ не JSON или JSON без списка
+    `data` — тоже сбой (на порту не OpenAI-совместимый сервер). REST LM Studio,
+    которого нет (404, не JSON, иной сбой), — не сбой: `extended=False`, модели
+    из первого ответа, `state` = `None`.
     """
     base = base_url.rstrip("/")
     started = time.perf_counter()
     try:
         with httpx.Client(timeout=timeout_s) as client:
             try:
-                basic = _rows(_get_json(client, f"{base}/models"))
-            except httpx.TransportError as exc:
-                # Таймаут и обрыв — тоже «не отвечает»: по смыслу для человека это
-                # одно и то же («сервер не запущен или не успел»).
-                reason = (
-                    f"сервер не отвечает по {base}"
-                    if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException))
-                    else f"{type(exc).__name__}: {exc}"
+                listing = _get_json(client, f"{base}/models")
+            except (httpx.ConnectError, httpx.TimeoutException):
+                # Отказ соединения и таймаут — «не отвечает»: по смыслу для
+                # человека это одно и то же («сервер не запущен или не успел»).
+                # Обрыв посреди ответа (ReadError, RemoteProtocolError) сюда не
+                # относится: на порту что-то отвечает — это текст ошибки ниже.
+                return ServerCheck(
+                    False, base, time.perf_counter() - started,
+                    f"сервер не отвечает по {base}", no_answer=True,
                 )
-                return ServerCheck(False, base, time.perf_counter() - started, reason)
             except (httpx.HTTPError, ValueError) as exc:
-                # HTTPStatusError или ответ не JSON.
+                # HTTPStatusError, иной транспортный сбой или ответ не JSON.
                 return ServerCheck(
                     False, base, time.perf_counter() - started,
                     f"{type(exc).__name__}: {exc}",
                 )
+            if not _has_data(listing):
+                return ServerCheck(
+                    False, base, time.perf_counter() - started,
+                    f"ответ {base}/models — не список моделей OpenAI API (нет списка data)",
+                )
+            basic = _rows(listing)
             models = tuple(
                 ModelInfo(
                     id=row["id"], type=_text(row.get("type")), state=None,
@@ -137,7 +197,7 @@ def check(base_url: str, timeout_s: float) -> ServerCheck:
                 payload = None
             # Ответ REST — словарь со списком `data` (он может быть и пустым:
             # моделей нет, но сервер LM Studio).
-            if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            if _has_data(payload):
                 rows = _rows(payload)
                 extended = True
                 models = tuple(

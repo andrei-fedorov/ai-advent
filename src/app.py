@@ -5611,47 +5611,34 @@ LOCAL_STATUS_INITIAL = (
 )
 
 
-def _local_model_text(model: local_server.ModelInfo) -> str:
-    """«`qwen3.5-2b-mlx` (MLX, 4bit, qwen3_5)» — формат, квантование, архитектура."""
-    details = [part for part in (model.format.upper(), model.quantization, model.arch) if part]
-    return f"`{model.id}`" + (f" ({', '.join(details)})" if details else "")
-
-
-def _local_context_text(model: local_server.ModelInfo) -> str:
-    if model.loaded_context and model.max_context:
-        return f"контекст {_fmt_int(model.loaded_context)} из {_fmt_int(model.max_context)}"
-    if model.max_context:
-        return f"контекст до {_fmt_int(model.max_context)}"
-    return ""
-
-
 def _local_status_md(check: local_server.ServerCheck, at: str) -> str:
-    """Строка статуса и активная модель (§6.2): пять состояний."""
-    if not check.ok:
-        hint = " — `lms server start`" if check.error.startswith("сервер не отвечает") else ""
+    """Строка статуса и активная модель (§6.2) — по `ServerCheck.status`; подписи
+    модели и контекста — из `local_server.py`, общие с программой дня."""
+    status = check.status
+    if status in (local_server.STATUS_NO_ANSWER, local_server.STATUS_FAILED):
+        hint = " — `lms server start`" if status == local_server.STATUS_NO_ANSWER else ""
         return f"⛔ **{_md_cell(check.error)}**{hint} · {at}"
     head = f"сервер отвечает · {check.elapsed:.2f} с"
-    if not check.extended:
+    if status == local_server.STATUS_UNKNOWN:
         return f"⚠️ {head} · сервер не сообщает, какая модель загружена · {at}"
-    loaded = check.loaded
-    if not loaded:
+    if status == local_server.STATUS_NOT_LOADED:
         return f"⚠️ {head}, но модель не загружена — `lms load <id>` · {at}"
-    if len(loaded) > 1:
-        names = ", ".join(f"`{model.id}`" for model in loaded)
+    if status == local_server.STATUS_SEVERAL:
+        names = ", ".join(f"`{model.id}`" for model in check.loaded)
         return (
             f"⚠️ {head} · загружено несколько моделей: {names} — что LM Studio берёт для запроса без "
             f"id, не проверялось: держите загруженной одну LLM · {at}"
         )
-    model = loaded[0]
-    context = _local_context_text(model)
-    return f"✅ {head} · загружена {_local_model_text(model)}" + (f" · {context}" if context else "") + f" · {at}"
+    model = check.loaded[0]
+    context = model.context_text
+    return f"✅ {head} · загружена {model.label}" + (f" · {context}" if context else "") + f" · {at}"
 
 
 def _local_models_table(check: local_server.ServerCheck | None) -> pd.DataFrame:
     """Модели сервера; загруженные выделены."""
     rows = []
     for model in (check.models if check is not None and check.ok else ()):
-        loaded = model in (check.loaded if check is not None else ())
+        loaded = model in check.loaded
         rows.append([
             f"**{model.id}** ✅" if loaded else model.id,
             model.type or "—",
@@ -6575,11 +6562,10 @@ with gr.Blocks(title="TooManyRules") as demo:
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
             # Локальная модель (день 26, §6.2) — развёрнут наверху панели. Не
-            # входит в `_view()` (третье исключение после блоков MCP дней
-            # 16-20): свои выходы `LOCAL_OUTPUTS`, обработчик без
-            # `agent_state`. Описание статично; «Последний вызов» с ответившей
-            # моделью — общий блок, его строка «Модель» с дня 26 показывает
-            # фактическую модель.
+            # входит в `_view()` (как блоки MCP дней 16-20): свои выходы
+            # `LOCAL_OUTPUTS`, обработчик без `agent_state`. Описание
+            # статично; «Последний вызов» с ответившей моделью — общий блок,
+            # его строка «Модель» с дня 26 показывает фактическую модель.
             with gr.Accordion("Локальная модель (день 26)", open=True):
                 gr.Markdown(
                     f"**Модель работает на этой машине**, в LM Studio; сервер "
@@ -6617,7 +6603,8 @@ with gr.Blocks(title="TooManyRules") as demo:
                     wrap=True,
                 )
             # Мини-чат: RAG + память задачи (день 25, §6.2) — с дня 26 свёрнут
-            # под блоком дня 26 (§6.3); его компоненты и выходы `_view()` те же. Описание — статичный Markdown; «Память задачи» — новое
+            # под блоком дня 26 (§6.3); его компоненты и выходы `_view()` те
+            # же. Описание — статичный Markdown; «Память задачи» — новое
             # 43-е значение `_view()`; «Проверка ответа», «RAG последнего
             # хода» и последнее сообщение запроса целиком переехали сюда из
             # блока дня 24 (правило дней 19-24: блок хода живёт в блоке

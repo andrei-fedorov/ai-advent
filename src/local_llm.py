@@ -81,19 +81,6 @@ def model_text(reply: agent.AgentReply) -> str:
     return f"`{reply.answered_model}`" if reply.answered_model else "н/д"
 
 
-def model_line(model: local_server.ModelInfo) -> str:
-    parts = [part for part in (model.format.upper(), model.quantization, model.arch) if part]
-    return f"`{model.id}`" + (f" ({', '.join(parts)})" if parts else "")
-
-
-def context_line(model: local_server.ModelInfo) -> str:
-    if model.loaded_context and model.max_context:
-        return f"контекст {num(model.loaded_context)} из {num(model.max_context)}"
-    if model.max_context:
-        return f"контекст до {num(model.max_context)}"
-    return ""
-
-
 # --- Лог ------------------------------------------------------------------------
 
 def log_answer(answer: Answer) -> None:
@@ -210,7 +197,8 @@ def build_report(
         f"- Сервер: `{config.base_url}` · пресет «{config.name}» · в запросе `model: {config.model}` "
         "(заглушка: какая модель ответит, решает LM Studio) · ключ не нужен",
         f"- Версия SDK `openai`: {openai.__version__} · температура {config.temperature} · "
-        f"температура служебных работ {config.service_temperature} · thinking в запросе выключен",
+        f"температура служебных работ {config.service_temperature} · потолок ответа "
+        f"{num(config.max_tokens) if config.max_tokens else 'нет'} · thinking в запросе выключен",
         "- Инструкции — общие с пресетами DeepSeek: системный промпт проекта, RAG-инструкции дней 22-25, промпты "
         "служебных работ; под локальную модель ничего не менялось",
         "- Агенты: голые — свежий агент на каждый вопрос, без хранилища, памяти, профиля, инвариантов, задачи и "
@@ -314,35 +302,37 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def check_server(base_url: str) -> local_server.ServerCheck:
     """Проверка сервера до вопросов (§5, п. 2): отказ — `sys.exit(2)`, остальное —
-    предупреждения."""
+    предупреждения. Состояние — `ServerCheck.status`, то же, что у блока дня."""
     check = local_server.check(base_url, presets.LOCAL_CHECK_TIMEOUT_S)
-    if not check.ok:
-        logger.error("%s — прогон отменён, модель не вызывалась. Запустите сервер: lms server start", check.error)
+    status = check.status
+    if status in (local_server.STATUS_NO_ANSWER, local_server.STATUS_FAILED):
+        # Подсказка — только серверу, который не запущен: чужому сервису на
+        # порту `lms server start` не поможет (правка по ревью).
+        hint = " Запустите сервер: lms server start" if status == local_server.STATUS_NO_ANSWER else ""
+        logger.error("%s — прогон отменён, модель не вызывалась.%s", check.error, hint)
         sys.exit(2)
-    llms = [model for model in check.models if model.type != "embeddings"]
-    if check.extended:
-        loaded = check.loaded
-        if not loaded:
-            ids = ", ".join(f"`{model.id}`" for model in llms) or "(сервер не назвал ни одной)"
-            logger.error(
-                "сервер отвечает, но модель не загружена — lms load <id>; модели сервера: %s — прогон отменён, "
-                "модель не вызывалась", ids,
-            )
-            sys.exit(2)
-        if len(loaded) > 1:
-            logger.warning(
-                "загружено несколько моделей (%s): что LM Studio берёт для запроса без id, не проверялось — "
-                "держите загруженной одну LLM", ", ".join(model.id for model in loaded),
-            )
-        else:
-            model = loaded[0]
-            logger.info(
-                "сервер отвечает за %.2f с · загружена %s%s", check.elapsed, model_line(model),
-                f" · {context_line(model)}" if context_line(model) else "",
-            )
-    else:
+    if status == local_server.STATUS_NOT_LOADED:
+        ids = ", ".join(f"`{model.id}`" for model in check.llms) or "(сервер не назвал ни одной)"
+        logger.error(
+            "сервер отвечает, но модель не загружена — lms load <id>; модели сервера: %s — прогон отменён, "
+            "модель не вызывалась", ids,
+        )
+        sys.exit(2)
+    if status == local_server.STATUS_SEVERAL:
+        logger.warning(
+            "загружено несколько моделей (%s): что LM Studio берёт для запроса без id, не проверялось — "
+            "держите загруженной одну LLM", ", ".join(model.id for model in check.loaded),
+        )
+    elif status == local_server.STATUS_UNKNOWN:
         logger.warning("сервер отвечает, но не сообщает, какая модель загружена — ответившая модель будет "
                        "взята из ответов API")
+    else:
+        model = check.loaded[0]
+        context = model.context_text
+        logger.info(
+            "сервер отвечает за %.2f с · загружена %s%s", check.elapsed, model.label,
+            f" · {context}" if context else "",
+        )
     return check
 
 
@@ -394,8 +384,8 @@ def main() -> None:
             info["lang"], info["chunks"], info["total"],
         )
     logger.info(
-        "пресет «%s» · %s · температура %s · вопросов: %d (%s)", config.name, config.base_url, config.temperature,
-        len(questions), ", ".join(q["id"] for q in questions),
+        "пресет «%s» · %s · температура %s · max_tokens %s · вопросов: %d (%s)", config.name, config.base_url,
+        config.temperature, config.max_tokens, len(questions), ", ".join(q["id"] for q in questions),
     )
 
     started = datetime.now()
