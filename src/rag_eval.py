@@ -764,10 +764,9 @@ def make_agent(
     config: agent.AgentConfig, name: str, index: rag_search.RulesIndex, mode: Mode,
 ) -> agent.Agent:
     bare = agent.Agent(
-        config, session_id=name, retriever=index, rag_instruction=presets.RAG_INSTRUCTION,
+        config, session_id=name, retriever=index,
         rag_rewrite_prompt=presets.RAG_REWRITE_PROMPT, rag_rewrite_max_tokens=presets.RAG_REWRITE_MAX_TOKENS,
-        rag_empty_instruction=presets.RAG_EMPTY_INSTRUCTION,
-        rag_answer_format=presets.RAG_ANSWER_FORMAT, rag_repair_instruction=presets.RAG_REPAIR_INSTRUCTION,
+        rag_answer_format=presets.RAG_ANSWER_FORMAT, **presets.rag_texts(config.name),
     )
     if not mode.rag:
         bare.set_rag_in_request(False)

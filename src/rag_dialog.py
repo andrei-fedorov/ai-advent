@@ -597,11 +597,9 @@ def make_agent(
     """Свежий агент на сценарий и режим (§5)."""
     fresh = agent.Agent(
         config, session_id=name, strategies=presets.make_strategies(), strategy=strategy,
-        memory=presets.make_memory(), retriever=index, rag_instruction=presets.RAG_INSTRUCTION,
+        memory=presets.make_memory(), retriever=index,
         rag_rewrite_prompt=presets.RAG_REWRITE_PROMPT, rag_rewrite_max_tokens=presets.RAG_REWRITE_MAX_TOKENS,
-        rag_empty_instruction=presets.RAG_EMPTY_INSTRUCTION,
-        rag_answer_format=presets.RAG_ANSWER_FORMAT, rag_repair_instruction=presets.RAG_REPAIR_INSTRUCTION,
-        rag_memory_instruction=presets.RAG_MEMORY_INSTRUCTION,
+        rag_answer_format=presets.RAG_ANSWER_FORMAT, **presets.rag_texts(config.name),
     )
     if not mode.memory:
         # Долговременной памяти у агента нет, поэтому снимается рабочий слой — и

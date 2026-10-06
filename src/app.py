@@ -157,6 +157,17 @@
 # Блок дня 25 свёрнут; у поля ввода — Л1 и К5, сценарии А и Б — в аккордеоне
 # прошлых дней.
 #
+# День 27 (спецификация дня 27, §6) — ассистент на локальной модели: агенты
+# получают тексты RAG по пресету (`presets.rag_texts()`: у «Локального»
+# короткие, без повтора формата и без инструкции памяти), а умолчания
+# переключателей запроса — `_apply_request_defaults()` (у «Локального» профиль,
+# инструменты и переписывание выключены) — у нового, восстановленного агента и
+# ветки. Блок «Ассистент на локальной модели (день 27)» развёрнут наверху
+# панели, в него переехали «Проверка ответа», «RAG последнего хода» и последнее
+# сообщение запроса целиком; блок дня 26 свёрнут; у поля ввода —
+# `LOCAL_APP_SCENARIO`, Л1 и К5 — в аккордеоне прошлых дней. `_view()` — 43
+# значения.
+#
 # Панель не знает, какие бывают стратегии и что такое сводка или факты: она
 # рисует то, что вернули `debug_state()` и `ContextView` — имя, описание
 # словами, текст памяти и числа. День 10 добавил в переключатель ещё две
@@ -269,6 +280,7 @@ from presets import (
     INVARIANT_MAX_ITEMS,
     INVARIANT_SCENARIO,
     INVARIANT_TEXT_WORDS,
+    LOCAL_APP_SCENARIO,
     LOCAL_BASE_URL,
     LOCAL_CHECK_TIMEOUT_S,
     LOCAL_QUESTIONS,
@@ -287,12 +299,8 @@ from presets import (
     RAG_CONTROL_QUESTIONS,
     RAG_DIALOG_SCENARIOS,
     RAG_EMBED_MODEL,
-    RAG_EMPTY_INSTRUCTION,
     RAG_FOLLOWUP_QUESTIONS,
     RAG_INDEX_DB,
-    RAG_INSTRUCTION,
-    RAG_MEMORY_INSTRUCTION,
-    RAG_REPAIR_INSTRUCTION,
     RAG_RERANK_BATCH,
     RAG_RERANK_MAX_LENGTH,
     RAG_RERANK_MODEL,
@@ -323,6 +331,9 @@ from presets import (
     make_router,
     make_strategies,
     make_task_machine,
+    rag_texts,
+    rag_texts_label,
+    request_defaults,
 )
 from storage import (
     JsonHistoryStore,
@@ -2848,6 +2859,8 @@ def _rag_md(state: dict) -> str:
     else:
         lines.append(f"- **Индекс:** ⚠️ {info['error']}")
     lines.append(_rag_mode_line(state, info))
+    # День 27 (§6.2): какие тексты RAG у агента — по пресету из `debug_state()`.
+    lines.append(f"- **Инструкции RAG:** {rag_texts_label(state['config']['name'])}")
     tools = state["tools"]
     if tools is not None and tools["in_request"]:
         lines.append(
@@ -3639,7 +3652,7 @@ def _new_agent(preset_name: str) -> Agent:
     успешного ответа не появляется: `create_session` только выдаёт номер.
     """
     session_id = STORE.create_session(preset_name)
-    return Agent(
+    agent = Agent(
         PRESETS[preset_name],
         session_id=session_id,
         store=STORE,
@@ -3674,18 +3687,43 @@ def _new_agent(preset_name: str) -> Agent:
         # Поиск выдержек — один `RulesIndex` на процесс, инструкция — из
         # `presets.py` (день 22, §9.1). Ветку `fork()` собирает с теми же.
         retriever=RULES_INDEX,
-        rag_instruction=RAG_INSTRUCTION,
         rag_rewrite_prompt=RAG_REWRITE_PROMPT,
         rag_rewrite_max_tokens=RAG_REWRITE_MAX_TOKENS,
-        rag_empty_instruction=RAG_EMPTY_INSTRUCTION,
-        # Формат ответа с источниками и цитатами и инструкция повтора — из
-        # `presets.py` (день 24, §6.1). Ветку `fork()` собирает с теми же.
+        # Формат ответа с источниками и цитатами — из `presets.py` (день 24,
+        # §6.1). Ветку `fork()` собирает с тем же.
         rag_answer_format=RAG_ANSWER_FORMAT,
-        rag_repair_instruction=RAG_REPAIR_INSTRUCTION,
-        # Инструкция памяти задачи — из `presets.py` (день 25, §6.1): уходит в
-        # запрос, только пока блок рабочей памяти в запросе. Ветку `fork()`
-        # собирает с той же.
-        rag_memory_instruction=RAG_MEMORY_INSTRUCTION,
+        # Тексты RAG — инструкция к выдержкам, пустой выдачи, повтор формата и
+        # (день 25, §6.1) инструкция памяти задачи — по пресету (день 27, §6.1):
+        # у «Локального» короткие, без повтора и без инструкции памяти. Ветку
+        # `fork()` собирает с теми же.
+        **rag_texts(preset_name),
+    )
+    _apply_request_defaults(agent)
+    return agent
+
+
+def _apply_request_defaults(agent: Agent) -> None:
+    """Умолчания переключателей запроса по пресету агента (день 27, §2.2, §6.1).
+
+    Новый агент, восстановленный при старте и ветка получают их одним правилом —
+    тем же, по которому у них `авто` и «включено» (дни 12, 17, 23). У пресетов
+    DeepSeek словарь пуст — функция ничего не делает. Состояние агента, а не
+    диалога: на диск не едет. Реранкер второго этапа не трогается."""
+    defaults = request_defaults(agent.config.name)
+    if not defaults:
+        return
+    if "profile" in defaults:
+        agent.set_profile_choice(defaults["profile"])
+    if "tools" in defaults:
+        agent.set_tools_in_request(defaults["tools"])
+    if "rag_rewrite" in defaults:
+        agent.set_rag_stages(defaults["rag_rewrite"], agent.rag_rerank)
+    logger.info(
+        "[%s] умолчания пресета: профиль %s, инструменты %s, переписывание %s",
+        f"#{agent.number} {agent.config.name} · {agent.session_id}",
+        "выключен" if defaults.get("profile") == CHOICE_OFF else "по умолчанию",
+        "выключены" if defaults.get("tools") is False else "по умолчанию",
+        "выключено" if defaults.get("rag_rewrite") is False else "по умолчанию",
     )
 
 
@@ -3750,7 +3788,7 @@ def _restore_agents() -> int:
         # Рабочая память приезжает из того же файла сессии (`context.working`),
         # кандидатов у восстановленного агента нет — они были вопросом
         # прошлого процесса (день 11, §2.4).
-        Agent(
+        restored_agent = Agent(
             PRESETS[preset_name],
             session_id=info.session_id,
             store=STORE,
@@ -3777,16 +3815,16 @@ def _restore_agents() -> int:
             sampling_max_chars=SAMPLING_MAX_CHARS,
             # RAG включён у восстановленного агента, как у нового (день 22, §2.5).
             retriever=RULES_INDEX,
-            rag_instruction=RAG_INSTRUCTION,
             rag_rewrite_prompt=RAG_REWRITE_PROMPT,
             rag_rewrite_max_tokens=RAG_REWRITE_MAX_TOKENS,
-            rag_empty_instruction=RAG_EMPTY_INSTRUCTION,
             rag_answer_format=RAG_ANSWER_FORMAT,
-            rag_repair_instruction=RAG_REPAIR_INSTRUCTION,
-            # Рабочая память старых сессий лежит по ключам, которые в карте
-            # остались (день 25, §6.1): читается как есть.
-            rag_memory_instruction=RAG_MEMORY_INSTRUCTION,
+            # Тексты RAG — по пресету (день 27, §6.1). Рабочая память старых
+            # сессий лежит по ключам, которые в карте остались (день 25, §6.1):
+            # читается как есть.
+            **rag_texts(preset_name),
         )
+        # Умолчания переключателей по пресету — как у нового агента (день 27).
+        _apply_request_defaults(restored_agent)
         restored += 1
     logger.info(
         "старт процесса: восстановлено %d %s из %s",
@@ -4354,6 +4392,8 @@ def on_fork(agent: Agent | None, checkpoint_choice: str | None, preset_name: str
                 f"Ветка от checkpoint'а «{checkpoint_id}» не создана — см. лог.",
             ),
         )
+    # Умолчания переключателей по пресету — как у нового агента (день 27, §6.1).
+    _apply_request_defaults(branch)
     working = branch.memory_state.working_items if branch.memory_state else 0
     return (
         branch,
@@ -5883,6 +5923,17 @@ _RAG_ANSWER_LABELS: list[str] = [
 ]
 assert len(_RAG_ANSWER_LABELS) == len(RAG_ANSWER_QUESTIONS)
 
+# Сценарий дня 27 — `presets.LOCAL_APP_SCENARIO`: тексты оттуда, подписи — здесь.
+_LOCAL_APP_LABELS: list[str] = [
+    "1 · К5: нокаут, источники и цитаты",
+    "2 · уточнение «А как его поднять?»",
+    "3 · К8: сколько трофеев",
+    "4 · инвариант П1: переведи Picket",
+    "5 · реплика «Понял, спасибо!»",
+    "6 · К10: Undertow (вне правил)",
+]
+assert len(_LOCAL_APP_LABELS) == len(LOCAL_APP_SCENARIO)
+
 # Сценарии дня 25 — `presets.RAG_DIALOG_SCENARIOS`: тексты оттуда, подписи — здесь.
 # Каждый сценарий проходится по порядку одним агентом на «Скользящем окне».
 _DIALOG_LABELS: dict[str, list[str]] = {
@@ -5931,16 +5982,17 @@ button.sm, .gradio-container button { font-size: 12px !important; padding: 4px 8
 with gr.Blocks(title="TooManyRules") as demo:
     gr.Markdown(
         "# TooManyRules \n"
-        "День 26, неделя 6 — **локальная модель**: тот же ассистент, только "
-        "ответ даёт модель, загруженная в LM Studio на этой машине, а не "
-        "облачный DeepSeek. Выберите пресет **«Локальный»**: ключ не нужен, "
-        "цена и окно контекста — «н/д». Какую модель загрузить, решаете вы в "
-        "LM Studio; приложение знает только адрес сервера, а кнопка «Проверить "
-        "сервер» (в блоке дня 26 справа) показывает, какая модель загружена. "
-        "У поля ввода — Л1 и К5: **Л2** — флажок RAG выключен, **Л3** — "
-        "включён. Поиск и реранкер локальные с дня 21, поэтому весь путь "
-        "«вопрос → правила → ответ» может идти без интернета; программа "
-        "`./run.sh local` задаёт те же три запроса. Верно ли ответила "
+        "День 27, неделя 6 — **ассистент на локальной модели**: тот же "
+        "ассистент, только ответ даёт модель, загруженная в LM Studio на этой "
+        "машине, а не облачный DeepSeek. Выберите пресет **«Локальный»**: ключ "
+        "не нужен, цена и окно контекста — «н/д», инструкции RAG короткие, а "
+        "профиль, инструменты MCP и переписывание запроса выключены по "
+        "умолчанию. Какую модель загрузить, решаете вы в LM Studio; "
+        "приложение знает только адрес сервера, а кнопка «Проверить сервер» "
+        "(в блоке дня 26 справа) показывает, какая модель загружена. У поля "
+        "ввода — сценарий дня 27: шесть сообщений по порядку одним агентом. "
+        "Поиск и реранкер локальные с дня 21, поэтому весь путь «вопрос → "
+        "правила → ответ» может идти без интернета. Верно ли ответила "
         "маленькая модель, решает человек."
     )
 
@@ -6126,22 +6178,16 @@ with gr.Blocks(title="TooManyRules") as demo:
                 placeholder="Например: из каких фаз состоит ход игрока?",
                 lines=2,
             )
-            # Примеры дня 26 (§6.3) — у поля ввода, в кадре: Л1 и К5 (одна
-            # строка на Л2 и Л3: Л2 — флажок RAG выключен, Л3 — включён). Клик
-            # кладёт текст в поле, отправляет человек. Сценарии дня 25 ушли в
-            # аккордеон прошлых дней.
+            # Сценарий дня 27 (§6.3) — у поля ввода, в кадре: шесть сообщений по
+            # порядку одним агентом пресета «Локальный» (на «Вся история»).
+            # Клик кладёт текст в поле, отправляет человек. Примеры дня 26 ушли
+            # в аккордеон прошлых дней.
             gr.Examples(
-                examples=[[LOCAL_QUESTIONS[0]["question"]], [LOCAL_QUESTIONS[1]["question"]]],
+                examples=[[text] for text in LOCAL_APP_SCENARIO],
                 inputs=[question_input],
-                example_labels=[
-                    "Л1 · простой: что ты умеешь",
-                    "К5 · Л2 — RAG выключен, Л3 — RAG включён",
-                ],
-                examples_per_page=2,
-                label=(
-                    "Запросы дня 26 — пресет «Локальный», новый агент на вопрос; "
-                    "инструменты MCP выключите"
-                ),
+                example_labels=_LOCAL_APP_LABELS,
+                examples_per_page=len(LOCAL_APP_SCENARIO),
+                label="Сценарий дня 27 — пресет «Локальный», по порядку одним агентом",
             )
             with gr.Row():
                 send_btn = gr.Button("Отправить", size="sm", variant="primary", scale=2)
@@ -6354,7 +6400,22 @@ with gr.Blocks(title="TooManyRules") as demo:
             # было; у поля ввода — примеры текущего дня (правило «на экране —
             # текущий день»), сценарии дня 25, контрольные вопросы дня 22 и
             # вопросы проверки ответа дня 24 — здесь.
-            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-20, 22-25)", open=False):
+            with gr.Accordion("Примеры и сценарии прошлых дней (6, 10-15, 17-20, 22-26)", open=False):
+                # Примеры дня 26 (§6.3) — с дня 27 здесь: Л1 и К5 (одна строка
+                # на Л2 и Л3: Л2 — флажок RAG выключен, Л3 — включён).
+                gr.Examples(
+                    examples=[[LOCAL_QUESTIONS[0]["question"]], [LOCAL_QUESTIONS[1]["question"]]],
+                    inputs=[question_input],
+                    example_labels=[
+                        "Л1 · простой: что ты умеешь",
+                        "К5 · Л2 — RAG выключен, Л3 — RAG включён",
+                    ],
+                    examples_per_page=2,
+                    label=(
+                        "Запросы дня 26 — пресет «Локальный», новый агент на вопрос; "
+                        "инструменты MCP выключите"
+                    ),
+                )
                 # Сценарии дня 25 (§6.3) — с дня 26 здесь: у поля ввода стоят
                 # примеры дня 26. Каждый сценарий — по порядку одним агентом на
                 # «Скользящем окне».
@@ -6561,12 +6622,56 @@ with gr.Blocks(title="TooManyRules") as demo:
         # --- Справа: дебаг-панель ---
         with gr.Column(scale=1):
             gr.Markdown("## Дебаг-панель")
-            # Локальная модель (день 26, §6.2) — развёрнут наверху панели. Не
+            # Ассистент на локальной модели (день 27, §6.2) — развёрнут наверху
+            # панели, над блоком дня 26. «Проверка ответа», «RAG последнего
+            # хода» и последнее сообщение запроса целиком переехали сюда из
+            # блока дня 25 (правило дней 19-25: блок хода живёт в блоке текущего
+            # дня) — те же компоненты и выходы `_view()` (39-40, 42); новых
+            # выходов нет, `_view()` — по-прежнему 43 значения.
+            with gr.Accordion("Ассистент на локальной модели (день 27)", open=True):
+                gr.Markdown(
+                    "**Пресет «Локальный» — полный ассистент на модели из LM "
+                    "Studio, без облака.** На инструкциях RAG дней 24-25 "
+                    "маленькая модель (Qwen3.5-2B) отвечала «Не знаю» на все "
+                    "вопросы даже при нужной выдержке на первом месте, поэтому у "
+                    "«Локального» **короткие инструкции RAG**: четыре правила, "
+                    "без образцов ответа, **без повтора формата** (он почти "
+                    "никогда не исправлял ответ, а время учетверял) и **без "
+                    "инструкции памяти**. Проверка ответа и список источников — "
+                    "прежние: нарушения помечает код.\n\n"
+                    "**По умолчанию у его агентов выключены** «Профиль в "
+                    "запросе» (шаблон «За столом» перебивал формат ответа), "
+                    "«Инструменты MCP в запросе» (модель их не вызывает) и "
+                    "«переписать запрос» во втором этапе (копировало пример из "
+                    "своего промпта в запрос поиска); реранкер с порогом "
+                    "остался. Новый агент, восстановленный после перезапуска и "
+                    "ветка стартуют с этими умолчаниями; **включаются руками** в "
+                    "переключателях. У пресетов DeepSeek всё как раньше.\n\n"
+                    "**На маленькой модели по-прежнему не работают:** разбор "
+                    "памяти (ничего не записывает), номера `[N]` в тексте "
+                    "ответа (цитаты есть, а ссылок нет — код помечает), "
+                    "инструменты; страж инвариантов то видит конфликт, то нет. "
+                    "**Верно ли отвечает модель, решает человек.**"
+                )
+                answer_md = gr.Markdown("")
+                rag_md = gr.Markdown("")
+                with gr.Accordion(
+                    "Последнее сообщение запроса целиком (выдержки + вопрос)", open=False
+                ):
+                    rag_message_box = gr.Textbox(
+                        label="Последнее сообщение запроса целиком (выдержки + вопрос)",
+                        lines=12,
+                        max_lines=40,
+                        interactive=False,
+                        buttons=["copy"],
+                    )
+            # Локальная модель (день 26, §6.2) — с дня 27 свёрнут под блоком
+            # дня 27 (§6.3), кнопка «Проверить сервер» внутри. Не
             # входит в `_view()` (как блоки MCP дней 16-20): свои выходы
             # `LOCAL_OUTPUTS`, обработчик без `agent_state`. Описание
             # статично; «Последний вызов» с ответившей моделью — общий блок,
             # его строка «Модель» с дня 26 показывает фактическую модель.
-            with gr.Accordion("Локальная модель (день 26)", open=True):
+            with gr.Accordion("Локальная модель (день 26)", open=False):
                 gr.Markdown(
                     f"**Модель работает на этой машине**, в LM Studio; сервер "
                     f"OpenAI-совместимый, адрес — `{LOCAL_BASE_URL}` "
@@ -6602,13 +6707,11 @@ with gr.Blocks(title="TooManyRules") as demo:
                     max_height=240,
                     wrap=True,
                 )
-            # Мини-чат: RAG + память задачи (день 25, §6.2) — с дня 26 свёрнут
-            # под блоком дня 26 (§6.3); его компоненты и выходы `_view()` те
-            # же. Описание — статичный Markdown; «Память задачи» — новое
-            # 43-е значение `_view()`; «Проверка ответа», «RAG последнего
-            # хода» и последнее сообщение запроса целиком переехали сюда из
-            # блока дня 24 (правило дней 19-24: блок хода живёт в блоке
-            # текущего дня) — те же компоненты и выходы `_view()` (39-40, 42).
+            # Мини-чат: RAG + память задачи (день 25, §6.2) — с дня 26 свёрнут;
+            # с дня 27 в нём остались описание и «Память задачи» — 43-е значение
+            # `_view()`: «Проверка ответа», «RAG последнего хода» и последнее
+            # сообщение запроса целиком переехали в блок дня 27 (§6.2), те же
+            # компоненты и выходы `_view()` (39-40, 42).
             with gr.Accordion("Мини-чат: RAG + память задачи (день 25)", open=False):
                 gr.Markdown(
                     "**Память задачи** — рабочий слой памяти дня 11 по трём "
@@ -6631,18 +6734,6 @@ with gr.Blocks(title="TooManyRules") as demo:
                     "state» задания — это память задачи."
                 )
                 task_memory_md = gr.Markdown("")
-                answer_md = gr.Markdown("")
-                rag_md = gr.Markdown("")
-                with gr.Accordion(
-                    "Последнее сообщение запроса целиком (выдержки + вопрос)", open=False
-                ):
-                    rag_message_box = gr.Textbox(
-                        label="Последнее сообщение запроса целиком (выдержки + вопрос)",
-                        lines=12,
-                        max_lines=40,
-                        interactive=False,
-                        buttons=["copy"],
-                    )
             # RAG: источники, цитаты и «не знаю» (день 24, §6.2) — с дня 25
             # свёрнут под блоком дня 25 (§6.4); остаётся статичное описание.
             with gr.Accordion("RAG: источники, цитаты и «не знаю» (день 24)", open=False):
