@@ -69,6 +69,25 @@ _INDEX_KEYS = (
     "threshold", "top_k",
 )
 
+# Поля записи и колонки, без которых отчёт не строится, — их проверяет `--merge`.
+# Поля правок по ревью (`rounds`, `all_cost_usd`, `prev_error`) необязательны:
+# JSON, записанные до правок, читаются, строки без данных — «н/д».
+_RECORD_KEYS = frozenset({
+    "col", "question", "mode", "repeat", "ok", "error", "answered_model", "finish_reason", "elapsed",
+    "prompt_tokens", "completion_tokens", "cost_usd", "reasoning", "rewrite_elapsed", "rewrite_ok", "queries",
+    "search_ok", "search_elapsed", "load_s", "rerank_load_s", "rerank_ok", "empty", "best", "hits", "before",
+    "after", "has_check", "kind", "check_empty", "asks", "sources", "quotes", "verbatim", "violations",
+    "repaired", "raw", "text", "prev_ok", "prev_text",
+})
+_COLUMN_KEYS = frozenset({
+    "preset", "base_url", "temperature", "temperature_override", "max_tokens", "reasoning_effort", "thinking",
+    "texts", "model_param", "server", "started", "built_at", "models",
+})
+
+# Служебные вызовы хода в `AgentReply` — для стоимости всех вызовов. У голого
+# агента программы из них бывает только переписывание.
+_SERVICE_CALLS = ("service_call", "memory_call", "route_call", "task_call", "guard_call", "rewrite_call")
+
 
 # --- Мелочи ---------------------------------------------------------------------
 
@@ -102,6 +121,50 @@ def of(count: int, base: int) -> str:
     return f"{count} из {base}"
 
 
+def failure(record: dict) -> str | None:
+    """Почему ход не годится в показатели: не удался он сам или его предыдущий
+    ход (уточняющий тогда задан агенту без контекста — правка по ревью);
+    `None` — ход удался."""
+    if not record["ok"]:
+        return f"ход не удался — {record['error']}"
+    if record["prev_ok"] is False:
+        return f"предыдущий ход не удался — {record.get('prev_error') or 'причина не записана'}"
+    return None
+
+
+def good(record: dict) -> bool:
+    return failure(record) is None
+
+
+def hit_ceiling(record: dict) -> bool:
+    """Упор в потолок: хоть один раунд основного запроса кончился `length`. В
+    JSON до правки по ревью раундов нет — по `finish_reason` хода."""
+    rounds = record.get("rounds")
+    if rounds is None:
+        return record["finish_reason"] == "length"
+    return any(item["finish_reason"] == "length" for item in rounds)
+
+
+def unbroken_lengths(record: dict) -> list[int]:
+    """`completion_tokens` раундов без обрыва: у хода с повтором формата сумма
+    хода — два ответа, а не один (правка по ревью)."""
+    rounds = record.get("rounds")
+    if rounds is None:
+        rounds = [record]
+    return [item["completion_tokens"] for item in rounds
+            if item["finish_reason"] != "length" and item["completion_tokens"]]
+
+
+def known_costs(reply: agent.AgentReply | None) -> list[float]:
+    """Известные стоимости всех вызовов хода: раунды основного запроса и
+    служебные работы (у голого агента — переписывание)."""
+    if reply is None:
+        return []
+    calls = [getattr(reply, name) for name in _SERVICE_CALLS] + list(reply.sampling_calls)
+    costs = [reply.cost_usd] + [call.cost_usd for call in calls if call is not None]
+    return [cost for cost in costs if cost is not None]
+
+
 # --- Записи ---------------------------------------------------------------------
 
 def make_record(col: int, question: dict, mode: rag_eval.Mode, repeat: int, run: rag_eval.Run) -> dict:
@@ -112,19 +175,28 @@ def make_record(col: int, question: dict, mode: rag_eval.Mode, repeat: int, run:
     found = rag_eval.record_of(run)
     check = rag_eval.answer_of(run)
     call = reply.rewrite_call
+    # Модели поиска грузятся при первом поиске — у уточняющего это может быть
+    # его предыдущий ход (`--only У1`).
+    searches = [item for item in (rag, run.prev.rag if run.prev is not None else None) if item is not None]
+    costs = known_costs(reply) + known_costs(run.prev)
     record = {
         "col": col, "question": question["id"], "mode": mode.key, "repeat": repeat,
         "ok": reply.ok, "error": reply.error, "answered_model": reply.answered_model,
         "finish_reason": reply.finish_reason, "elapsed": reply.elapsed,
         "prompt_tokens": reply.prompt_tokens, "completion_tokens": reply.completion_tokens,
         "cost_usd": reply.cost_usd, "reasoning": bool(reply.reasoning),
+        "rounds": [
+            {"completion_tokens": item.completion_tokens, "finish_reason": item.finish_reason, "repair": item.repair}
+            for item in reply.rounds
+        ],
+        "all_cost_usd": sum(costs) if costs else None,
         "rewrite_elapsed": call.elapsed if call is not None else None,
         "rewrite_ok": call.ok if call is not None else None,
         "queries": list(rag.queries) if rag is not None else [],
         "search_ok": rag.ok if rag is not None else None,
         "search_elapsed": rag.elapsed if rag is not None else None,
-        "load_s": rag.load_s if rag is not None else 0.0,
-        "rerank_load_s": rag.rerank_load_s if rag is not None else 0.0,
+        "load_s": sum(item.load_s for item in searches),
+        "rerank_load_s": sum(item.rerank_load_s for item in searches),
         "rerank_ok": rag.rerank_ok if rag is not None else None,
         "empty": found.empty if found is not None else None,
         "best": found.best if found is not None else None,
@@ -143,6 +215,7 @@ def make_record(col: int, question: dict, mode: rag_eval.Mode, repeat: int, run:
         "raw": check.raw if check is not None else reply.text,
         "text": reply.text,
         "prev_ok": run.prev.ok if run.prev is not None else None,
+        "prev_error": run.prev.error if run.prev is not None else None,
         "prev_text": run.prev.text if run.prev is not None else None,
     }
     return record
@@ -183,12 +256,16 @@ def column_key(column: dict) -> tuple:
 # --- Показатели -----------------------------------------------------------------
 
 class Data:
-    """Записи прогона: колонки, режимы, вопросы и группы повторов."""
+    """Записи прогона: колонки, режимы, вопросы и группы повторов. `interrupted` —
+    пометки прерванных прогонов для начала отчёта (у `--merge` — по файлу)."""
 
-    def __init__(self, columns: list[dict], records: list[dict], indexes: list[dict]) -> None:
+    def __init__(
+        self, columns: list[dict], records: list[dict], indexes: list[dict], interrupted: list[str] | None = None,
+    ) -> None:
         self.columns = columns
         self.records = records
         self.indexes = indexes
+        self.interrupted = interrupted or []
         modes_present = {r["mode"] for r in records}
         self.modes = [mode for mode in rag_eval.MODES if mode.key in modes_present]
         ids_present = {r["question"] for r in records}
@@ -215,7 +292,7 @@ class Data:
 
 def quality_rows(records: list[dict]) -> list[tuple[str, str]]:
     """Показатели формы по записям одной колонки и режима (§2.3)."""
-    ok = [r for r in records if r["ok"]]
+    ok = [r for r in records if good(r)]
     checked = [r for r in ok if r["has_check"]]
     excerpts = [r for r in checked if not r["check_empty"]]
     empty = [r for r in checked if r["check_empty"]]
@@ -242,14 +319,22 @@ def quality_rows(records: list[dict]) -> list[tuple[str, str]]:
     ]
 
 
+def cost_text(values: list[float | None]) -> str:
+    known = [value for value in values if value is not None]
+    return money(sum(known)) if known else "н/д"
+
+
 def speed_rows(records: list[dict]) -> list[tuple[str, str]]:
-    ok = [r for r in records if r["ok"]]
+    ok = [r for r in records if good(r)]
     times = [r["elapsed"] for r in ok]
-    costs = [r["cost_usd"] for r in ok if r["cost_usd"] is not None]
     rates = [value for value in (speed(r) for r in ok) if value is not None]
     searched = [r for r in ok if r["search_ok"] and r["search_elapsed"] is not None]
     rewritten = [r["rewrite_elapsed"] for r in ok if r["rewrite_elapsed"] is not None]
-    unbroken = [r["completion_tokens"] for r in ok if r["finish_reason"] != "length" and r["completion_tokens"]]
+    unbroken = [length for r in ok for length in unbroken_lengths(r)]
+    # Деньги потрачены и на неудачных ходах — суммы по всем записям. Полной
+    # стоимости нет в JSON до правки по ревью.
+    all_costs = ("н/д — в записях нет" if any("all_cost_usd" not in r for r in records)
+                 else cost_text([r["all_cost_usd"] for r in records]))
     load_e5 = sum(r["load_s"] or 0 for r in records)
     load_rank = sum(r["rerank_load_s"] or 0 for r in records)
     return [
@@ -261,32 +346,38 @@ def speed_rows(records: list[dict]) -> list[tuple[str, str]]:
         ("prompt_tokens: медиана", whole(median([r["prompt_tokens"] for r in ok if r["prompt_tokens"]]))),
         ("completion_tokens: медиана", whole(median([r["completion_tokens"] for r in ok if r["completion_tokens"]]))),
         ("≈ток/с: медиана (с префиллом)", whole(median(rates))),
-        ("самый длинный ответ без обрыва, токенов", whole(max(unbroken) if unbroken else None)),
-        ("стоимость, сумма", money(sum(costs)) if costs else "н/д"),
+        ("самый длинный ответ без обрыва (один раунд), токенов", whole(max(unbroken) if unbroken else None)),
+        ("стоимость основного вызова, сумма", cost_text([r["cost_usd"] for r in records])),
+        ("стоимость всех вызовов хода (с переписыванием и предыдущим ходом), сумма", all_costs),
     ]
 
 
 def stability(group: list[dict]) -> dict:
-    """Стабильность N повторов одного вопроса в одной колонке и режиме (§2.3)."""
-    ok = [r for r in group if r["ok"]]
+    """Стабильность N повторов одного вопроса в одной колонке и режиме (§2.3).
+    Меряется, только если удачных ответов не меньше двух (`measured`): одному
+    ответу не с чем совпадать (правка по ревью); «повтор 1 отличается» — только
+    если повтор 1 удался."""
+    ok = [r for r in group if good(r)]
     keys = [answer_key(r) for r in ok]
-    distinct = len(set(keys))
-    rest = keys[1:]
-    first_differs = len(keys) >= 2 and keys[0] not in rest
+    measured = len(ok) >= 2
+    first = measured and ok[0]["repeat"] == 1
+    rest = keys[1:] if first else []
     times = [r["elapsed"] for r in ok]
     return {
-        "n": len(group), "ok": len(ok), "distinct": distinct, "all_same": len(keys) >= 1 and distinct == 1,
-        "first_differs": first_differs, "rest_same": len(set(rest)) == 1 if rest else False,
-        "kind_same": len({r["kind"] for r in ok}) <= 1, "hits_same": len({tuple(r["hits"]) for r in ok}) <= 1,
+        "n": len(group), "ok": len(ok), "measured": measured, "distinct": len(set(keys)),
+        "all_same": measured and len(set(keys)) == 1,
+        "first_differs": first and keys[0] not in rest, "rest_same": first and len(set(rest)) == 1,
+        "kind_same": measured and len({r["kind"] for r in ok}) == 1,
+        "hits_same": measured and len({tuple(r["hits"]) for r in ok}) == 1,
         "queries": len({tuple(r["queries"]) for r in ok}),
-        "failed": len(group) - len(ok), "length": sum(1 for r in ok if r["finish_reason"] == "length"),
+        "failed": len(group) - len(ok), "length": sum(1 for r in ok if hit_ceiling(r)),
         "t_min": min(times) if times else None, "t_med": median(times), "t_max": max(times) if times else None,
-        "spread": (max(times) - min(times)) if times else None,
+        "spread": (max(times) - min(times)) if measured else None,
     }
 
 
 def stability_label(info: dict) -> str:
-    if info["ok"] < 2:
+    if not info["measured"]:
         return "— (меньше двух ответов)"
     if info["all_same"]:
         return f"✓ {info['ok']} одинаковых"
@@ -300,6 +391,7 @@ def stability_summary(data: Data, col: int, mode: rag_eval.Mode) -> dict:
     spreads = [i["spread"] for i in infos if i["spread"] is not None]
     return {
         "questions": len(infos),
+        "measured": sum(1 for i in infos if i["measured"]),
         "all_same": sum(1 for i in infos if i["all_same"]),
         "first_differs": sum(1 for i in infos if i["first_differs"]),
         "kind_same": sum(1 for i in infos if i["kind_same"]),
@@ -417,14 +509,15 @@ def stability_section(data: Data) -> list[str]:
         return f"| {label} | " + " | ".join(cell(fn(summary[pair])) for pair in data.pairs) + " |"
 
     out += [
-        "Сводка по колонке и режиму (вопросов: все N ответов одинаковы, повтор 1 отличается от остальных, вид "
-        "одинаков, выдача одинакова; «одинаковы» — тексты модели после схлопывания пробелов):", "",
+        "Сводка по колонке и режиму. Стабильность меряется у вопросов, где удачных ответов не меньше двух, — "
+        "«из K» в строках ниже первой считается от них; «одинаковы» — тексты модели после схлопывания пробелов:", "",
         "| показатель | " + " | ".join(data.header(col, mode) for col, mode in data.pairs) + " |",
         "| --- | " + " | ".join("---" for _ in data.pairs) + " |",
-        row("все N ответов одинаковы", lambda s: of(s["all_same"], s["questions"])),
-        row("повтор 1 отличается от остальных", lambda s: of(s["first_differs"], s["questions"])),
-        row("вид ответа одинаков", lambda s: of(s["kind_same"], s["questions"])),
-        row("выдача одинакова", lambda s: of(s["hits_same"], s["questions"])),
+        row("вопросов с двумя и больше удачными ответами", lambda s: of(s["measured"], s["questions"])),
+        row("все N ответов одинаковы", lambda s: of(s["all_same"], s["measured"])),
+        row("повтор 1 отличается от остальных", lambda s: of(s["first_differs"], s["measured"])),
+        row("вид ответа одинаков", lambda s: of(s["kind_same"], s["measured"])),
+        row("выдача одинакова", lambda s: of(s["hits_same"], s["measured"])),
         row("сбоев / упоров в потолок всего", lambda s: f"{s['failed']} / {s['length']}"),
         row("разброс времени (макс − мин), с: медиана / максимум",
             lambda s: f"{sec(s['spread_med'])} / {sec(s['spread_max'])}"),
@@ -443,7 +536,8 @@ def stability_section(data: Data) -> list[str]:
                 continue
             info = stability(group)
             lines = [stability_label(info)]
-            lines.append(f"вид: {'✓' if info['kind_same'] else '≠'} · выдача: {'✓' if info['hits_same'] else '≠'}")
+            if info["measured"]:
+                lines.append(f"вид: {'✓' if info['kind_same'] else '≠'} · выдача: {'✓' if info['hits_same'] else '≠'}")
             if mode.rewrite:
                 lines.append(f"запросов поиска: {info['queries']}")
             lines.append(f"упоров: {info['length']} · сбоев: {info['failed']}")
@@ -475,7 +569,7 @@ def by_question_section(data: Data) -> list[str]:
                 if not group:
                     cells += ["—", ""]
                     continue
-                ok = [r for r in group if r["ok"]]
+                ok = [r for r in group if good(r)]
                 kinds = list(dict.fromkeys(r["kind"] or "—" for r in ok))
                 violations = [len(r["violations"]) for r in ok]
                 info = stability(group)
@@ -511,25 +605,29 @@ def answers_section(data: Data) -> list[str]:
                             quote(first["prev_text"]) if first["prev_ok"] else "⚠️ ход не удался", ""]
                 variants: dict[str, list[dict]] = {}
                 for record in group:
-                    variants.setdefault(answer_key(record) if record["ok"] else f"сбой: {record['error']}", []).append(record)
+                    reason = failure(record)
+                    variants.setdefault(answer_key(record) if reason is None else f"сбой: {reason}", []).append(record)
                 for records in variants.values():
                     lead = records[0]
+                    reason = failure(lead)
                     numbers = [r["repeat"] for r in records]
                     count = f"×{len(records)}" + ("" if len(records) == len(group) else
                                                   f" (повтор{'ы' if len(numbers) > 1 else ''} " + ", ".join(map(str, numbers)) + ")")
                     if not lead["ok"]:
-                        out += [f"{count} ⚠️ ход не удался: {lead['error']}", ""]
+                        out += [f"{count} ⚠️ {reason}", ""]
                         continue
-                    out += [f"{count}", "", quote(lead["text"]), "", f"_{metrics_text(lead)}_", ""]
+                    # Предыдущий ход не удался — ответ есть, но задан без контекста.
+                    out += [count + (f" ⚠️ {reason}; вопрос задан без контекста" if reason else ""), "",
+                            quote(lead["text"]), "", f"_{metrics_text(lead)}_", ""]
                     if mode.rewrite and lead["queries"]:
                         out += ["_Запросы поиска: " + " · ".join(f"«{cell(q)}»" for q in lead["queries"]) + "_", ""]
     return out
 
 
-def build_report(data: Data, interrupted: str | None = None) -> str:
+def build_report(data: Data) -> str:
     out = ["# Сравнение локальной и облачной модели: RAG, качество, скорость, стабильность (день 28)", ""]
-    if interrupted is not None:
-        out += [f"**Прервано: {interrupted}** — в отчёте пройденные ходы ({len(data.records)}).", ""]
+    for note in data.interrupted:
+        out += [f"**Прервано:** {note}", ""]
     out += conditions(data)
     out += ["## 2. Качество (форма)", "",
             "Код проверяет форму: номера выдержек, дословность цитат, «Не знаю» и уточняющий вопрос (день 24). "
@@ -572,6 +670,22 @@ def load_json(path: Path) -> dict:
         or not isinstance(data.get("columns"), list) or not isinstance(data.get("records"), list)
     ):
         raise ValueError(f"{path}: не записи программы {PROGRAM}")
+    # Форма записей — до сборки отчёта: битая запись дала бы трейсбек посреди
+    # отчёта, а не отказ (правка по ревью).
+    columns = data["columns"]
+    for number, column in enumerate(columns, 1):
+        missing = _COLUMN_KEYS - column.keys() if isinstance(column, dict) else _COLUMN_KEYS
+        if missing or not isinstance(column["models"], list):
+            raise ValueError(f"{path}: колонка {number} не той формы (нет полей: {', '.join(sorted(missing)) or 'models'})")
+    for number, record in enumerate(data["records"], 1):
+        missing = _RECORD_KEYS - record.keys() if isinstance(record, dict) else _RECORD_KEYS
+        if missing:
+            raise ValueError(f"{path}: запись {number} не той формы (нет полей: {', '.join(sorted(missing))})")
+        if not isinstance(record["col"], int) or not 0 <= record["col"] < len(columns):
+            raise ValueError(f"{path}: запись {number} ссылается на колонку {record['col']!r}, а колонок {len(columns)}")
+        if record["mode"] not in rag_eval.MODE_BY_KEY or record["question"] not in QUESTION_BY_ID:
+            raise ValueError(f"{path}: запись {number} — неизвестный режим или вопрос "
+                             f"({record['mode']!r}, {record['question']!r})")
     return data
 
 
@@ -581,9 +695,12 @@ def merge(paths: list[Path]) -> Data:
     columns: list[dict] = []
     records: list[dict] = []
     indexes: list[dict] = []
+    interrupted: list[str] = []
     seen: dict[tuple, Path] = {}
     for path in paths:
         data = load_json(path)
+        if data.get("interrupted"):
+            interrupted.append(f"`{path}` — {data['interrupted']}; колонки этого файла неполные")
         offset = len(columns)
         for column in data["columns"]:
             key = column_key(column)
@@ -597,7 +714,7 @@ def merge(paths: list[Path]) -> Data:
         records += [{**record, "col": record["col"] + offset} for record in data["records"]]
         if data.get("index"):
             indexes.append(data["index"])
-    return Data(columns, records, indexes)
+    return Data(columns, records, indexes, interrupted)
 
 
 # --- Прогон ---------------------------------------------------------------------
@@ -642,6 +759,24 @@ def _refuse(message: str) -> None:
     sys.exit(2)
 
 
+def _items(value: str | None, default: tuple[str, ...]) -> list[str]:
+    """Значения флага через запятую; не задан — умолчание. Пустая строка — пустой
+    список, а не умолчание: `--presets ""` — отказ (правка по ревью)."""
+    text = ",".join(default) if value is None else value
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def _out_path(args: argparse.Namespace, default: Path) -> Path:
+    """Путь отчёта: `.json` — отказ (JSON прогона пишется рядом с тем же именем и
+    затёр бы отчёт, у `--merge` — вход), каталог — отказ (правка по ревью)."""
+    path = args.out.expanduser() if args.out is not None else default
+    if path.suffix.lower() == ".json":
+        _refuse(f"--out {path}: отчёт — Markdown (.md), JSON записей пишется рядом с тем же именем")
+    if path.is_dir():
+        _refuse(f"--out {path}: это каталог, нужен файл отчёта .md")
+    return path
+
+
 def run_merge(args: argparse.Namespace) -> None:
     flags = ("presets", "modes", "repeat", "only", "temperature", "db")
     given = [f"--{name}" for name in flags if getattr(args, name) is not None]
@@ -650,12 +785,11 @@ def run_merge(args: argparse.Namespace) -> None:
     paths = [Path(item.strip()) for item in args.merge.split(",") if item.strip()]
     if not paths:
         _refuse("--merge: не назван ни один файл")
+    out_path = _out_path(args, presets.RAG_COMPARE_DIR / f"{datetime.now():%Y-%m-%d-%H%M%S}-merge.md")
     try:
         data = merge(paths)
     except ValueError as exc:
         _refuse(f"--merge: {exc}")
-    out_path = (args.out.expanduser() if args.out is not None
-                else presets.RAG_COMPARE_DIR / f"{datetime.now():%Y-%m-%d-%H%M%S}-merge.md")
     report = build_report(data)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(report, encoding="utf-8")
@@ -663,6 +797,44 @@ def run_merge(args: argparse.Namespace) -> None:
                 len(data.records), rag_search.shown(out_path))
     print_summaries(report)
     sys.exit(0)
+
+
+def run_turn(question: dict, mode: rag_eval.Mode, config: agent.AgentConfig,
+             index: rag_search.RulesIndex) -> rag_eval.Run:
+    """Ход `rag_eval.run_mode()`; созданные им агенты после хода снимаются с
+    учёта (правка по ревью): иначе реестр процесса держит каждого вместе с его
+    клиентом OpenAI и соединением до конца прогона — по умолчанию 192 агента,
+    по дескриптору на каждого (замер на заглушке сервера: 30 агентов — +30).
+    Снятого агента освобождает сборщик мусора (ссылки циклические): открытых
+    дескрипторов остаются единицы-десятки, а не по одному на ход."""
+    created = agent.process_stats()["agents_created"]
+    try:
+        return rag_eval.run_mode(question, CONTROLS, mode, config, index)
+    finally:
+        for bare in agent.agents():
+            if bare.number > created:
+                agent.delete_agent(bare.number)
+
+
+def run_all(configs: list[agent.AgentConfig], questions: list[dict], modes: list[rag_eval.Mode], repeat: int,
+            index: rag_search.RulesIndex, records: list[dict]) -> str | None:
+    """Ходы всех колонок в порядке §5.1 — повтор за повтором; записи дописываются
+    в `records` (при Ctrl+C пройденное остаётся у вызывающего). Возвращает
+    причину остановки на первом сбое хода, `None` — все ходы удались."""
+    for number, config in enumerate(configs):
+        logger.info("колонка %d из %d: пресет «%s» · %s", number + 1, len(configs), config.name, config.base_url)
+        for attempt in range(1, repeat + 1):
+            for question in questions:
+                for mode in modes:
+                    run = run_turn(question, mode, config, index)
+                    record = make_record(number, question, mode, attempt, run)
+                    records.append(record)
+                    log_record(config, question, mode, attempt, repeat, record)
+                    reason = failure(record)
+                    if reason is not None:
+                        logger.error("сбой — пишу отчёт по пройденному")
+                        return f"{config.name} · {question['id']} · {mode.key} · повтор {attempt}: {reason}"
+    return None
 
 
 def main() -> None:
@@ -677,13 +849,13 @@ def main() -> None:
         run_merge(args)
 
     # --- Отказы до вызова модели ---
-    names = [item.strip() for item in (args.presets or ",".join(presets.RAG_COMPARE_PRESETS)).split(",") if item.strip()]
+    names = _items(args.presets, presets.RAG_COMPARE_PRESETS)
     unknown = [name for name in names if name not in presets.PRESETS]
     if unknown or not names:
         _refuse(f"нет пресетов: {', '.join(unknown) or '(пусто)'}; есть: "
                 + ", ".join(f"«{name}»" for name in presets.PRESETS))
     names = list(dict.fromkeys(names))
-    keys = [item.strip() for item in (args.modes or ",".join(presets.RAG_COMPARE_MODES)).split(",") if item.strip()]
+    keys = _items(args.modes, presets.RAG_COMPARE_MODES)
     unknown = [key for key in keys if key not in rag_eval.MODE_BY_KEY]
     if unknown or not keys:
         _refuse(f"нет режимов: {', '.join(unknown) or '(пусто)'}; есть: " + ", ".join(m.key for m in rag_eval.MODES))
@@ -692,8 +864,8 @@ def main() -> None:
     if repeat < 1:
         _refuse(f"--repeat {repeat}: нужно не меньше 1")
     questions = list(QUESTIONS)
-    if args.only:
-        wanted = [item.strip().translate(rag_eval._LATIN_ID) for item in args.only.split(",") if item.strip()]
+    if args.only is not None:
+        wanted = [item.translate(rag_eval._LATIN_ID) for item in _items(args.only, ())]
         known = {q["id"] for q in questions}
         missing = [item for item in wanted if item not in known]
         if missing or not wanted:
@@ -710,6 +882,13 @@ def main() -> None:
                 _refuse(str(exc))
         configs.append(config)
 
+    started = datetime.now()
+    out_path = _out_path(args, presets.RAG_COMPARE_DIR / f"{started:%Y-%m-%d-%H%M%S}.md")
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _refuse(f"--out {out_path}: каталог не создаётся ({exc.strerror or exc}) — прогон отменён, модель не вызывалась")
+
     index = rag_search.RulesIndex(
         (args.db or presets.RAG_INDEX_DB).expanduser(), presets.RAG_SEARCH_STRATEGY, presets.RAG_SEARCH_LANG,
         presets.RAG_TOP_K, candidates_k=presets.RAG_CANDIDATES, rerank_model=presets.RAG_RERANK_MODEL,
@@ -725,7 +904,6 @@ def main() -> None:
             "прогон отменён, модель не вызывалась"
         )
 
-    started = datetime.now()
     index_info = {key: info.get(key) for key in _INDEX_KEYS}
     columns: list[dict] = []
     for config in configs:
@@ -747,36 +925,10 @@ def main() -> None:
         ", ".join(mode.key for mode in modes), repeat, len(questions), calls * len(modes) * repeat,
     )
 
-    out_path = (args.out.expanduser() if args.out is not None
-                else presets.RAG_COMPARE_DIR / f"{started:%Y-%m-%d-%H%M%S}.md")
     records: list[dict] = []
-    interrupted: str | None = None
-    code = 0
-    stop = False
     try:
-        for number, config in enumerate(configs):
-            logger.info("колонка %d из %d: пресет «%s» · %s", number + 1, len(configs), config.name, config.base_url)
-            for attempt in range(1, repeat + 1):
-                for question in questions:
-                    for mode in modes:
-                        run = rag_eval.run_mode(question, CONTROLS, mode, config, index)
-                        record = make_record(number, question, mode, attempt, run)
-                        records.append(record)
-                        log_record(config, question, mode, attempt, repeat, record)
-                        if not record["ok"]:
-                            interrupted = (
-                                f"{config.name} · {question['id']} · {mode.key} · повтор {attempt}: ход не удался — "
-                                f"{record['error']}"
-                            )
-                            code, stop = 1, True
-                            logger.error("сбой — пишу отчёт по пройденному")
-                            break
-                    if stop:
-                        break
-                if stop:
-                    break
-            if stop:
-                break
+        interrupted = run_all(configs, questions, modes, repeat, index, records)
+        code = 0 if interrupted is None else 1
     except KeyboardInterrupt:
         interrupted, code = _passed(records), 130
         logger.error("прервано %s — пишу отчёт по пройденному", interrupted)
@@ -794,13 +946,16 @@ def main() -> None:
         "program": PROGRAM, "started": f"{started:%Y-%m-%d %H:%M:%S}", "index": index_info, "columns": kept,
         "records": kept_records, "interrupted": interrupted,
     }
-    report = build_report(Data(kept, kept_records, [index_info]), interrupted)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(report, encoding="utf-8")
+    # JSON — первым: отчёт строится из записей, и сбой его сборки или записи не
+    # должен терять оплаченные ходы — по JSON отчёт соберёт `--merge` (правка по
+    # ревью).
     json_path = out_path.with_suffix(".json")
     dump_json(json_path, payload)
-    logger.info("отчёт: %s · записи: %s (%d ходов)", rag_search.shown(out_path), rag_search.shown(json_path),
-                len(records))
+    logger.info("записи: %s (%d ходов)", rag_search.shown(json_path), len(records))
+    notes = [] if interrupted is None else [f"{interrupted} — в отчёте пройденные ходы ({len(records)})"]
+    report = build_report(Data(kept, kept_records, [index_info], notes))
+    out_path.write_text(report, encoding="utf-8")
+    logger.info("отчёт: %s", rag_search.shown(out_path))
     print_summaries(report)
     sys.exit(code)
 
@@ -809,7 +964,7 @@ def log_record(config: agent.AgentConfig, question: dict, mode: rag_eval.Mode, a
                record: dict) -> None:
     head = f"{config.name} · {question['id']} · {mode.key} · повтор {attempt}/{repeat}: "
     if not record["ok"]:
-        logger.info("%s⚠️ ход не удался: %s", head, record["error"])
+        logger.info("%s⚠️ %s", head, failure(record))
         return
     rate = speed(record)
     line = (
@@ -818,8 +973,10 @@ def log_record(config: agent.AgentConfig, question: dict, mode: rag_eval.Mode, a
     )
     if record["kind"]:
         line += f" · {record['kind']}"
-    if record["finish_reason"] == "length":
+    if hit_ceiling(record):
         line += " · ⚠️ finish_reason length (упор в потолок)"
+    if record["prev_ok"] is False:
+        line += f" · ⚠️ {failure(record)}"
     logger.info("%s", line)
 
 
