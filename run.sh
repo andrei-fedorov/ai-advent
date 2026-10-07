@@ -37,6 +37,15 @@ cd "$(dirname "${BASH_SOURCE[0]}")/src"
 #                               нужен; отчёт Markdown в src/data/local/ (для Л3 —
 #                               индекс и реранкер в кэше): --only Л1,Л3, --url
 #                               <адрес>, --db <путь>, --out <файл.md>
+#   ./run.sh rag-compare [...] — сравнение локальной и облачной модели в RAG (день
+#                               28): 16 вопросов rag-eval в режимах `фильтр` и
+#                               `полный`, каждый по N повторов; отчёт Markdown и
+#                               JSON записей в src/data/rag/compare/ (индекс и
+#                               реранкер в кэше; ключ DeepSeek — только колонке
+#                               «Базовый»; локальную колонку запускайте сразу
+#                               после lms load): --presets, --modes, --repeat,
+#                               --only, --temperature, --db, --out, --merge
+#                               a.json,b.json (общий отчёт без вызовов модели)
 APP="app.py"
 case "${1:-}" in
     "")        APP="app.py" ;;
@@ -46,8 +55,9 @@ case "${1:-}" in
     rag-eval)  APP="rag_eval.py" ;;
     rag-dialog) APP="rag_dialog.py" ;;
     local)     APP="local_llm.py" ;;
+    rag-compare) APP="rag_compare.py" ;;
     *)
-        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера], ./run.sh index [аргументы индекса], ./run.sh rag-eval [аргументы прогона], ./run.sh rag-dialog [аргументы прогона] или ./run.sh local [аргументы прогона]" >&2
+        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера], ./run.sh index [аргументы индекса], ./run.sh rag-eval [аргументы прогона], ./run.sh rag-dialog [аргументы прогона], ./run.sh local [аргументы прогона] или ./run.sh rag-compare [аргументы прогона]" >&2
         exit 1
         ;;
 esac
@@ -78,6 +88,13 @@ if [ "$APP" = "local_llm.py" ]; then
     # Локальной модели ключ не нужен (api_key_env=None): LLM отвечает LM Studio
     # на этой машине. Поэтому src/.env здесь не проверяется, как у index.
     exec python local_llm.py "${@:2}"
+fi
+
+if [ "$APP" = "rag_compare.py" ]; then
+    # Ключ нужен только колонке DeepSeek («Базовый»), и проверяет его сама
+    # программа (отказ до вызова модели); локальной колонке и --merge ключ не
+    # нужен. Поэтому src/.env здесь не проверяется, как у local.
+    exec python rag_compare.py "${@:2}"
 fi
 
 if [ ! -f ".env" ]; then

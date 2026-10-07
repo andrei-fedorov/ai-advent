@@ -291,6 +291,10 @@ class AgentConfig:
     thinking: bool = False             # → extra_body={"thinking": {"type": ...}}
     temperature: float | None = None
     top_p: float | None = None
+    # Стандартный параметр OpenAI (день 28). `None` — не передаётся; `"none"`
+    # выключает рассуждение у модели, которая рассуждает сама (Bonsai-27B в
+    # LM Studio: `thinking` и `chat_template_kwargs` сервер игнорирует).
+    reasoning_effort: str | None = None
     max_tokens: int | None = None
     stop: list[str] | None = None
     keep_history: bool = True          # ведёт ли агент стек сообщений между вызовами
@@ -3608,7 +3612,10 @@ class Agent:
         переписывание запроса давали от прогона к прогону разное, и поиск то
         находил раздел, то нет); `None` — не передаётся, как на днях 9-24.
         Модель — из конфига агента: отдельной модели под служебные работы нет
-        (правило дня 9).
+        (правило дня 9). Рассуждение у служебных вызовов выключено и
+        `thinking`, и, если задано в конфиге, `reasoning_effort` — по той же
+        причине дня 9 (день 28: у Bonsai-27B без поля переписывание с потолком
+        200 токенов обрывалось бы рассуждением).
 
         Исключение API пробрасывается вызывающему: что сбой значит для
         памяти, знает работа вокруг вызова, а не вызов.
@@ -3622,6 +3629,11 @@ class Agent:
             **(
                 {"temperature": self._config.service_temperature}
                 if self._config.service_temperature is not None
+                else {}
+            ),
+            **(
+                {"reasoning_effort": self._config.reasoning_effort}
+                if self._config.reasoning_effort is not None
                 else {}
             ),
         )
@@ -4934,6 +4946,7 @@ class Agent:
         params = {
             "temperature": self._config.temperature,
             "top_p": self._config.top_p,
+            "reasoning_effort": self._config.reasoning_effort,
             "max_tokens": self._config.max_tokens,
             "stop": self._config.stop,
         }
