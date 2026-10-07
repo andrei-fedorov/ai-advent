@@ -319,11 +319,16 @@ def check_server(base_url: str) -> local_server.ServerCheck:
         )
         sys.exit(2)
     if status == local_server.STATUS_SEVERAL:
-        logger.warning(
-            "загружено несколько моделей (%s): что LM Studio берёт для запроса без id, не проверялось — "
-            "держите загруженной одну LLM", ", ".join(model.id for model in check.loaded),
+        # Отказ, а не предупреждение (день 28, прогон автора): при двух
+        # загруженных экземплярах LM Studio на заглушку `local` отвечает 400
+        # «Invalid model identifier» — не прошёл бы ни один запрос.
+        logger.error(
+            "загружено несколько моделей (%s): на запрос с заглушкой `%s` LM Studio отвечает 400 — оставьте "
+            "загруженной одну LLM (lms ps, lms unload <id>); прогон отменён, модель не вызывалась",
+            ", ".join(model.id for model in check.loaded), presets.LOCAL_MODEL_ALIAS,
         )
-    elif status == local_server.STATUS_UNKNOWN:
+        sys.exit(2)
+    if status == local_server.STATUS_UNKNOWN:
         logger.warning("сервер отвечает, но не сообщает, какая модель загружена — ответившая модель будет "
                        "взята из ответов API")
     else:
