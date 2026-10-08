@@ -19,7 +19,20 @@
 # `rag_answer.py`). Состояние сервера (`ServerCheck.status`) и подписи модели
 # определены здесь один раз: блок дня и программа решают по ним, а не по тексту
 # ошибки и не своими копиями (правка по ревью).
+#
+# День 29 — память процесса модели (`footprint_mb()`, `server_memory_mb()`):
+# сколько занимает процесс, в котором LM Studio держит модель. Мера — вывод
+# `footprint` (macOS), а не RSS: на Apple Silicon память видеокарты общая с
+# системной, RSS её не видит, а `footprint` включает регион «IOAccelerator
+# (graphics)» — у 4-битной Qwen3.5-2B в покое это 1,7 ГБ из 2,4 ГБ. Путь процесса
+# LM Studio модуль не знает: шаблон `pgrep -f` приходит параметром из
+# `presets.py`. Только чтение — `pgrep` и `footprint`, без сигналов и записи в
+# чужой процесс; без исключений, как `check()`: нет программы, не macOS, нет
+# процесса, вывод не разобран — `None`. Только стандартная библиотека и `httpx`
+# — лист графа остаётся листом.
 
+import re
+import subprocess
 import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
@@ -29,6 +42,13 @@ import httpx
 # Тип записи REST LM Studio, который не считается языковой моделью.
 _EMBEDDINGS = "embeddings"
 _LOADED = "loaded"
+
+# Потолок одного запуска `footprint` и `pgrep`, секунды: обычно — десятые доли.
+FOOTPRINT_TIMEOUT_S = 5
+
+# «node [58260]: 64-bit    Footprint: 2364 MB (16384 bytes per page)».
+_FOOTPRINT_LINE = re.compile(r"Footprint:\s*([\d.,]+)\s*([KMG]B)\b")
+_UNIT_MB = {"KB": 1 / 1024, "MB": 1.0, "GB": 1024.0}
 
 # Состояние сервера (`ServerCheck.status`): по нему блок дня выбирает строку
 # статуса, а программа — отказ или предупреждение.
@@ -218,3 +238,43 @@ def check(base_url: str, timeout_s: float) -> ServerCheck:
             False, base, time.perf_counter() - started, f"{type(exc).__name__}: {exc}"
         )
     return ServerCheck(True, base, time.perf_counter() - started, "", models, extended)
+
+
+def _run(args: list[str]) -> str | None:
+    """Вывод программы; не запустилась, таймаут — `None`. Ненулевой код выхода
+    не сбой: у `pgrep` это «никого не нашёл» — разбирает вызывающий."""
+    try:
+        done = subprocess.run(args, capture_output=True, text=True, timeout=FOOTPRINT_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return done.stdout
+
+
+def footprint_mb(pid: int) -> float | None:
+    """Память процесса по `footprint <pid>` (macOS), МБ — с памятью видеокарты.
+    Нет программы, не macOS, нет процесса, не разобрано — `None`."""
+    try:
+        output = _run(["footprint", str(int(pid))])
+    except Exception:  # noqa: BLE001 — контракт модуля: без исключений
+        return None
+    match = _FOOTPRINT_LINE.search(output or "")
+    if match is None:
+        return None
+    try:
+        value = float(match.group(1).replace(",", "."))
+    except ValueError:
+        return None
+    return value * _UNIT_MB[match.group(2)]
+
+
+def server_memory_mb(pattern: str) -> float | None:
+    """Наибольший `footprint_mb()` среди процессов `pgrep -f <pattern>`: у LM
+    Studio процессов с одним путём несколько (служебный и с моделью), модель —
+    в самом большом. Никого не нашёл или ни один не измерен — `None`."""
+    try:
+        output = _run(["pgrep", "-f", pattern]) if pattern else None
+        pids = [int(line) for line in (output or "").split() if line.isdigit()]
+        values = [value for value in (footprint_mb(pid) for pid in pids) if value is not None]
+    except Exception:  # noqa: BLE001 — контракт модуля: без исключений
+        return None
+    return max(values) if values else None

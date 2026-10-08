@@ -33,6 +33,15 @@
 # (ход `ok=False` или исключение), 2 — отказ до вызова модели, 130 — Ctrl+C; при
 # 1 и 130 отчёт пишется по пройденному (правила `local_llm.py`). Сессий на диск
 # программа не пишет, индекс только читает, модели поиска из сети не качает.
+#
+# День 29 — **ресурсы**: память процесса модели LM Studio (перед первым ходом
+# колонки и пик) и пик памяти самой программы (e5 и реранкер), отсчётами раз в
+# `presets.LOCAL_MEMORY_SAMPLE_S` в потоке-демоне на колонку
+# (`MemorySampler`). Меряет `local_server.footprint_mb()` / `server_memory_mb()`
+# — только чтение, без сигналов; не нашли процесс — «н/д», прогон не
+# отменяется. Квантование и формат загруженной модели — из
+# `local_server.check()`, в условиях и разделе «Ресурсы». JSON дня 28 без поля
+# `memory` читаются: строки раздела — «н/д».
 
 import argparse
 import dataclasses
@@ -41,11 +50,13 @@ import logging
 import os
 import statistics
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
 import agent
 import local_llm
+import local_server
 import presets
 import rag_answer
 import rag_eval
@@ -228,7 +239,69 @@ def make_column(config: agent.AgentConfig, override: float | None, started: date
         "reasoning_effort": config.reasoning_effort, "thinking": config.thinking,
         "texts": presets.rag_texts_label(config.name), "model_param": config.model, "server": None,
         "started": f"{started:%Y-%m-%d %H:%M:%S}", "built_at": index.get("built_at", ""), "models": [],
+        "memory": None,
     }
+
+
+# --- Память (день 29) -----------------------------------------------------------
+
+class MemorySampler:
+    """Отсчёты памяти одной колонки (спецификация дня 29, §5.2): поток-демон раз
+    в `step_s` снимает `footprint` процесса модели LM Studio (только у локальной
+    колонки — `pattern` не пуст) и своего процесса. Только читает память — в
+    агента не лезет. `start()` — перед первым ходом колонки (отсчёт «в покое»),
+    `stop()` — после последнего, в том числе при Ctrl+C и сбое."""
+
+    def __init__(self, pattern: str | None, step_s: float) -> None:
+        self.pattern = pattern
+        self.step_s = step_s
+        self.server_idle: float | None = None
+        self.server_peak: float | None = None
+        self.program_peak: float | None = None
+        self.samples = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _sample(self, server: float | None = None) -> None:
+        if self.pattern and server is None:
+            server = local_server.server_memory_mb(self.pattern)
+        program = local_server.footprint_mb(os.getpid())
+        if server is not None:
+            self.server_peak = server if self.server_peak is None else max(self.server_peak, server)
+        if program is not None:
+            self.program_peak = program if self.program_peak is None else max(self.program_peak, program)
+        self.samples += 1
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.step_s):
+            self._sample()
+
+    def start(self) -> None:
+        if self.pattern:
+            self.server_idle = local_server.server_memory_mb(self.pattern)
+        self._sample(self.server_idle)
+        self._thread = threading.Thread(target=self._run, name="rag-compare-memory", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            # Отсчёт в работе кончится сам: у `footprint` и `pgrep` свой потолок.
+            self._thread.join(timeout=3 * local_server.FOOTPRINT_TIMEOUT_S)
+
+    def as_dict(self) -> dict:
+        return {
+            "server_idle_mb": self.server_idle, "server_peak_mb": self.server_peak,
+            "program_peak_mb": self.program_peak, "samples": self.samples, "sample_s": self.step_s,
+        }
+
+
+def mb(value: float | None) -> str:
+    return "н/д" if value is None else whole(value)
+
+
+def _mb_unit(value: float | None) -> str:
+    return "н/д" if value is None else f"{whole(value)} МБ"
 
 
 def finalize_columns(columns: list[dict], records: list[dict]) -> None:
@@ -460,7 +533,8 @@ def conditions(data: Data) -> list[str]:
         server = column.get("server")
         if server:
             line += " · загружено на старте прогона: " + (
-                ", ".join(f"`{m['id']}`" + (f" ({m['context']})" if m["context"] else "") for m in server["models"])
+                ", ".join(f"`{m['id']}`" + (f" ({model_details(m)})" if model_details(m) else "")
+                          for m in server["models"])
                 or "сервер не сообщил"
             )
         out.append(line)
@@ -483,6 +557,66 @@ def conditions(data: Data) -> list[str]:
     return out
 
 
+def model_details(model: dict) -> str:
+    """«MLX · 4bit · контекст 132 096 из 262 144» — что знает запись модели
+    колонки; у записей дня 28 формата и квантования нет."""
+    parts = [(model.get("format") or "").upper(), model.get("quantization") or "", model.get("context") or ""]
+    return " · ".join(part for part in parts if part)
+
+
+def resources_section(data: Data) -> list[str]:
+    """Раздел «Ресурсы» (день 29, §5.2): по колонкам — память на прогон колонки,
+    а не на режим."""
+    out = ["## 4. Ресурсы", ""]
+    if not data.columns:
+        return out + ["Колонок нет.", ""]
+    step = next((c["memory"]["sample_s"] for c in data.columns if c.get("memory")), presets.LOCAL_MEMORY_SAMPLE_S)
+
+    def started_model(column: dict) -> str:
+        server = column.get("server")
+        if not server:
+            return "— (облако)" if column["base_url"] != presets.LOCAL_BASE_URL else "н/д"
+        return "<br>".join(f"`{m['id']}`" + (f" · {model_details(m)}" if model_details(m) else "")
+                           for m in server["models"]) or "сервер не сообщил"
+
+    def server_memory(column: dict) -> str:
+        memory = column.get("memory")
+        if not memory:
+            return "н/д — в записях нет"
+        if not column.get("server") and column["base_url"] != presets.LOCAL_BASE_URL:
+            return "— (облако)"
+        return f"{mb(memory['server_idle_mb'])} / {mb(memory['server_peak_mb'])}"
+
+    def program_memory(column: dict) -> str:
+        memory = column.get("memory")
+        return mb(memory["program_peak_mb"]) if memory else "н/д — в записях нет"
+
+    def samples(column: dict) -> str:
+        memory = column.get("memory")
+        return f"{memory['samples']} · раз в {memory['sample_s']:g} с" if memory else "н/д"
+
+    rows = (
+        ("модель на старте: id · формат · квантование · контекст", started_model),
+        ("память процесса модели LM Studio, МБ: перед первым ходом / пик", server_memory),
+        ("память программы (поиск: e5 и реранкер), пик, МБ", program_memory),
+        ("отсчётов и шаг", samples),
+    )
+    out += [
+        "| показатель | " + " | ".join(cell(column_label(c)) for c in data.columns) + " |",
+        "| --- | " + " | ".join("---" for _ in data.columns) + " |",
+    ]
+    for label, fn in rows:
+        out.append(f"| {label} | " + " | ".join(cell(fn(c)) for c in data.columns) + " |")
+    out += [
+        "",
+        f"`footprint` (macOS) — с памятью видеокарты; пик — по отсчётам раз в {step:g} с, короткий всплеск может не "
+        "попасть; у облачной колонки памяти модели нет; время загрузки модели программа не меряет — его пишет "
+        "человек.",
+        "",
+    ]
+    return out
+
+
 def metric_table(data: Data, rows_fn) -> list[str]:
     """Таблица «показатель × (колонка, режим)»; `rows_fn(records)` — пары
     (показатель, значение) по записям пары."""
@@ -500,7 +634,7 @@ def metric_table(data: Data, rows_fn) -> list[str]:
 
 
 def stability_section(data: Data) -> list[str]:
-    out = ["## 4. Стабильность", ""]
+    out = ["## 5. Стабильность", ""]
     if data.repeats < 2:
         out += ["Повторов меньше двух: стабильность не измеряется (`--repeat` ≥ 2).", ""]
     summary = {pair: stability_summary(data, pair[0], pair[1]) for pair in data.pairs}
@@ -549,7 +683,7 @@ def stability_section(data: Data) -> list[str]:
 
 
 def by_question_section(data: Data) -> list[str]:
-    out = ["## 5. По вопросам", "",
+    out = ["## 6. По вопросам", "",
            "Первая ячейка колонки — вид ответа, нарушений, медиана времени, стабильность; вторая — «смысл (автор)», "
            "её заполняет автор.", ""]
     columns = sorted({col for col, _ in data.pairs})
@@ -587,7 +721,7 @@ def by_question_section(data: Data) -> list[str]:
 
 
 def answers_section(data: Data) -> list[str]:
-    out = ["## 6. Ответы", "",
+    out = ["## 7. Ответы", "",
            "Собранный ответ (`AgentReply.text`) каждого различающегося ответа с кратностью, строка метрик и, в "
            "`полном`, запрос поиска. Различие — по тексту модели после схлопывания пробелов.", ""]
     for question in data.questions:
@@ -625,7 +759,7 @@ def answers_section(data: Data) -> list[str]:
 
 
 def build_report(data: Data) -> str:
-    out = ["# Сравнение локальной и облачной модели: RAG, качество, скорость, стабильность (день 28)", ""]
+    out = ["# Сравнение моделей в RAG: качество, скорость, ресурсы, стабильность (дни 28–29)", ""]
     for note in data.interrupted:
         out += [f"**Прервано:** {note}", ""]
     out += conditions(data)
@@ -635,6 +769,7 @@ def build_report(data: Data) -> str:
             "относятся к поиску, а не к модели: в `фильтре` у колонок они совпадают — это проверка стенда.", "",
             *metric_table(data, quality_rows)]
     out += ["## 3. Скорость", "", *metric_table(data, speed_rows)]
+    out += resources_section(data)
     out += stability_section(data)
     out += by_question_section(data)
     out += answers_section(data)
@@ -645,7 +780,8 @@ def print_summaries(report: str) -> None:
     for title, start, stop in (
         ("Качество (форма)", "## 2. Качество (форма)", "## 3. "),
         ("Скорость", "## 3. Скорость", "## 4. "),
-        ("Стабильность", "## 4. Стабильность", "По вопросам:"),
+        ("Ресурсы", "## 4. Ресурсы", "## 5. "),
+        ("Стабильность", "## 5. Стабильность", "По вопросам:"),
     ):
         print()
         print(title + report.partition(start)[2].partition(stop)[0].rstrip())
@@ -817,23 +953,55 @@ def run_turn(question: dict, mode: rag_eval.Mode, config: agent.AgentConfig,
 
 
 def run_all(configs: list[agent.AgentConfig], questions: list[dict], modes: list[rag_eval.Mode], repeat: int,
-            index: rag_search.RulesIndex, records: list[dict]) -> str | None:
+            index: rag_search.RulesIndex, records: list[dict], columns: list[dict]) -> str | None:
     """Ходы всех колонок в порядке §5.1 — повтор за повтором; записи дописываются
     в `records` (при Ctrl+C пройденное остаётся у вызывающего). Возвращает
-    причину остановки на первом сбое хода, `None` — все ходы удались."""
+    причину остановки на первом сбое хода, `None` — все ходы удались. Память
+    колонки (день 29) пишется в `columns[номер]["memory"]` и при прерывании — по
+    пройденному."""
     for number, config in enumerate(configs):
         logger.info("колонка %d из %d: пресет «%s» · %s", number + 1, len(configs), config.name, config.base_url)
-        for attempt in range(1, repeat + 1):
-            for question in questions:
-                for mode in modes:
-                    run = run_turn(question, mode, config, index)
-                    record = make_record(number, question, mode, attempt, run)
-                    records.append(record)
-                    log_record(config, question, mode, attempt, repeat, record)
-                    reason = failure(record)
-                    if reason is not None:
-                        logger.error("сбой — пишу отчёт по пройденному")
-                        return f"{config.name} · {question['id']} · {mode.key} · повтор {attempt}: {reason}"
+        # Шаблон читается при запуске колонки, а не при импорте: проверка «н/д»
+        # (§13, п. 8) перекрывает его из REPL.
+        local = config.base_url == presets.LOCAL_BASE_URL
+        sampler = MemorySampler(presets.LOCAL_SERVER_PROCESS if local else None, presets.LOCAL_MEMORY_SAMPLE_S)
+        sampler.start()
+        if local:
+            if sampler.server_idle is None:
+                logger.info("память процесса модели: н/д — процесс LM Studio не найден по шаблону «%s»",
+                            presets.LOCAL_SERVER_PROCESS)
+            else:
+                logger.info("память процесса модели: %s МБ", whole(sampler.server_idle))
+        try:
+            reason = _run_column(number, config, questions, modes, repeat, index, records)
+        finally:
+            sampler.stop()
+            columns[number]["memory"] = sampler.as_dict()
+            logger.info(
+                "колонка %d: пик памяти процесса модели %s · программы %s · отсчётов %d", number + 1,
+                _mb_unit(sampler.server_peak) if local else "— (облако)", _mb_unit(sampler.program_peak),
+                sampler.samples,
+            )
+        if reason is not None:
+            return reason
+    return None
+
+
+def _run_column(number: int, config: agent.AgentConfig, questions: list[dict], modes: list[rag_eval.Mode],
+                repeat: int, index: rag_search.RulesIndex, records: list[dict]) -> str | None:
+    """Ходы одной колонки — повтор за повтором; причина остановки на первом
+    сбое, `None` — все удались."""
+    for attempt in range(1, repeat + 1):
+        for question in questions:
+            for mode in modes:
+                run = run_turn(question, mode, config, index)
+                record = make_record(number, question, mode, attempt, run)
+                records.append(record)
+                log_record(config, question, mode, attempt, repeat, record)
+                reason = failure(record)
+                if reason is not None:
+                    logger.error("сбой — пишу отчёт по пройденному")
+                    return f"{config.name} · {question['id']} · {mode.key} · повтор {attempt}: {reason}"
     return None
 
 
@@ -911,7 +1079,9 @@ def main() -> None:
         if config.base_url == presets.LOCAL_BASE_URL:
             check = local_llm.check_server(config.base_url)
             column["server"] = {"models": [
-                {"id": model.id, "context": model.context_text or ""} for model in check.loaded
+                {"id": model.id, "context": model.context_text or "", "format": model.format,
+                 "quantization": model.quantization}
+                for model in check.loaded
             ]}
         elif config.api_key_env is not None and not os.environ.get(config.api_key_env):
             _refuse(f"нет ключа {config.api_key_env} в src/.env — прогон отменён, модель не вызывалась")
@@ -927,7 +1097,7 @@ def main() -> None:
 
     records: list[dict] = []
     try:
-        interrupted = run_all(configs, questions, modes, repeat, index, records)
+        interrupted = run_all(configs, questions, modes, repeat, index, records, columns)
         code = 0 if interrupted is None else 1
     except KeyboardInterrupt:
         interrupted, code = _passed(records), 130
