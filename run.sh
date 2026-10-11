@@ -46,6 +46,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")/src"
 #                               после lms load): --presets, --modes, --repeat,
 #                               --only, --temperature, --db, --out, --merge
 #                               a.json,b.json (общий отчёт без вызовов модели)
+#   ./run.sh service [...]    — локальная модель как приватный сервис (день 30):
+#                               OpenAI-совместимый прокси перед LM Studio и
+#                               страница чата на http://<адрес Mac>:8800; ключи
+#                               клиентов — TOOMANYRULES_SERVICE_KEYS в src/.env;
+#                               --host, --port, --upstream <адрес LM Studio>,
+#                               --new-key (напечатать новый ключ и выйти)
+#   ./run.sh service-load [...] — проверка стабильности сервиса (день 30): ключ,
+#                               окно модели, параллельные запросы, лимит; отчёт
+#                               Markdown в src/data/service/: --url, --scenarios,
+#                               --requests N, --clients a,b, --out <файл.md>
 APP="app.py"
 case "${1:-}" in
     "")        APP="app.py" ;;
@@ -56,8 +66,10 @@ case "${1:-}" in
     rag-dialog) APP="rag_dialog.py" ;;
     local)     APP="local_llm.py" ;;
     rag-compare) APP="rag_compare.py" ;;
+    service)   APP="llm_service.py" ;;
+    service-load) APP="service_load.py" ;;
     *)
-        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера], ./run.sh index [аргументы индекса], ./run.sh rag-eval [аргументы прогона], ./run.sh rag-dialog [аргументы прогона], ./run.sh local [аргументы прогона] или ./run.sh rag-compare [аргументы прогона]" >&2
+        echo "Неизвестный аргумент: $1. Допустимо: ./run.sh, ./run.sh week1, ./run.sh faq-watch [аргументы сервера], ./run.sh index [аргументы индекса], ./run.sh rag-eval [аргументы прогона], ./run.sh rag-dialog [аргументы прогона], ./run.sh local [аргументы прогона], ./run.sh rag-compare [аргументы прогона], ./run.sh service [аргументы сервиса] или ./run.sh service-load [аргументы прогона]" >&2
         exit 1
         ;;
 esac
@@ -95,6 +107,14 @@ if [ "$APP" = "rag_compare.py" ]; then
     # программа (отказ до вызова модели); локальной колонке и --merge ключ не
     # нужен. Поэтому src/.env здесь не проверяется, как у local.
     exec python rag_compare.py "${@:2}"
+fi
+
+if [ "$APP" = "llm_service.py" ] || [ "$APP" = "service_load.py" ]; then
+    # Сервису и программе нагрузки ключ DeepSeek не нужен: модель — LM Studio
+    # на этой машине. Свои ключи клиентов (TOOMANYRULES_SERVICE_KEYS) они
+    # проверяют сами и отказывают с подсказкой, поэтому src/.env здесь не
+    # проверяется, как у local.
+    exec python "$APP" "${@:2}"
 fi
 
 if [ ! -f ".env" ]; then

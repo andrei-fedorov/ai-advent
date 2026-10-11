@@ -30,6 +30,12 @@
 # чужой процесс; без исключений, как `check()`: нет программы, не macOS, нет
 # процесса, вывод не разобран — `None`. Только стандартная библиотека и `httpx`
 # — лист графа остаётся листом.
+#
+# День 30 — ключ: `check(..., api_key=…)` ставит заголовок `Authorization: Bearer`
+# обоим запросам. Так проверка идёт и через сервис дня 30 (`llm_service.py`),
+# который пускает только по ключу и отдаёт оба адреса LM Studio как есть; без
+# ключа сервис отвечает 401 — это «сбой» с текстом ошибки. Разбор ответов не
+# менялся. LM Studio ключ не проверяет, поэтому без сервиса ключ не нужен.
 
 import re
 import subprocess
@@ -160,13 +166,25 @@ def _rows(payload: object) -> list[dict]:
     return [row for row in payload["data"] if isinstance(row, dict) and isinstance(row.get("id"), str)]
 
 
+def _error_message(response: httpx.Response) -> str:
+    """« — <текст>» из тела `{"error": {"message": …}}` (форма OpenAI API);
+    другого тела — пусто."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    message = error.get("message") if isinstance(error, dict) else error
+    return f" — {message}" if isinstance(message, str) and message else ""
+
+
 def _get_json(client: httpx.Client, url: str) -> object:
     response = client.get(url)
     response.raise_for_status()
     return response.json()
 
 
-def check(base_url: str, timeout_s: float) -> ServerCheck:
+def check(base_url: str, timeout_s: float, api_key: str | None = None) -> ServerCheck:
     """Спросить сервер, какие модели у него есть и какая загружена.
 
     Без исключений: сбой — `ok=False` с причиной. Нет ответа на `/models` —
@@ -174,12 +192,14 @@ def check(base_url: str, timeout_s: float) -> ServerCheck:
     таймаута, текст ошибки для остального; ответ не JSON или JSON без списка
     `data` — тоже сбой (на порту не OpenAI-совместимый сервер). REST LM Studio,
     которого нет (404, не JSON, иной сбой), — не сбой: `extended=False`, модели
-    из первого ответа, `state` = `None`.
+    из первого ответа, `state` = `None`. `api_key` (день 30) — заголовок
+    `Authorization: Bearer` у обоих запросов; `None` — без заголовка.
     """
     base = base_url.rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     started = time.perf_counter()
     try:
-        with httpx.Client(timeout=timeout_s) as client:
+        with httpx.Client(timeout=timeout_s, headers=headers) as client:
             try:
                 listing = _get_json(client, f"{base}/models")
             except (httpx.ConnectError, httpx.TimeoutException):
@@ -191,8 +211,16 @@ def check(base_url: str, timeout_s: float) -> ServerCheck:
                     False, base, time.perf_counter() - started,
                     f"сервер не отвечает по {base}", no_answer=True,
                 )
+            except httpx.HTTPStatusError as exc:
+                # Ответ с ошибкой. Текст ошибки в форме OpenAI API (у сервиса дня
+                # 30 — «Нет доступа: …») дописывается: по нему видно, что не так.
+                return ServerCheck(
+                    False, base, time.perf_counter() - started,
+                    f"{exc.response.status_code} {exc.response.reason_phrase} на {base}/models"
+                    f"{_error_message(exc.response)}",
+                )
             except (httpx.HTTPError, ValueError) as exc:
-                # HTTPStatusError, иной транспортный сбой или ответ не JSON.
+                # Иной транспортный сбой или ответ не JSON.
                 return ServerCheck(
                     False, base, time.perf_counter() - started,
                     f"{type(exc).__name__}: {exc}",

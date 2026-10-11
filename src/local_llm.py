@@ -302,8 +302,10 @@ def _args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def check_server(base_url: str) -> local_server.ServerCheck:
     """Проверка сервера до вопросов (§5, п. 2): отказ — `sys.exit(2)`, остальное —
-    предупреждения. Состояние — `ServerCheck.status`, то же, что у блока дня."""
-    check = local_server.check(base_url, presets.LOCAL_CHECK_TIMEOUT_S)
+    предупреждения. Состояние — `ServerCheck.status`, то же, что у блока дня. С дня
+    30 — с ключом `presets.local_api_key()` (сервис дня 30 пускает только по
+    ключу; без переменной — без ключа, как раньше). Её же зовёт `rag_compare.py`."""
+    check = local_server.check(base_url, presets.LOCAL_CHECK_TIMEOUT_S, presets.local_api_key())
     status = check.status
     if status in (local_server.STATUS_NO_ANSWER, local_server.STATUS_FAILED):
         # Подсказка — только серверу, который не запущен: чужому сервису на

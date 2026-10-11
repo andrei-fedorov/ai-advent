@@ -6,3 +6,5 @@ httpx>=0.28
 pymupdf>=1.26
 sentence-transformers>=5
 numpy>=2
+fastapi>=0.110
+uvicorn>=0.30
