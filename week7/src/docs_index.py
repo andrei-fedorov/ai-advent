@@ -174,6 +174,10 @@ def main():
         previous = read_index(args.db) if args.db.exists() else None
         if args.probe and previous is None:
             raise IndexInvalid("индекс не найден — ./week7/run.sh index")
+        temporary = args.db.with_name(args.db.name + ".tmp")
+        if not args.probe and temporary.exists():
+            raise ValueError(f"есть временный файл {temporary} — идёт другая сборка или прежняя "
+                             "была прервана; если индексатор не запущен, удалите этот файл")
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         log(f"отказ: {exc}")
         return 2

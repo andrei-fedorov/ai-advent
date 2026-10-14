@@ -57,15 +57,18 @@ def corpus_files(repo: Path, globs, exclude=()) -> tuple[list[Path], list[str]]:
     warnings = []
     for pattern in globs:
         matches = []
+        excluded = False
         for path in repo.glob(pattern):
             if path.name in {"AGENTS.md", "CLAUDE.md"} or not path.is_file():
                 continue
             if not path.resolve().is_relative_to(repo.resolve()):
                 continue
             if any(fnmatch.fnmatch(path.relative_to(repo).as_posix(), rule) for rule in exclude):
+                excluded = True
                 continue
             matches.append(path)
-        if not matches:
+        # Шаблон, чьи файлы целиком сняты DOCS_EXCLUDE, — осознанное решение, не пропажа.
+        if not matches and not excluded:
             warnings.append(f"шаблон {pattern} не нашёл файлов")
         found.update(matches)
     return sorted(found), warnings

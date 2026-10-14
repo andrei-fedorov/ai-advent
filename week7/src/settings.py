@@ -10,7 +10,8 @@ DATA_DIR = WEEK7_DIR / "data"
 MODELS_DIR = Path(os.environ.get("DEVHELP_MODELS_DIR", DATA_DIR / "models")).expanduser().resolve()
 INDEX_DB = DATA_DIR / "docs_index.sqlite3"
 DOCS_GLOBS = ("README.md", "docs/*.md", "week7/README.md", "week7/docs/*.md")
-DOCS_EXCLUDE = ()
+# Спецификации недели 7 содержат пробные вопросы и ожидания: на В8 они заняли #1–#4.
+DOCS_EXCLUDE = ("week7/docs/*",)
 CURRENT_DOCS = ("README.md", "week7/README.md", "docs/TooManyRules — архитектура кода.md")
 EMBED_MODEL = "intfloat/multilingual-e5-base"
 RERANK_MODEL = "BAAI/bge-reranker-v2-m3-int8"
