@@ -1,0 +1,16 @@
+[project]
+name = "ai-advent-week7"
+version = "0.1.0"
+description = "Ассистент разработчика: документация и контекст git"
+requires-python = ">=3.14"
+dependencies = [
+    "fastembed>=0.9",
+    "numpy>=2",
+    "openai>=2",
+    "mcp>=2.2,<3",
+    "python-dotenv>=1",
+    "anyio>=4",
+]
+
+[tool.uv]
+package = false
