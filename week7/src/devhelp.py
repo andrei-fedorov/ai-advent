@@ -34,7 +34,7 @@ def cited_numbers(text) -> list[int]:
         for item in re.split(r"\s*[,;]\s*", group):
             bounds = [int(number) for number in re.split(r"\s*[–—-]\s*", item)]
             low, high = bounds[0], bounds[-1]
-            numbers.update(range(low, high + 1) if 0 <= high - low <= 20 else bounds)
+            numbers.update(range(low, high) if 0 <= high - low <= 20 else bounds)
     return sorted(numbers)
 
 
