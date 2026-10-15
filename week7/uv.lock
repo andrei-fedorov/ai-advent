@@ -13,6 +13,8 @@ dependencies = [
     { name = "numpy" },
     { name = "openai" },
     { name = "python-dotenv" },
+    { name = "starlette" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
@@ -23,6 +25,8 @@ requires-dist = [
     { name = "numpy", specifier = ">=2" },
     { name = "openai", specifier = ">=2" },
     { name = "python-dotenv", specifier = ">=1" },
+    { name = "starlette", specifier = ">=1.8" },
+    { name = "uvicorn", specifier = ">=0.54" },
 ]
 
 [[package]]

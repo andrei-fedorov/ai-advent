@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TooManyRules — поддержка</title>
+<style>
+:root{color-scheme:light;--ink:#182d34;--muted:#536a70;--line:#cedbd8;--green:#176552;--paper:#fffefa;--wash:#eef3ef}
+*{box-sizing:border-box}body{margin:0;background:var(--wash);color:var(--ink);font:16px/1.45 system-ui,sans-serif}header{padding:22px 28px;background:var(--ink);color:white;display:flex;justify-content:space-between;align-items:center;gap:16px}h1{font-size:24px;margin:0;font-weight:650;letter-spacing:-.6px}header p{margin:4px 0 0;color:#bed3cc;font-size:14px}.badge{border:1px solid #6f8e83;border-radius:20px;padding:5px 12px;font-size:13px;white-space:nowrap}main{padding:20px;display:grid;grid-template-columns:260px minmax(290px,1fr) minmax(430px,1.4fr);gap:16px;max-width:1800px;margin:auto}.panel{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:18px;min-width:0}h2{margin:0 0 14px;font-size:19px}h3{font-size:15px;margin:12px 0 6px}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}button,select,textarea{font:inherit}button,select{border:1px solid var(--line);border-radius:7px;background:white;color:var(--ink);padding:8px 10px}button{cursor:pointer}button:hover{border-color:var(--green)}button:disabled{cursor:wait;opacity:.55}.primary{background:var(--green);color:white;border-color:var(--green);font-weight:600}.ticket-button{display:block;width:100%;text-align:left;margin:8px 0;padding:12px;border-left:3px solid transparent}.ticket-button.selected{border-left-color:var(--green);background:#eaf3eb}.ticket-button span{display:block}.small,small{font-size:13px;color:var(--muted)}#tickets{max-height:570px;overflow:auto}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.5 ui-monospace,monospace;margin:0}#ticket{max-height:490px;overflow:auto}details{border-top:1px solid var(--line);padding-top:12px;margin-top:14px}summary{cursor:pointer;font-weight:600}details pre{margin-top:12px;max-height:300px;overflow:auto}textarea{width:100%;resize:vertical;border:1px solid var(--line);border-radius:8px;padding:10px;background:white;color:var(--ink)}#question{height:72px;min-height:60px;font-size:15px}#draft{height:270px;min-height:150px;font-size:17px;line-height:1.55;margin-top:12px}label{display:block;margin-bottom:6px}.error{color:#a42f2b;white-space:pre-wrap;overflow-wrap:anywhere;margin:10px 0;font-size:14px}.warning{color:#845115;white-space:pre-wrap}.source{font-size:13px;margin:6px 0;overflow-wrap:anywhere}#crm,#stats{font-size:13px;color:var(--muted);margin:8px 0;overflow-wrap:anywhere}#health{max-width:1800px;margin:0 auto;padding:0 22px 18px;font-size:13px;color:var(--muted)}:focus-visible{outline:3px solid #b3c9a7;outline-offset:2px}
+@media(max-width:1050px){main{grid-template-columns:1fr}#tickets{max-height:300px}#ticket{max-height:400px}header{align-items:flex-start}.badge{display:none}#draft{height:320px}}
+</style>
+</head>
+<body>
+<header><div><h1>TooManyRules — поддержка</h1><p>Тикет → контекст → черновик ответа</p></div><span class="badge">Локальная страница оператора</span></header>
+<main>
+<section class="panel"><h2>Тикеты</h2><div class="row"><select id="status" aria-label="Статус тикетов"><option value="open">Открытые</option><option value="waiting">Ждут ответа</option><option value="closed">Закрытые</option><option value="all">Все</option></select><button id="refresh" type="button">Обновить</button></div><button id="general" class="ticket-button selected" type="button">Без тикета — общий вопрос о продукте</button><p id="list-error" class="error" role="alert"></p><nav id="tickets" aria-label="Список тикетов"></nav></section>
+<section class="panel"><h2 id="ticket-title">Тикет</h2><p id="ticket-error" class="error" role="alert"></p><pre id="ticket">Общий вопрос: данные CRM не используются</pre><details id="user-details" hidden><summary>Пользователь</summary><pre id="user"></pre></details></section>
+<section class="panel"><h2>Черновик</h2><label for="question">Вопрос</label><textarea id="question" placeholder="вопрос о продукте"></textarea><div class="row"><button id="prepare" class="primary" type="button">Подготовить черновик</button><span id="progress" class="small" role="status"></span></div><p id="answer-error" class="error" role="alert"></p><label for="draft" class="small">Ответ пользователю — проверьте перед отправкой</label><textarea id="draft" aria-label="Черновик ответа"></textarea><div class="row"><button id="copy" type="button">Скопировать</button><span id="copy-status" class="small" role="status"></span></div><h3>Источники</h3><div id="sources"></div><div id="warnings" class="warning small"></div><p id="crm">CRM: тикета нет</p><p id="stats"></p><details><summary>Контекст ответа</summary><pre id="context"></pre></details></section>
+</main><p id="health"></p>
+<script>
+'use strict';
+const el = id => document.getElementById(id);
+const statusNames = {open: 'открыт', waiting: 'ждёт ответа пользователя', closed: 'закрыт'};
+let selected = null, busy = false, selecting = false, selection = 0;
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || `Ошибка ${response.status}`);
+  return data;
+}
+
+function text(id, value) {
+  el(id).textContent = value;
+}
+
+function clearDraft() {
+  el('draft').value = '';
+  for (const id of ['sources', 'warnings', 'stats', 'context', 'answer-error', 'copy-status']) text(id, '');
+  text('crm', selected ? '' : 'CRM: тикета нет');
+}
+
+function controls() {
+  el('prepare').disabled = busy || selecting;
+  el('refresh').disabled = busy;
+  el('status').disabled = busy;
+  for (const button of document.querySelectorAll('.ticket-button')) button.disabled = busy;
+}
+
+function highlight() {
+  for (const button of document.querySelectorAll('.ticket-button')) {
+    button.classList.toggle('selected', button.dataset.id === selected || button.id === 'general' && selected === null);
+  }
+}
+
+async function choose(id) {
+  if (busy) return;
+  // Поздний ответ предыдущего выбора не должен заменить новый тикет.
+  const version = ++selection;
+  selected = id;
+  selecting = !!id;
+  controls();
+  clearDraft();
+  highlight();
+  el('question').value = '';
+  el('question').placeholder = id ? 'пусто — ответ на последнее сообщение пользователя' : 'вопрос о продукте';
+  text('ticket-error', '');
+  text('ticket-title', id ? 'Тикет ' + id : 'Тикет');
+  el('user-details').hidden = true;
+  text('user', '');
+  text('ticket', id ? 'Загрузка…' : 'Общий вопрос: данные CRM не используются');
+  if (!id) return;
+  try {
+    const data = await api('/api/tickets/' + encodeURIComponent(id));
+    if (version !== selection) return;
+    text('ticket', data.ticket);
+    text('user', data.user || data.user_error || 'Данные пользователя недоступны');
+    el('user-details').hidden = false;
+  } catch (error) {
+    if (version === selection) {
+      text('ticket-error', error.message);
+      text('ticket', '');
+    }
+  } finally {
+    if (version === selection) {
+      selecting = false;
+      controls();
+    }
+  }
+}
+
+async function refresh() {
+  text('list-error', '');
+  try {
+    const data = await api('/api/tickets?status=' + encodeURIComponent(el('status').value));
+    el('tickets').replaceChildren();
+    for (const ticket of data.tickets) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'ticket-button';
+      button.dataset.id = ticket.id;
+      const meta = document.createElement('span');
+      meta.className = 'small';
+      meta.textContent = ticket.id + ' · ' + ticket.created.replace('T', ' ');
+      const subject = document.createElement('span');
+      subject.textContent = ticket.subject;
+      const status = document.createElement('span');
+      status.className = 'small';
+      status.textContent = statusNames[ticket.status] || ticket.status;
+      button.append(meta, subject, status);
+      button.addEventListener('click', () => choose(ticket.id));
+      el('tickets').append(button);
+    }
+    highlight();
+    controls();
+  } catch (error) {
+    text('list-error', error.message);
+  }
+}
+
+el('prepare').addEventListener('click', async () => {
+  if (busy || selecting) return;
+  busy = true;
+  controls();
+  text('answer-error', '');
+  const start = Date.now();
+  const tick = () => text('progress', 'готовится… ' + Math.floor((Date.now() - start) / 1000) + ' с');
+  tick();
+  const timer = setInterval(tick, 1000);
+  try {
+    const data = await api('/api/answer', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ticket_id: selected, question: el('question').value})
+    });
+    el('draft').value = data.answer;
+    text('copy-status', '');
+    el('sources').replaceChildren();
+    for (const source of data.sources) {
+      const p = document.createElement('p');
+      p.className = 'source';
+      p.textContent = '[' + source.n + '] ' + source.label;
+      el('sources').append(p);
+    }
+    text('warnings', data.warnings.join('\n'));
+    text('crm', data.crm);
+    text('stats', data.stats);
+    const excerpts = data.excerpts.map(e =>
+      '[' + e.n + '] ' + e.kind + ' · ' + e.label + ' · оценка ' + (e.score ?? '—') + ' · до реранка #' + e.rank
+    ).join('\n\n');
+    const calls = data.tool_calls.map(c =>
+      c.name + ' ' + JSON.stringify(c.arguments) + ' · ' + (c.ok ? 'готово' : 'ошибка')
+    ).join('\n') || 'нет';
+    text('context', 'Вопрос (' + (data.question_from_ticket ? 'из тикета' : 'из поля') + '):\n' + data.question +
+      '\n\nЗапрос поиска:\n' + data.query + '\n\nВыдержки:\n' + excerpts + '\n\nВызовы инструментов моделью:\n' + calls);
+  } catch (error) {
+    // Прежний черновик остаётся доступен для редактирования и копирования.
+    text('answer-error', error.message);
+  } finally {
+    clearInterval(timer);
+    text('progress', '');
+    busy = false;
+    controls();
+  }
+});
+
+el('copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(el('draft').value);
+    text('copy-status', 'Скопировано');
+  } catch {
+    el('draft').focus();
+    el('draft').select();
+    text('copy-status', 'Нажмите Ctrl+C или ⌘C');
+  }
+});
+
+el('refresh').addEventListener('click', refresh);
+el('status').addEventListener('change', refresh);
+el('general').addEventListener('click', () => choose(null));
+refresh();
+api('/api/health').then(data => text('health',
+  'Индекс: ' + data.chunks + ' кусков, FAQ: ' + data.faq_chunks + ' · модель ' + data.model +
+  (data.warnings.length ? ' · ⚠️ ' + data.warnings.join(' · ') : '')
+)).catch(error => text('health', error.message));
+</script>
+</body>
+</html>

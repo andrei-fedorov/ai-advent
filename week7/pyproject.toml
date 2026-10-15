@@ -10,6 +10,8 @@ dependencies = [
     "mcp>=2.2,<3",
     "python-dotenv>=1",
     "anyio>=4",
+    "starlette>=1.8",
+    "uvicorn>=0.54",
 ]
 
 [tool.uv]

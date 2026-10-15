@@ -33,6 +33,8 @@
 - Python 3.14, **`uv`** (`uv sync`, `uv run`; `uv.lock` коммитится).
 - Эмбеддинги и реранкер — **`fastembed`** (ONNX, без `torch`); модели — в `week7/data/models/`, не в кэше Hugging Face автора.
 - LLM — **любой OpenAI-совместимый адрес** через `openai` SDK: `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` в `week7/.env`; по умолчанию DeepSeek `deepseek-flash`.
+- Веб-страница поддержки — Starlette и uvicorn, единственные импорты в `support_web.py`.
+- `demo/` — вымышленные данные CRM в git; `data/` — локальные данные вне git.
 - MCP — SDK v2 (`mcp>=2.2,<3`), API v2: `Client(StdioServerParameters(...))`, `MCPServer`. Примеры из интернета на `ClientSession`/`FastMCP` — это v1.
 - Лицензии моделей и библиотек проверяются: продукт может пойти в компанию (реранкер Jina v2 отклонён на дне 31 — CC BY-NC).
 
@@ -48,6 +50,7 @@
 
 ## Свои прогоны (для Claude и исполнителя)
 
+- Свой сервер `support` запускается со своим `--port`: 8833 может быть занят автором.
 - Данные автора (`week7/data/`, `week7/.env`) не трогать: свой индекс — `--db <свой путь>`, свой ключ — в окружении команды.
 - Индекс правил TooManyRules (`src/data/rag/`), его данные и кэш моделей Hugging Face автора `week7/` не читает и не пишет.
 - Коммиты для проверки ревью — только во временном клоне в `/private/tmp/`, со своими ветками; `--repo` указывает на клон. В рабочем дереве автора не создавать веток и коммитов, не делать push. Реальные вызовы DeepSeek — с разрешения автора.
@@ -59,12 +62,14 @@
 ./week7/run.sh index [--repo <путь>] [--db <путь>] [--full] [--probe]   # день 31: индекс документации
 ./week7/run.sh help  [--repo <путь>] [--db <путь>] ["вопрос"]   # день 31: ассистент разработчика, /help
 ./week7/run.sh review [--repo <путь>] [--db <путь>] [--base main] [--head HEAD] [--out <путь>] # день 32: ревью ветки
+./week7/run.sh support [--repo <путь>] [--db <путь>] [--crm <путь>] [--port <порт>] # день 33: страница оператора
+./week7/run.sh crm-server --crm <путь>                          # день 33: MCP CRM вручную
 ./week7/run.sh git-server --repo <путь>                         # день 31: MCP-сервер git вручную (отладка)
 ```
 
 ## Архитектура кода
 
-Дни 31–32 реализованы по спецификациям в `week7/docs/`. Workflow проекта — `.github/workflows/week7-review.yml`, единственный файл программы недели вне `week7/`; после выноса меняется checkout в workflow проекта. День 31 — по `week7/docs/День 31 спецификация.md`. Программы запускаются как файлы, каталог не публикуется Python-пакетом.
+Дни 31–33 реализованы по спецификациям в `week7/docs/`. Workflow проекта — `.github/workflows/week7-review.yml`, единственный файл программы недели вне `week7/`; после выноса меняется checkout в workflow проекта. День 31 — по `week7/docs/День 31 спецификация.md`. Программы запускаются как файлы, каталог не публикуется Python-пакетом.
 
 | Файл | Роль и зависимости проекта |
 | --- | --- |
@@ -79,7 +84,12 @@
 | `src/llm.py` | Лист: единственный импорт `openai`, параметры аргументами, function calling и лог каждого раунда |
 | `src/mcp_client.py` | Лист: единственный импорт клиента MCP v2, stdio и белый список окружения, ошибки по стадиям |
 | `src/git_server.py` | Отдельная программа без импортов проекта: сервер MCP v2, `git_branch`, `git_status`, `git_log`, `git_diff`, `git_changed_files`, `git_range_diff`, `git_show_file`; фиксированные команды git и `ToolError` |
-| `src/devhelp.py` | → `settings`, `search`, `llm`, `mcp_client`: `.env`, CLI, один MCP-процесс на вопрос, подписи источников и итоговый расход |
+| `src/citations.py` | Лист: номера ссылок, источники и пометки для devhelp и поддержки |
+| `src/crm_server.py` | Отдельная программа: чтение JSON, get_ticket/get_user/find_tickets, без contact |
+| `src/support_web.py` | Лист: Starlette/uvicorn, HTTP, защита и один ответ за раз; обработчики аргументами |
+| `src/support_page.html` | Страница оператора: тикеты, пользователь, редактируемый черновик, только текст |
+| `src/support_desk.py` | → settings, search, llm, mcp_client, citations, support_web: контекст, поиск, черновик |
+| `src/devhelp.py` | → `settings`, `search`, `llm`, `mcp_client`, `citations`: `.env`, CLI, один MCP-процесс на вопрос, подписи источников и итоговый расход |
 
 ```text
 devhelp ──► settings
@@ -89,12 +99,17 @@ devhelp ──► settings
 pr_review ──► settings, search, llm, mcp_client, review_report
 docs_index ──► settings, md_chunks, code_chunks, embedder, search
 code_chunks ──► md_chunks
+support_desk ──► settings, search, llm, mcp_client, citations, support_web
+devhelp ──► citations
+mcp_client ──stdio──► crm_server ──► demo/crm.json
 ```
 
 `llm` и `mcp_client` принимают параметры и ничего не импортируют из `settings`. `git_server` не импортирует проект и пишет логи только в stderr. `numpy` используется для матрицы поиска и векторов; внешние модели и протоколы остаются за своими модулями. Импортов TooManyRules и изменения `sys.path` нет.
 
-Индекс содержит `current`/`docs` и `code`; devhelp ищет только `current`/`docs` и показывает модели только `DEVHELP_TOOLS` (`git_status`, `git_log`, `git_diff`). Ревьюер ищет оба вида, исключая изменённые файлы; модель видит только `git_show_file`.
+Индекс содержит `current`/`docs`, `code` и `faq` (FAQ поддержки); devhelp ищет только `current`/`docs` и показывает модели только `DEVHELP_TOOLS` (`git_status`, `git_log`, `git_diff`). Ревьюер ищет оба вида, исключая изменённые файлы; модель видит только `git_show_file`.
 
-Индекс — SQLite версии 1: `meta`, `files`, `chunks`. Файлы с прежним SHA-256 сохраняют куски и векторы; новая база целиком пишется в `<db>.tmp`, затем `os.replace`. Чужой файл не затирается. `help` читает индекс в память, проверяет кэш обеих моделей без сети; устаревшие файлы и другой `repo` — предупреждения. Ошибка реранкера во время поиска оставляет пять ближайших векторов.
+Поддержка ищет `faq` и отдельно `current`/`docs` без `week7/*`. Модель видит только `find_tickets` и `get_ticket`; `get_user` вызывает код. Без тикета MCP не запускается.
 
-Для своих прогонов `DEVHELP_MODELS_DIR` задаёт свой каталог моделей, `DEVHELP_GIT_COMMAND` — исполняемый файл вместо Python MCP-сервера (проверка сбоя запуска); `--db` и `--repo` задают индекс и проект. `.env` загружается только из `week7/`, заданное окружение не перекрывается. Ключ в MCP-процесс не передаётся; SDK наследует только свой белый список.
+Индекс — SQLite версии 1: `meta`, `files`, `chunks`. Файлы с прежним SHA-256 сохраняют куски и векторы; новая база целиком пишется в `<db>.tmp`, затем `os.replace`. Чужой файл не затирается. `help` и `support` читают индекс в память, проверяют кэш обеих моделей без сети; устаревшие файлы и другой `repo` — предупреждения. Ошибка реранкера во время поиска оставляет пять ближайших векторов.
+
+Для своих прогонов `DEVHELP_MODELS_DIR` задаёт свой каталог моделей, `SUPPORT_CRM_COMMAND` — исполняемый файл вместо MCP-сервера CRM; `DEVHELP_GIT_COMMAND` — исполняемый файл вместо Python MCP-сервера (проверка сбоя запуска); `--db` и `--repo` задают индекс и проект. `.env` загружается только из `week7/`, заданное окружение не перекрывается. Ключ в MCP-процесс не передаётся; SDK наследует только свой белый список.

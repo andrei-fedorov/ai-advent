@@ -117,7 +117,7 @@ def build(args, paths, head, previous):
         for chunk, vector, text in zip(batch, vectors, texts):
             day = re.search(r"День (\d+)", chunk.doc, re.IGNORECASE)
             rows.append({"doc": chunk.doc, "day": int(day[1]) if day else None,
-                         "kind": "current" if chunk.doc in cfg.CURRENT_DOCS else "docs",
+                         "kind": "faq" if chunk.doc in cfg.FAQ_DOCS else "current" if chunk.doc in cfg.CURRENT_DOCS else "docs",
                          "section": chunk.section, "part": chunk.part, "parts": chunk.parts,
                          "line": chunk.line, "text": chunk.text,
                          "tokens": embedder.count_tokens(text), "vec": vector.astype("float32").tobytes()})
@@ -128,9 +128,9 @@ def build(args, paths, head, previous):
             log(f"{done} из {len(pending)} кусков, ≈{remaining:.0f} с осталось")
             last_progress = now
     embedding_time = time.monotonic() - embedding
-    # Подписи обновляются даже у сохранённых векторов, если изменили CURRENT_DOCS.
+    # Подписи обновляются даже у сохранённых векторов, если изменили CURRENT_DOCS или FAQ_DOCS.
     for row in rows:
-        row["kind"] = "code" if row["doc"] in code_docs else "current" if row["doc"] in cfg.CURRENT_DOCS else "docs"
+        row["kind"] = "code" if row["doc"] in code_docs else "faq" if row["doc"] in cfg.FAQ_DOCS else "current" if row["doc"] in cfg.CURRENT_DOCS else "docs"
         if row["kind"] == "code":
             row["day"] = None
     meta = {**expected, "dim": len(rows[0]["vec"]) // 4, "globs": json.dumps(cfg.DOCS_GLOBS + cfg.CODE_GLOBS),
@@ -146,6 +146,8 @@ def build(args, paths, head, previous):
     for kind, label in (("code", "код"), ("docs", "документация")):
         subset = [row for row in rows if (row["kind"] == "code") == (kind == "code")]
         log(f"{label}: файлов {sum((file['doc'] in code_docs) == (kind == 'code') for file in files)}, кусков {len(subset)}")
+    faq = [row for row in rows if row["kind"] == "faq"]
+    log(f"из них FAQ поддержки: файлов {len({row['doc'] for row in faq})}, кусков {len(faq)}")
     log(f"пересчитано: {len(pending)} кусков, {sum(len(chunk.text) for chunk in pending)} символов")
     log(f"длина кусков: средняя {sum(lengths) / len(lengths):.0f}, максимум {max(lengths)}; "
         f"токены: максимум {max(row['tokens'] for row in rows)}, длиннее 512 — {len(overlong)}")
@@ -164,6 +166,7 @@ def probe(args):
         log("⚠️ " + warning)
     questions = [(f"В{i}", q, ("current", "docs")) for i, q in enumerate(cfg.PROBE_QUESTIONS, 1)]
     questions += [(f"К{i}", q, ("code",)) for i, q in enumerate(cfg.CODE_PROBE_QUESTIONS, 1)]
+    questions += [(f"Ф{i}", q, ("faq",)) for i, q in enumerate(cfg.SUPPORT_PROBE_QUESTIONS, 1)]
     for number, question, kinds in questions:
         result = index.search(question, kinds=kinds)
         log(f"{number}: {question} · поиск {result.elapsed:.2f} с, реранк {result.rerank_elapsed:.2f} с")

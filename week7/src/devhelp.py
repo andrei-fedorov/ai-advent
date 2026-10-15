@@ -4,11 +4,11 @@ import argparse
 import asyncio
 import os
 from pathlib import Path
-import re
 import readline  # История строк ввода; история разговора в модель не передаётся.
 
 from dotenv import load_dotenv
 
+from citations import source_lines
 from llm import LlmParams, answer
 from mcp_client import McpSession
 from search import DocsIndex
@@ -27,32 +27,12 @@ def show_help():
         print("  /help " + question)
 
 
-def cited_numbers(text) -> list[int]:
-    # [1], а также списки и диапазоны: [1, 3], [2–4], [1; 5].
-    numbers = set()
-    for group in re.findall(r"\[(\d+(?:\s*[,;–—-]\s*\d+)*)\]", text):
-        for item in re.split(r"\s*[,;]\s*", group):
-            bounds = [int(number) for number in re.split(r"\s*[–—-]\s*", item)]
-            low, high = bounds[0], bounds[-1]
-            numbers.update(range(low, high + 1) if 0 <= high - low <= 20 else bounds)
-    return sorted(numbers)
-
-
 def show_answer(result, search, branch, calls):
     if not result.ok:
         print(f"Ошибка LLM: {result.error}")
         return
     print("\n" + result.text)
-    references = cited_numbers(result.text)
-    if references:
-        print("\nИсточники:")
-        for number in references:
-            if 1 <= number <= len(search.hits):
-                print(f"  [{number}] {search.hits[number - 1].label()}")
-            else:
-                print(f"  ⚠️ [{number}] — такой выдержки не было")
-    else:
-        print("\n⚠️ ответ не ссылается на выдержки — сверить его с документацией нельзя")
+    print("\n" + "\n".join(source_lines(result.text, search.hits)))
     print(f"Git: ветка {branch} (git_branch) · вызвано моделью: {', '.join(calls) or 'нет'}")
     cost = "стоимость неизвестна" if result.cost_usd is None else f"≈ ${result.cost_usd:.6f}"
     print(f"Поиск {search.elapsed:.2f} с · модель {sum(round.elapsed for round in result.rounds):.2f} с · "

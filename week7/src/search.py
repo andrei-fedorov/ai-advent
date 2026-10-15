@@ -93,7 +93,7 @@ class Hit:
     rank: int
 
     def label(self) -> str:
-        note = " · текущее состояние" if self.kind == "current" else f" · день {self.day}" if self.day else ""
+        note = " · FAQ поддержки" if self.kind == "faq" else " · текущее состояние" if self.kind == "current" else f" · день {self.day}" if self.day else ""
         part = f" · часть {self.part}/{self.parts}" if self.parts > 1 else ""
         return f"{self.doc}:{self.line} · {self.section}{part}{note}"
 
