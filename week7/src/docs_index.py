@@ -1,4 +1,4 @@
-"""Программа индексации Markdown: пересчёт изменённых файлов, атомарная запись."""
+"""Программа индексации документации и кода: пересчёт изменённых файлов, атомарная запись."""
 
 import argparse
 from datetime import datetime, timezone
@@ -13,6 +13,7 @@ import time
 
 from embedder import Embedder, Reranker
 from md_chunks import chunk_markdown
+from code_chunks import chunk_code
 from search import SCHEMA, DocsIndex, IndexInvalid, corpus_files, read_index
 import settings as cfg
 
@@ -60,6 +61,8 @@ def write_index(path, meta, files, rows):
 
 def build(args, paths, head, previous):
     started = time.monotonic()
+    code_paths, _ = corpus_files(args.repo, cfg.CODE_GLOBS, cfg.CODE_EXCLUDE)
+    code_docs = {path.relative_to(args.repo).as_posix() for path in code_paths}
     old_meta, old_files, old_rows = previous or ({}, {}, [])
     expected = {"schema": str(SCHEMA), "embed_model": cfg.EMBED_MODEL,
                 "chunk_max_chars": str(cfg.CHUNK_MAX_CHARS), "repo": str(args.repo)}
@@ -79,13 +82,19 @@ def build(args, paths, head, previous):
     for path in paths:
         raw = path.read_bytes()
         doc = path.relative_to(args.repo).as_posix()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            log(f"⚠️ {doc}: не UTF-8, пропущен")
+            continue
         digest = hashlib.sha256(raw).hexdigest()
         if reason is None and old_files.get(doc, {}).get("sha256") == digest:
             chunks = reusable.get(doc, [])
             rows.extend(chunks)
             kept += 1
         else:
-            chunks = chunk_markdown(raw.decode("utf-8"), doc, cfg.CHUNK_MAX_CHARS)
+            chunks = (chunk_markdown(text, doc, cfg.CHUNK_MAX_CHARS) if path.suffix == ".md"
+                      else chunk_code(text, doc, cfg.CHUNK_MAX_CHARS, cfg.CODE_DEF_RE))
             pending.extend(chunks)
             recalculated += 1
         files.append({"doc": doc, "sha256": digest, "size": len(raw), "chunks": len(chunks)})
@@ -94,7 +103,7 @@ def build(args, paths, head, previous):
         raise ValueError("в корпусе нет непустых разделов")
     loading = time.monotonic()
     embedder = Embedder(cfg.EMBED_MODEL, cfg.MODELS_DIR).load(allow_download=True)
-    # Обычная сборка тоже готовит реранкер: help никогда не скачивает модели.
+    # Обычная сборка тоже готовит реранкер: help и review никогда не скачивают модели.
     Reranker(cfg.RERANK_MODEL, cfg.MODELS_DIR).load(allow_download=True)
     loading_time = time.monotonic() - loading
     embedding = time.monotonic()
@@ -119,8 +128,10 @@ def build(args, paths, head, previous):
     embedding_time = time.monotonic() - embedding
     # Подписи обновляются даже у сохранённых векторов, если изменили CURRENT_DOCS.
     for row in rows:
-        row["kind"] = "current" if row["doc"] in cfg.CURRENT_DOCS else "docs"
-    meta = {**expected, "dim": len(rows[0]["vec"]) // 4, "globs": json.dumps(cfg.DOCS_GLOBS),
+        row["kind"] = "code" if row["doc"] in code_docs else "current" if row["doc"] in cfg.CURRENT_DOCS else "docs"
+        if row["kind"] == "code":
+            row["day"] = None
+    meta = {**expected, "dim": len(rows[0]["vec"]) // 4, "globs": json.dumps(cfg.DOCS_GLOBS + cfg.CODE_GLOBS),
             "head": head, "built_at": datetime.now(timezone.utc).isoformat(),
             "rerank_model": cfg.RERANK_MODEL}
     writing = time.monotonic()
@@ -130,6 +141,9 @@ def build(args, paths, head, previous):
     lengths = [len(row["text"]) for row in rows]
     overlong = [row for row in rows if row["tokens"] > 512]
     log(f"файлов {len(files)}: сохранено {kept}, пересчитано {recalculated}, удалено {deleted}; кусков {len(rows)}")
+    for kind, label in (("code", "код"), ("docs", "документация")):
+        subset = [row for row in rows if (row["kind"] == "code") == (kind == "code")]
+        log(f"{label}: файлов {sum((file['doc'] in code_docs) == (kind == 'code') for file in files)}, кусков {len(subset)}")
     log(f"пересчитано: {len(pending)} кусков, {sum(len(chunk.text) for chunk in pending)} символов")
     log(f"длина кусков: средняя {sum(lengths) / len(lengths):.0f}, максимум {max(lengths)}; "
         f"токены: максимум {max(row['tokens'] for row in rows)}, длиннее 512 — {len(overlong)}")
@@ -144,11 +158,13 @@ def probe(args):
     index = DocsIndex(args.db, cfg.MODELS_DIR, rerank_model=cfg.RERANK_MODEL,
                       candidates=cfg.SEARCH_CANDIDATES, top_k=cfg.SEARCH_TOP_K)
     index.load_models(allow_download=True)
-    for warning in index.warnings(args.repo, cfg.DOCS_GLOBS, cfg.DOCS_EXCLUDE):
+    for warning in index.warnings(args.repo, cfg.DOCS_GLOBS + cfg.CODE_GLOBS, cfg.DOCS_EXCLUDE + cfg.CODE_EXCLUDE):
         log("⚠️ " + warning)
-    for number, question in enumerate(cfg.PROBE_QUESTIONS, 1):
-        result = index.search(question)
-        log(f"В{number}: {question} · поиск {result.elapsed:.2f} с, реранк {result.rerank_elapsed:.2f} с")
+    questions = [(f"В{i}", q, ("current", "docs")) for i, q in enumerate(cfg.PROBE_QUESTIONS, 1)]
+    questions += [(f"К{i}", q, ("code",)) for i, q in enumerate(cfg.CODE_PROBE_QUESTIONS, 1)]
+    for number, question, kinds in questions:
+        result = index.search(question, kinds=kinds)
+        log(f"{number}: {question} · поиск {result.elapsed:.2f} с, реранк {result.rerank_elapsed:.2f} с")
         if result.rerank_error:
             log(f"⚠️ реранкер: {result.rerank_error}")
         for position, hit in enumerate(result.hits, 1):
@@ -157,7 +173,7 @@ def probe(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Индекс документации проекта")
+    parser = argparse.ArgumentParser(description="Индекс документации и кода проекта")
     parser.add_argument("--repo", type=Path, default=cfg.DEFAULT_REPO)
     parser.add_argument("--db", type=Path, default=cfg.INDEX_DB)
     parser.add_argument("--full", action="store_true", help="пересчитать все файлы")
@@ -166,7 +182,7 @@ def main():
     args.repo, args.db = args.repo.expanduser().resolve(), args.db.expanduser().resolve()
     try:
         head = repo_metadata(args.repo)
-        paths, warnings = corpus_files(args.repo, cfg.DOCS_GLOBS, cfg.DOCS_EXCLUDE)
+        paths, warnings = corpus_files(args.repo, cfg.DOCS_GLOBS + cfg.CODE_GLOBS, cfg.DOCS_EXCLUDE + cfg.CODE_EXCLUDE)
         for warning in warnings:
             log("⚠️ " + warning)
         if not paths:

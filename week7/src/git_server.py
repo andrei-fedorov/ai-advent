@@ -14,6 +14,10 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
+CHANGED_MAX_FILES = 200
+RANGE_DIFF_MAX_CHARS = 40_000
+SHOW_MAX_LINES = 400
+SHOW_MAX_CHARS = 30_000
 STATUS_MAX_LINES = 100
 DIFF_MAX_CHARS = 12000
 GIT_TIMEOUT_S = 10
@@ -42,6 +46,127 @@ def make_server(repo: Path):
         if result.returncode and not allow_failure:
             raise ToolError(result.stderr.strip() or f"git завершился с кодом {result.returncode}")
         return result.stdout if not result.returncode else None
+
+    def validate_path(path):
+        relative = Path(path)
+        if (not path or "\0" in path or relative.is_absolute() or PureWindowsPath(path).is_absolute()
+                or ".." in relative.parts or ".." in PureWindowsPath(path).parts
+                or not (repo / relative).resolve().is_relative_to(repo)):
+            raise ToolError("path должен быть относительным, без '..' и внутри репозитория")
+
+    def revision(ref):
+        if not ref or ref.startswith("-") or "\0" in ref or any(char.isspace() for char in ref):
+            raise ToolError("недопустимая ревизия")
+        sha = git("rev-parse", "--verify", "--end-of-options", ref + "^{commit}", allow_failure=True)
+        if not sha:
+            raise ToolError(f"ревизия не найдена: {ref}")
+        return sha.strip()
+
+    def revisions(base, head):
+        root = git("rev-parse", "--show-toplevel").strip()
+        if Path(root).resolve() != repo:
+            raise ToolError("--repo должен быть корнем git-репозитория")
+        return revision(base), revision(head)
+
+    @server.tool(description="Список файлов PR от общего предка: статус, пути, число добавленных и удалённых строк.")
+    def git_changed_files(base: str, head: str) -> str:
+        base, head = revisions(base, head)
+        common = git("merge-base", base, head).strip()
+        options = ("--no-ext-diff", "--no-textconv", "-M")
+        names = iter(git("diff", *options, "--name-status", "-z", f"{base}...{head}", "--").split("\0"))
+        files = []
+        for status in names:
+            if not status:
+                continue
+            path = next(names)
+            old = None
+            if status[0] in "RC":
+                old, path = path, next(names)
+            files.append((status[0], old, path))
+        stats = {}
+        entries = iter(git("diff", *options, "--numstat", "-z", f"{base}...{head}", "--").split("\0"))
+        for entry in entries:
+            if not entry:
+                continue
+            added, deleted, path = entry.split("\t", 2)
+            if not path:
+                next(entries)  # Старое имя при переименовании.
+                path = next(entries)
+            stats[path] = (added, deleted)
+        lines = [f"base {base[:12]} · head {head[:12]} · merge-base {common[:12]}",
+                 "ревизии: " + json.dumps({"base": base, "head": head, "merge_base": common})]
+        for status, old, path in files[:CHANGED_MAX_FILES]:
+            added, deleted = stats.get(path, ("0", "0"))
+            name = json.dumps(path, ensure_ascii=False)
+            if old is not None:
+                name = json.dumps(old, ensure_ascii=False) + " → " + name
+            count = "двоичный" if added == "-" else f"+{added} −{deleted}"
+            lines.append(f"{status}\t{name}\t{count}")
+        if len(files) > CHANGED_MAX_FILES:
+            lines.append(f"и ещё {len(files) - CHANGED_MAX_FILES}")
+        return "\n".join(lines)
+
+    @server.tool(description="Diff одного файла PR от общего предка, с ограниченным контекстом и объёмом.")
+    def git_range_diff(base: str, head: str, path: str,
+                       context: Annotated[int, Field(ge=0, le=50)] = 10) -> str:
+        validate_path(path)
+        base, head = revisions(base, head)
+        # Оба имени нужны, чтобы diff переименования содержал удалённые строки старого пути.
+        old_paths = []
+        names = iter(git("diff", "--no-ext-diff", "--no-textconv", "-M", "--name-status", "-z",
+                         f"{base}...{head}", "--").split("\0"))
+        for status in names:
+            if not status:
+                continue
+            old = next(names)
+            if status[0] in "RC":
+                new = next(names)
+                if new == path:
+                    validate_path(old)
+                    old_paths.append(old)
+        text = git("diff", "--no-ext-diff", "--no-textconv", "-M", f"-U{context}",
+                   f"{base}...{head}", "--", *old_paths, path)
+        if len(text) > RANGE_DIFF_MAX_CHARS:
+            reserve = 100
+            cut = max(0, text.rfind("\n", 0, RANGE_DIFF_MAX_CHARS - reserve))
+            return text[:cut] + f"\nобрезано: показано {cut} из {len(text)} символов"
+        return text
+
+    @server.tool(description="Прочитать файл проекта в ревизии PR целиком или диапазоном строк. "
+                 "Вызывай, когда для замечания нужно увидеть код вне diff: вызывающий код, определение "
+                 "функции, константы. ref — sha головы PR из сообщения. Ответ ограничен 400 строками "
+                 "и 30000 символами; продолжение читай следующим диапазоном.")
+    def git_show_file(ref: str, path: str,
+                      start_line: Annotated[int, Field(ge=1)] = 1,
+                      end_line: Annotated[int | None, Field(ge=1)] = None) -> str:
+        validate_path(path)
+        sha = revision(ref)
+        if end_line is not None and end_line < start_line:
+            raise ToolError("end_line должен быть не меньше start_line")
+        kind = git("cat-file", "-t", f"{sha}:{path}", allow_failure=True)
+        if kind is None:
+            raise ToolError(f"файл отсутствует в ревизии: {path}")
+        if kind.strip() != "blob":
+            raise ToolError("path должен указывать на файл")
+        text = git("show", "--no-ext-diff", "--no-textconv", f"{sha}:{path}", "--")
+        if "\0" in text:
+            raise ToolError("двоичный файл")
+        lines = text.splitlines(keepends=True)
+        if start_line > len(lines) and lines:
+            raise ToolError("start_line за концом файла")
+        end = min(len(lines), end_line or len(lines), start_line + SHOW_MAX_LINES - 1)
+        chosen = []
+        size = 0
+        for line in lines[start_line - 1:end]:
+            if size + len(line) > max(0, SHOW_MAX_CHARS - len(path) - 150):
+                break
+            chosen.append(line)
+            size += len(line)
+        shown_end = start_line + len(chosen) - 1
+        header = f"{path} @ {sha[:12]}, строки {start_line}–{shown_end} из {len(lines)}"
+        # Даже одна строка длиннее потолка возвращается с явной пометкой, без потери границы.
+        suffix = "\nобрезано: продолжение не поместилось" if shown_end < end else ""
+        return header + "\n" + "".join(chosen) + suffix
 
     @server.tool(description=BRANCH_DESCRIPTION)
     def git_branch() -> str:
@@ -89,11 +214,7 @@ def make_server(repo: Path):
     @server.tool(description=DIFF_DESCRIPTION)
     def git_diff(staged: bool = False, path: str | None = None) -> str:
         if path is not None:
-            relative = Path(path)
-            if (not path or "\0" in path or relative.is_absolute() or PureWindowsPath(path).is_absolute()
-                    or ".." in relative.parts or ".." in PureWindowsPath(path).parts
-                    or not (repo / relative).resolve().is_relative_to(repo)):
-                raise ToolError("path должен быть относительным, без '..' и внутри репозитория")
+            validate_path(path)
         options = ["--cached"] if staged else []
         files = [path] if path is not None else []
         stat = git("diff", "--no-ext-diff", "--no-textconv", *options, "--stat", "--", *files)

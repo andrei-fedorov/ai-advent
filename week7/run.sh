@@ -8,8 +8,9 @@ fi
 case "${1:-}" in
     index) program=docs_index ;;
     help) program=devhelp ;;
+    review) program=pr_review ;;
     git-server) program=git_server ;;
-    *) echo 'Команды: index, help, git-server. Аргументы: --help.' >&2; exit 2 ;;
+    *) echo 'Команды: index, help, review, git-server. Аргументы: --help.' >&2; exit 2 ;;
 esac
 shift
 uv sync --quiet

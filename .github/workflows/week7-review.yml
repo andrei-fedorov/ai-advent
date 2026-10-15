@@ -1,0 +1,114 @@
+name: AI-ревью PR — неделя 7
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: week7-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Проверить событие
+        id: gate
+        env:
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [[ "$IS_PR" == true && ( "$IS_DRAFT" == true || "$HEAD_REPO" != "$GITHUB_REPOSITORY" ) ]]; then
+            echo 'Пропуск: ревью доступно для готовых PR из этого репозитория; черновики и форки пропускаются.'
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        if: steps.gate.outputs.run == 'true'
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v10
+        if: steps.gate.outputs.run == 'true'
+        with:
+          enable-cache: true
+          cache-dependency-glob: week7/uv.lock
+
+      - name: Установить Python
+        if: steps.gate.outputs.run == 'true'
+        working-directory: week7
+        run: uv python install
+
+      # Имена моделей меняются вместе с settings.py.
+      - uses: actions/cache/restore@v6
+        if: steps.gate.outputs.run == 'true'
+        id: models
+        with:
+          path: week7/data/models
+          key: week7-models-multilingual-e5-base-bge-reranker-v2-m3-int8
+
+      - uses: actions/cache/restore@v6
+        if: steps.gate.outputs.run == 'true'
+        id: index
+        with:
+          path: week7/data/docs_index.sqlite3
+          key: week7-index-${{ github.sha }}
+          restore-keys: week7-index-
+
+      - name: Обновить индекс документации и кода
+        if: steps.gate.outputs.run == 'true'
+        run: ./week7/run.sh index
+
+      - uses: actions/cache/save@v6
+        if: steps.gate.outputs.run == 'true' && steps.models.outputs.cache-hit != 'true'
+        with:
+          path: week7/data/models
+          key: ${{ steps.models.outputs.cache-primary-key }}
+
+      - uses: actions/cache/save@v6
+        if: steps.gate.outputs.run == 'true' && steps.index.outputs.cache-hit != 'true'
+        with:
+          path: week7/data/docs_index.sqlite3
+          key: ${{ steps.index.outputs.cache-primary-key }}
+
+      - name: Ревью PR
+        if: steps.gate.outputs.run == 'true' && github.event_name == 'pull_request'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s' "$PR_BODY" > pr_body.md
+          LINK_BASE="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$HEAD_SHA/"
+          ./week7/run.sh review --base "origin/$BASE_REF" --head "$HEAD_SHA" --title "$PR_TITLE" --body-file "$GITHUB_WORKSPACE/pr_body.md" --link-base "$LINK_BASE" --out "$GITHUB_WORKSPACE/review.md"
+
+      - name: Опубликовать ревью и сводку
+        if: steps.gate.outputs.run == 'true' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          cat review.md >> "$GITHUB_STEP_SUMMARY"
+          comment_id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- week7-ai-review -->"))) | .id' | head -n 1)
+          if [[ -n "$comment_id" ]]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment_id" -F body=@review.md --silent
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -F body=@review.md --silent
+          fi

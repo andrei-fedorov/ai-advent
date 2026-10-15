@@ -50,6 +50,7 @@
 
 - Данные автора (`week7/data/`, `week7/.env`) не трогать: свой индекс — `--db <свой путь>`, свой ключ — в окружении команды.
 - Индекс правил TooManyRules (`src/data/rag/`), его данные и кэш моделей Hugging Face автора `week7/` не читает и не пишет.
+- Коммиты для проверки ревью — только во временном клоне в `/private/tmp/`, со своими ветками; `--repo` указывает на клон. В рабочем дереве автора не создавать веток и коммитов, не делать push. Реальные вызовы DeepSeek — с разрешения автора.
 - Рабочее дерево автора общее: для проверки git-инструментов — своя ветка и своя правка, после прогона вернуть как было; ничего не коммитить.
 
 ## Команды
@@ -57,12 +58,13 @@
 ```bash
 ./week7/run.sh index [--repo <путь>] [--db <путь>] [--full] [--probe]   # день 31: индекс документации
 ./week7/run.sh help  [--repo <путь>] [--db <путь>] ["вопрос"]   # день 31: ассистент разработчика, /help
+./week7/run.sh review [--repo <путь>] [--db <путь>] [--base main] [--head HEAD] [--out <путь>] # день 32: ревью ветки
 ./week7/run.sh git-server --repo <путь>                         # день 31: MCP-сервер git вручную (отладка)
 ```
 
 ## Архитектура кода
 
-День 31 реализован по `week7/docs/День 31 спецификация.md`. Программы запускаются как файлы, каталог не публикуется Python-пакетом.
+Дни 31–32 реализованы по спецификациям в `week7/docs/`. Workflow проекта — `.github/workflows/week7-review.yml`, единственный файл программы недели вне `week7/`; после выноса меняется checkout в workflow проекта. День 31 — по `week7/docs/День 31 спецификация.md`. Программы запускаются как файлы, каталог не публикуется Python-пакетом.
 
 | Файл | Роль и зависимости проекта |
 | --- | --- |
@@ -70,10 +72,13 @@
 | `src/md_chunks.py` | Лист: чистые функции нарезки, `Chunk`, путь заголовков, строки и части |
 | `src/embedder.py` | Лист: единственный импорт `fastembed`, модели e5 и bge, CPU, запрет скачивания |
 | `src/search.py` | → `embedder`: проверка собственного SQLite, корпус и хеши, матрица векторов, реранк |
-| `src/docs_index.py` | → `settings`, `md_chunks`, `embedder`, `search`: проверка корня git и HEAD, пересчёт изменённых файлов, атомарная запись, `--probe` |
+| `src/code_chunks.py` | → `md_chunks`: чистая нарезка кода блоками, без парсера |
+| `src/review_report.py` | Лист: номера строк, JSON, проверки, Markdown |
+| `src/pr_review.py` | → `settings`, `search`, `llm`, `mcp_client`, `review_report`: ревью ветки |
+| `src/docs_index.py` | → `settings`, `md_chunks`, `code_chunks`, `embedder`, `search`: проверка корня git и HEAD, пересчёт изменённых файлов, атомарная запись, `--probe` |
 | `src/llm.py` | Лист: единственный импорт `openai`, параметры аргументами, function calling и лог каждого раунда |
 | `src/mcp_client.py` | Лист: единственный импорт клиента MCP v2, stdio и белый список окружения, ошибки по стадиям |
-| `src/git_server.py` | Отдельная программа без импортов проекта: сервер MCP v2, `git_branch`, `git_status`, `git_log`, `git_diff`; фиксированные команды git и `ToolError` |
+| `src/git_server.py` | Отдельная программа без импортов проекта: сервер MCP v2, `git_branch`, `git_status`, `git_log`, `git_diff`, `git_changed_files`, `git_range_diff`, `git_show_file`; фиксированные команды git и `ToolError` |
 | `src/devhelp.py` | → `settings`, `search`, `llm`, `mcp_client`: `.env`, CLI, один MCP-процесс на вопрос, подписи источников и итоговый расход |
 
 ```text
@@ -81,10 +86,14 @@ devhelp ──► settings
         ├─► search ──► embedder
         ├─► llm
         └─► mcp_client ──stdio──► git_server ──► git
-docs_index ──► settings, md_chunks, embedder, search
+pr_review ──► settings, search, llm, mcp_client, review_report
+docs_index ──► settings, md_chunks, code_chunks, embedder, search
+code_chunks ──► md_chunks
 ```
 
 `llm` и `mcp_client` принимают параметры и ничего не импортируют из `settings`. `git_server` не импортирует проект и пишет логи только в stderr. `numpy` используется для матрицы поиска и векторов; внешние модели и протоколы остаются за своими модулями. Импортов TooManyRules и изменения `sys.path` нет.
+
+Индекс содержит `current`/`docs` и `code`; devhelp ищет только `current`/`docs` и показывает модели только `DEVHELP_TOOLS` (`git_status`, `git_log`, `git_diff`). Ревьюер ищет оба вида, исключая изменённые файлы; модель видит только `git_show_file`.
 
 Индекс — SQLite версии 1: `meta`, `files`, `chunks`. Файлы с прежним SHA-256 сохраняют куски и векторы; новая база целиком пишется в `<db>.tmp`, затем `os.replace`. Чужой файл не затирается. `help` читает индекс в память, проверяет кэш обеих моделей без сети; устаревшие файлы и другой `repo` — предупреждения. Ошибка реранкера во время поиска оставляет пять ближайших векторов.
 

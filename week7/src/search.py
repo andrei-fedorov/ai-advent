@@ -134,16 +134,21 @@ class DocsIndex:
         hashes = {path.relative_to(repo).as_posix(): file_hash(path) for path in paths}
         changed = sum(hashes.get(doc) != self.files.get(doc, {}).get("sha256") for doc in hashes.keys() | self.files.keys())
         if changed:
-            warnings.append(f"документация менялась после сборки индекса ({changed} файлов) — ./week7/run.sh index")
+            warnings.append(f"корпус менялся после сборки индекса ({changed} файлов) — ./week7/run.sh index")
         return warnings
 
-    def search(self, question: str) -> SearchResult:
+    def search(self, question: str, kinds=None, exclude_docs=()) -> SearchResult:
         started = time.monotonic()
-        similarities = self.matrix @ self.embedder.embed_query(question)
+        eligible = np.array([i for i, row in enumerate(self.chunks)
+                             if (kinds is None or row["kind"] in kinds) and row["doc"] not in exclude_docs],
+                            dtype=np.intp)
+        if not len(eligible):
+            return SearchResult([], time.monotonic() - started, 0)
+        similarities = self.matrix[eligible] @ self.embedder.embed_query(question)
         nearest = np.argsort(-similarities, kind="stable")[:self.candidates]
         hits = []
         for rank, index in enumerate(nearest, 1):
-            row = self.chunks[int(index)]
+            row = self.chunks[int(eligible[index])]
             hits.append(Hit(**{key: row[key] for key in ("doc", "day", "kind", "section", "part", "parts", "line", "text")},
                             sim=float(similarities[index]), score=None, rank=rank))
         rerank_started = time.monotonic()

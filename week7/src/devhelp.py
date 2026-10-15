@@ -63,7 +63,7 @@ def show_answer(result, search, branch, calls):
 
 async def ask(question, repo, index, params):
     # Выполняется в текущем потоке: Ctrl+C прерывает также CPU-поиск.
-    search = index.search(question)
+    search = index.search(question, kinds=("current", "docs"))
     log(f"поиск {search.elapsed:.2f} с, реранк {search.rerank_elapsed:.2f} с")
     if search.rerank_error:
         log("⚠️ реранкер недоступен, взяты ближайшие векторы: " + search.rerank_error)
@@ -78,10 +78,10 @@ async def ask(question, repo, index, params):
         log(f"MCP git_branch {branch_call.elapsed:.3f} с · {branch}")
         catalog = await session.tools()
         log(f"MCP каталог {session.tools_elapsed:.3f} с: "
-            f"{', '.join(tool['name'] for tool in catalog) or 'пуст'} · {session.error or 'готово'}")
+            f"{', '.join(tool['name'] for tool in catalog if tool['name'] in cfg.DEVHELP_TOOLS) or 'пуст'} · {session.error or 'готово'}")
         tools = [{"type": "function", "function": {"name": tool["name"],
                   "description": tool["description"], "parameters": tool["inputSchema"]}}
-                 for tool in catalog if tool["name"] != "git_branch"]
+                 for tool in catalog if tool["name"] in cfg.DEVHELP_TOOLS]
         excerpts = "\n\n".join(f"[{number}] {hit.label()}\n{hit.text}" for number, hit in enumerate(search.hits, 1))
         messages = [{"role": "system", "content": cfg.SYSTEM_PROMPT},
                     {"role": "user", "content": cfg.USER_TEMPLATE.format(repo=repo.name, branch=branch,
@@ -123,13 +123,13 @@ def main():
     params = LlmParams(os.environ.get("LLM_BASE_URL", cfg.LLM_BASE_URL), key,
                        os.environ.get("LLM_MODEL", cfg.LLM_MODEL), cfg.LLM_TEMPERATURE,
                        cfg.LLM_MAX_TOKENS, cfg.LLM_MAX_TOOL_ROUNDS, cfg.TOOL_RESULT_MAX_CHARS,
-                       cfg.PRICES, cfg.LLM_TIMEOUT_S)
+                       cfg.PRICES, cfg.LLM_TIMEOUT_S, log_prefix="[devhelp]")
     try:
         if not repo.is_dir():
             raise ValueError("--repo не существует или не каталог")
         index = DocsIndex(db, cfg.MODELS_DIR, rerank_model=cfg.RERANK_MODEL,
                           candidates=cfg.SEARCH_CANDIDATES, top_k=cfg.SEARCH_TOP_K)
-        for warning in index.warnings(repo, cfg.DOCS_GLOBS, cfg.DOCS_EXCLUDE):
+        for warning in index.warnings(repo, cfg.DOCS_GLOBS + cfg.CODE_GLOBS, cfg.DOCS_EXCLUDE + cfg.CODE_EXCLUDE):
             log("⚠️ " + warning)
         index.load_models(allow_download=False)
     except Exception as exc:

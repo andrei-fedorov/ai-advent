@@ -19,6 +19,7 @@ class LlmParams:
     tool_result_max_chars: int
     prices: dict[str, tuple[float, float]]
     timeout_s: float
+    log_prefix: str = "[devhelp]"
 
 
 @dataclass
@@ -65,7 +66,7 @@ async def answer(messages: list[dict], tools: list[dict], call_tool, params: Llm
                 try:
                     response = await client.chat.completions.create(**request)
                 except Exception as exc:
-                    print(f"[devhelp] LLM {params.model} · раунд {number} · сбой · "
+                    print(f"{params.log_prefix} LLM {params.model} · раунд {number} · сбой · "
                           f"{time.monotonic() - started:.2f} с: {exc}", flush=True)
                     raise
                 elapsed = time.monotonic() - started
@@ -90,7 +91,7 @@ async def answer(messages: list[dict], tools: list[dict], call_tool, params: Llm
                     round.cost_usd is not None for round in result.rounds) else None
                 result.answered_model, result.finish_reason = response.model, reason
                 cost_label = "неизвестна" if cost is None else f"${cost:.6f}"
-                print(f"[devhelp] LLM {response.model} · раунд {number} · finish_reason={reason} · "
+                print(f"{params.log_prefix} LLM {response.model} · раунд {number} · finish_reason={reason} · "
                       f"{elapsed:.2f} с · prompt={prompt} completion={completion} cache={cached} · "
                       f"стоимость {cost_label} · вызовы {json.dumps(calls, ensure_ascii=False)}", flush=True)
                 if not message.tool_calls:
@@ -120,7 +121,7 @@ async def answer(messages: list[dict], tools: list[dict], call_tool, params: Llm
                         content = tool_result.text if tool_result.ok else f"Ошибка инструмента: {tool_result.error}"
                     except (ValueError, TypeError) as exc:
                         content = f"Ошибка инструмента: {exc}"
-                        print(f"[devhelp] {call.function.name}: {content}", flush=True)
+                        print(f"{params.log_prefix} {call.function.name}: {content}", flush=True)
                     if len(content) > params.tool_result_max_chars:
                         marker = "\n[результат обрезан]"
                         content = content[:max(0, params.tool_result_max_chars - len(marker))] + marker
