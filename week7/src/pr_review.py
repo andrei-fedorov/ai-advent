@@ -12,6 +12,7 @@ import tempfile
 import time
 
 from dotenv import load_dotenv
+import openai
 
 from llm import LlmParams, answer
 from mcp_client import McpSession, ToolCall
@@ -272,6 +273,15 @@ async def review(args, index, params):
     return report
 
 
+def title_hint(title, params):
+    # Одна фраза о PR по заголовку — для лога, до сбора контекста.
+    client = openai.OpenAI(base_url=params.base_url, api_key=params.api_key, timeout=params.timeout_s)
+    response = client.chat.completions.create(
+        model=params.model, max_tokens=60,
+        messages=[{"role": "user", "content": "Одной фразой: о чём этот PR? Заголовок: " + title}])
+    return (response.choices[0].message.content or "").strip()
+
+
 def write_report(path, report):
     path = path.expanduser().resolve()
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
@@ -315,6 +325,11 @@ def main():
     except Exception as exc:
         log(f"отказ: {exc}")
         return 2
+    if args.title:
+        try:
+            log("о чём PR: " + title_hint(args.title, params))
+        except Exception as exc:
+            log(f"подсказка по заголовку недоступна: {exc}")
     try:
         report = asyncio.run(review(args, index, params))
         if args.out:
