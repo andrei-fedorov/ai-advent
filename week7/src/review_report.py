@@ -8,10 +8,35 @@ MARKER = "<!-- week7-ai-review -->"
 CATEGORIES = {"bug": "Потенциальные баги", "architecture": "Архитектурные проблемы",
               "recommendation": "Рекомендации"}
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)")
+SHOW_HEADER_RE = re.compile(r"^(.* @ \S+, строки )(\d+)–(\d+)( из \d+)$")
+SHOW_TRUNCATED = "\nобрезано: продолжение не поместилось"
+RENDERED_SUFFIXES = (".md", ".markdown")
 
 
 def numbered_text(text: str, start_line: int = 1) -> str:
     return "\n".join(f"{number:5} | {line}" for number, line in enumerate(text.splitlines(), start_line))
+
+
+def numbered_show_result(text: str, max_chars: int) -> str:
+    """Нумерует ответ git_show_file и укладывает его в max_chars целыми строками с верным заголовком."""
+    header, _, body = text.partition("\n")
+    match = SHOW_HEADER_RE.match(header)
+    if not match:
+        return header + "\n" + numbered_text(body)
+    first, last = int(match[2]), int(match[3])
+    cut = body.endswith(SHOW_TRUNCATED)
+    lines = numbered_text(body.removesuffix(SHOW_TRUNCATED), first).splitlines()
+    kept, size = [], len(header) + 100
+    for line in lines:
+        # Хотя бы одна строка: сверхдлинную обрежет уже llm.py.
+        if kept and size + len(line) + 1 > max_chars:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    if len(kept) < len(lines):
+        last, cut = first + len(kept) - 1, True
+    note = f"\nобрезано: продолжение читай со строки {last + 1}" if cut else ""
+    return f"{match[1]}{first}–{last}{match[4]}\n" + "\n".join(kept) + note
 
 
 def numbered_diff(text: str) -> tuple[str, list[tuple[int, int]]]:
@@ -50,20 +75,35 @@ def search_query(path: str, diff: str, max_chars: int) -> str:
 
 
 def parse_response(text: str) -> dict | None:
-    def valid(value):
+    def integer(value):
+        # Номер строкой («41») модель пишет часто; это не повод терять всё ревью.
+        if isinstance(value, str) and re.fullmatch(r"\d+", value.strip(), re.ASCII):
+            return int(value)
+        return value
+
+    def normalized(value):
         if not isinstance(value, dict) or not isinstance(value.get("summary"), str) or not isinstance(value.get("findings"), list):
-            return False
+            return None
+        findings = []
         for finding in value["findings"]:
             if not isinstance(finding, dict):
-                return False
+                return None
             if not all(isinstance(finding.get(key), str) for key in
                        ("category", "severity", "file", "title", "details")):
-                return False
-            if type(finding.get("line")) is not int or not isinstance(finding.get("sources"), list):
-                return False
-            if any(type(source) is not int for source in finding["sources"]):
-                return False
-        return True
+                return None
+            # null — замечание ко всему файлу; показывается с пометкой.
+            line = integer(finding.get("line"))
+            if line is not None and type(line) is not int:
+                return None
+            sources = finding.get("sources")
+            sources = [] if sources is None else sources
+            if not isinstance(sources, list):
+                return None
+            sources = [integer(source) for source in sources]
+            if any(type(source) is not int for source in sources):
+                return None
+            findings.append({**finding, "line": line, "sources": sources})
+        return {**value, "findings": findings}
     try:
         value = json.loads(text)
     except (ValueError, TypeError):
@@ -74,7 +114,7 @@ def parse_response(text: str) -> dict | None:
             value, _ = json.JSONDecoder().raw_decode(text[start:])
         except ValueError:
             return None
-    return value if valid(value) else None
+    return normalized(value)
 
 
 def finding_warnings(finding: dict, changed: set[str], ranges: dict, source_count: int) -> list[str]:
@@ -83,7 +123,9 @@ def finding_warnings(finding: dict, changed: set[str], ranges: dict, source_coun
         warnings.append("категория: " + finding["category"])
     if finding["file"] not in changed:
         warnings.append("файла нет в PR")
-    if not any(low <= finding["line"] <= high for low, high in ranges.get(finding["file"], ())):
+    elif finding["line"] is None:
+        warnings.append("строка не указана")
+    elif not any(low <= finding["line"] <= high for low, high in ranges.get(finding["file"], ())):
         warnings.append("строка вне изменений PR")
     warnings.extend(f"[{number}] — такой выдержки не было" for number in finding["sources"]
                     if not 1 <= number <= source_count)
@@ -118,10 +160,14 @@ def render_review(raw: str, *, changed: set[str], ranges: dict, source_labels: l
         if not group:
             lines.extend(["Не найдено.", ""])
         for index, finding in enumerate(group, 1):
-            label = f"{finding['file']}:{finding['line']}"
+            line = finding["line"]
+            label = finding["file"] if line is None else f"{finding['file']}:{line}"
             location = f"`{label}`"
             if link_base:
-                location = f"[{location}]({link_base.rstrip('/')}/{quote(finding['file'], safe='/')}#L{finding['line']})"
+                # Markdown GitHub показывает отрисованным, якорь строки работает только в ?plain=1.
+                plain = "?plain=1" if finding["file"].lower().endswith(RENDERED_SUFFIXES) else ""
+                anchor = "" if line is None else f"{plain}#L{line}"
+                location = f"[{location}]({link_base.rstrip('/')}/{quote(finding['file'], safe='/')}{anchor})"
             lines.extend([safe_text(f"{index}. **{finding['severity']}** · {location} — {finding['title']}"),
                           "   " + safe_text(finding["details"]).replace("\n", "\n   ")])
             for warning in finding_warnings(finding, changed, ranges, len(source_labels)):

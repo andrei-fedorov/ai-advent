@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 from llm import LlmParams, answer
 from mcp_client import McpSession, ToolCall
-from review_report import numbered_diff, numbered_text, render_review, search_query
+from review_report import numbered_diff, numbered_show_result, numbered_text, render_review, search_query
 from search import DocsIndex
 import settings as cfg
 
@@ -48,16 +48,18 @@ def changed_files(text):
 
 
 def merge_hits(results, limit):
+    # Оценка реранкера и косинус — разные шкалы: куски с реранком всегда выше.
+    def value(hit):
+        return (hit.score is not None, hit.score if hit.score is not None else hit.sim)
+
     combined = {}
     for result in results:
         for hit in result.hits:
             key = (hit.doc, hit.section, hit.part, hit.line)
-            value = hit.score if hit.score is not None else hit.sim
             old = combined.get(key)
-            if old is None or value > (old.score if old.score is not None else old.sim):
+            if old is None or value(hit) > value(old):
                 combined[key] = hit
-    return sorted(combined.values(), key=lambda hit: hit.score if hit.score is not None else hit.sim,
-                  reverse=True)[:limit]
+    return sorted(combined.values(), key=value, reverse=True)[:limit]
 
 
 async def review(args, index, params):
@@ -134,14 +136,12 @@ async def review(args, index, params):
                     if sum(map(len, parts)) > limit:
                         if optional:
                             warnings.append(path + ": правила превышают лимит, не включены")
-                            return ""
                         return None
                     if end >= total:
                         return "".join(parts)
                     if end < begin:
                         if optional:
                             warnings.append(path + ": строка правил превышает лимит, не включены")
-                            return ""
                         return None
                     next_line = end + 1
 
@@ -174,9 +174,9 @@ async def review(args, index, params):
 
             async def rule(path):
                 if path not in rule_cache:
+                    # None — файла нет (строка лога MCP) или он длиннее лимита (предупреждение
+                    # в ревью); в обоих случаях правила не включаются, поиск идёт к родителю.
                     rule_cache[path] = await read_file(path, cfg.REVIEW_RULES_MAX_CHARS, optional=True)
-                    # Отличаем отсутствующий файл от существующего слишком большого.
-                    # Отсутствие уже отражено ошибкой MCP, предупреждение не требуется.
                 if rule_cache[path] is not None:
                     rules[path] = rule_cache[path]
                     return True
@@ -242,9 +242,7 @@ async def review(args, index, params):
                 if not result.ok and not result.text:
                     raise RuntimeError(result.error)
                 if result.ok:
-                    header, _, body = result.text.partition("\n")
-                    match = re.search(r"строки (\d+)–", header)
-                    result.text = header + "\n" + numbered_text(body, int(match[1]) if match else 1)
+                    result.text = numbered_show_result(result.text, params.tool_result_max_chars)
                 return result
 
             result = await answer([{"role": "system", "content": cfg.REVIEW_SYSTEM_PROMPT},

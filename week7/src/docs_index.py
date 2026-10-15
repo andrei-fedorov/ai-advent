@@ -82,12 +82,14 @@ def build(args, paths, head, previous):
     for path in paths:
         raw = path.read_bytes()
         doc = path.relative_to(args.repo).as_posix()
+        digest = hashlib.sha256(raw).hexdigest()
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             log(f"⚠️ {doc}: не UTF-8, пропущен")
+            # Хеш записан, чтобы help и review не считали файл изменившимся после сборки.
+            files.append({"doc": doc, "sha256": digest, "size": len(raw), "chunks": 0})
             continue
-        digest = hashlib.sha256(raw).hexdigest()
         if reason is None and old_files.get(doc, {}).get("sha256") == digest:
             chunks = reusable.get(doc, [])
             rows.extend(chunks)
