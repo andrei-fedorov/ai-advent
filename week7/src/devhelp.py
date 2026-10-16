@@ -30,10 +30,11 @@ def git_session(repo):
                       env=None, timeout_s=cfg.MCP_TIMEOUT_S)
 
 
-async def mcp_call(session, name, arguments, calls):
+async def mcp_call(session, name, arguments, calls, service=False):
+    # service — вызов делает код, а не модель: на странице он помечен, в шапку .diff не идёт.
     result = await session.call(name, arguments)
     calls.append({"name": name, "arguments": arguments, "elapsed": result.elapsed,
-                  "size": len(result.text), "error": result.error})
+                  "size": len(result.text), "error": result.error, "service": service})
     text = result.text
     if name in ("project_read", "project_grep", "project_files"):
         text = text.splitlines()[0] if text else ""
@@ -43,7 +44,7 @@ async def mcp_call(session, name, arguments, calls):
 
 
 async def path_status(session, path, calls):
-    result = await mcp_call(session, "project_path_status", {"path": path}, calls)
+    result = await mcp_call(session, "project_path_status", {"path": path}, calls, service=True)
     if not result.ok:
         raise ValueError(result.error or "статус пути недоступен")
     return json.loads(result.text)
@@ -87,7 +88,7 @@ async def ask(goal, repo, index, params, out_dir) -> Answer:
     draft, calls = changes.Draft(goal), []
     async with git_session(repo) as session:
         log(f"MCP подключение {session.elapsed:.3f} с · {session.error or 'готово'}")
-        branch_call = await mcp_call(session, "git_branch", {}, calls)
+        branch_call = await mcp_call(session, "git_branch", {}, calls, service=True)
         branch = branch_call.text if branch_call.ok else cfg.UNKNOWN_BRANCH.format(reason=branch_call.error)
         catalog = await session.tools()
         log(f"MCP каталог {session.tools_elapsed:.3f} с: "
@@ -138,19 +139,23 @@ async def ask(goal, repo, index, params, out_dir) -> Answer:
                 content = arguments.get("content")
                 details = {"path": path, "length": len(content) if isinstance(content, str) else 0}
             calls.append({"name": name, "arguments": details, "elapsed": result.elapsed,
-                          "size": len(result.text), "error": result.error})
+                          "size": len(result.text), "error": result.error, "service": False})
             return result
 
-        result = await answer(messages, tools, call_tool, params)
+        result = await answer(messages, tools, call_tool, params,
+                              final_tools=cfg.DEVHELP_LOCAL_TOOLS,
+                              final_tool_rounds=cfg.DEVHELP_FINAL_TOOL_ROUNDS,
+                              tool_text_retries=cfg.DEVHELP_TOOL_TEXT_RETRIES)
         patch = None
         if draft.files:
-            head = await mcp_call(session, "git_log", {"limit": 1}, calls)
+            head = await mcp_call(session, "git_log", {"limit": 1}, calls, service=True)
             patch = changes.write_patch(draft, out_dir, {"репозиторий": repo,
                 "HEAD": head.text.split(" | ", 1)[0] if head.ok else "неизвестен",
                 "модель": result.answered_model or params.model, "раунды": len(result.rounds),
-                "инструменты": ", ".join(call["name"] for call in calls)})
+                "инструменты": ", ".join(call["name"] for call in calls if not call["service"])})
             log(f"diff {patch} · файлов {len(draft.files)}")
-    return Answer(result.text, source_lines(result.text, search.hits), branch, calls, result, draft, patch, search, goal)
+    sources = source_lines(result.text, search.hits) if result.ok else []
+    return Answer(result.text, sources, branch, calls, result, draft, patch, search, goal)
 
 
 async def apply_file(draft, path, repo):

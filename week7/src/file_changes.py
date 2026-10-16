@@ -38,7 +38,8 @@ def validate_path(repo, path, status, kind):
             or ".." in relative.parts or ".." in PureWindowsPath(path).parts
             or any(char in path for char in "\r\n\t")):
         raise ValueError("путь должен быть относительным, без '..' и внутри репозитория")
-    if ".git" in relative.parts:
+    # Регистр не важен: на macOS .GIT — тот же каталог .git.
+    if any(part.lower() == ".git" for part in relative.parts):
         raise ValueError("нельзя менять служебный каталог git")
     if relative.suffix.lower() != ".md":
         raise ValueError("менять можно только Markdown (.md)")
@@ -81,6 +82,10 @@ def check_text(text):
 
 
 def propose_edit(draft, repo, path, old, new, status, *, max_files):
+    # Нового файла ещё нет на диске: проверка пути ответила бы «файл не найден».
+    previous = draft.files.get(Path(path).as_posix()) if isinstance(path, str) else None
+    if previous and previous.kind != "edit":
+        raise ValueError("для нового файла используй propose_file")
     target = validate_path(repo, path, status, "edit")
     check_text(old)
     check_text(new)
@@ -90,8 +95,6 @@ def propose_edit(draft, repo, path, old, new, status, *, max_files):
     if not old:
         raise ValueError("old не должен быть пустым")
     previous = draft.files.get(path)
-    if previous and previous.kind != "edit":
-        raise ValueError("для нового файла используй propose_file")
     if previous is None:
         if len(draft.files) >= max_files:
             raise ValueError(f"в черновике уже {max_files} файлов")

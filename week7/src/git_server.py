@@ -34,6 +34,14 @@ LOG_DESCRIPTION = "Узнать, над чем работали в послед�
 DIFF_DESCRIPTION = "Показать изменения: статистика и diff всего рабочего дерева или конкретного относительного файла. staged=true — изменения в индексе."
 
 
+def text_lines(text):
+    # Как git grep: строки делятся только по \n, иначе номера расходятся; \r у CRLF не показывается.
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return [line.removesuffix("\r") for line in lines]
+
+
 def make_server(repo: Path):
     server = MCPServer("git-сервер", log_level="WARNING")
 
@@ -206,7 +214,7 @@ def make_server(repo: Path):
         raw = git("grep", "-n", "-I", "--null", "--no-color", "--untracked",
                   "-F" if fixed else "-E", "-e", pattern, "--", *paths, ok_codes=(0, 1))
         matches = []
-        for line in raw.splitlines():
+        for line in text_lines(raw):
             path, number, text = line.split("\0", 2)
             matches.append(f"{path}:{number}: {text[:GREP_LINE_MAX_CHARS]}" +
                            ("…" if len(text) > GREP_LINE_MAX_CHARS else ""))
@@ -235,14 +243,17 @@ def make_server(repo: Path):
             raise ToolError(f"нельзя прочитать UTF-8: {exc}") from exc
         if "\0" in text:
             raise ToolError("двоичный файл")
-        lines = text.splitlines()
+        lines = text_lines(text)
         if start_line > len(lines) and lines:
             raise ToolError("start_line за концом файла")
         end = min(len(lines), end_line or len(lines), start_line + READ_MAX_LINES - 1)
-        chosen, size = [], 0
+        chosen, size, budget = [], 0, max(0, READ_MAX_CHARS - len(path) - 200)
         for n in range(start_line, end + 1):
             line = f"{n}│{lines[n - 1]}\n"
-            if size + len(line) > max(0, READ_MAX_CHARS - len(path) - 200):
+            if size + len(line) > budget:
+                if not chosen:
+                    # Строка длиннее потолка: показываем начало, иначе чтение не продвинется.
+                    chosen.append(line[:budget - 60] + f"… строка обрезана: {len(lines[n - 1])} симв.\n")
                 break
             chosen.append(line)
             size += len(line)

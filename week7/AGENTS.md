@@ -82,7 +82,7 @@
 | `src/review_report.py` | Лист: номера строк, JSON, проверки, Markdown |
 | `src/pr_review.py` | → `settings`, `search`, `llm`, `mcp_client`, `review_report`: ревью ветки |
 | `src/docs_index.py` | → `settings`, `md_chunks`, `code_chunks`, `embedder`, `search`: проверка корня git и HEAD, пересчёт изменённых файлов, атомарная запись, `--probe` |
-| `src/llm.py` | Лист: единственный импорт `openai`, параметры аргументами, function calling и лог каждого раунда |
+| `src/llm.py` | Лист: единственный импорт `openai`, параметры аргументами, function calling, стадии черновика и текста, защита от разметки DSML и лог каждого раунда |
 | `src/mcp_client.py` | Лист: единственный импорт клиента MCP v2, stdio и белый список окружения, ошибки по стадиям |
 | `src/git_server.py` | Отдельная программа без импортов проекта: сервер MCP v2, `git_branch`, `git_status`, `git_log`, `git_diff`, `git_changed_files`, `git_range_diff`, `git_show_file`; фиксированные команды git, project_files/project_grep/project_read, скрытый project_path_status и `ToolError` |
 | `src/citations.py` | Лист: номера ссылок, источники и пометки для devhelp и поддержки |
@@ -109,7 +109,7 @@ mcp_client ──stdio──► crm_server ──► demo/crm.json
 
 `llm` и `mcp_client` принимают параметры и ничего не импортируют из `settings`. `git_server` не импортирует проект и пишет логи только в stderr. `numpy` используется для матрицы поиска и векторов; внешние модели и протоколы остаются за своими модулями. Импортов TooManyRules и изменения `sys.path` нет.
 
-Индекс содержит `current`/`docs`, `code` и `faq` (FAQ поддержки); devhelp ищет только `current`/`docs` и показывает модели `DEVHELP_TOOLS` (`git_status`, `git_log`, `git_diff`, `project_files`, `project_grep`, `project_read`) плюс локальные `propose_edit`/`propose_file`. Они готовят черновик только `.md`; запись — по кнопке одного файла или `--apply` в CLI. Скрытый `project_path_status` вызывается кодом перед предложением и применением; SHA-256 защищает изменённый после предложения файл. Каждый черновик сохраняет `.diff`, последние 20 доступны странице в памяти. Ревьюер ищет оба вида, исключая изменённые файлы; модель видит только `git_show_file`.
+Индекс содержит `current`/`docs`, `code` и `faq` (FAQ поддержки); devhelp ищет только `current`/`docs` и показывает модели `DEVHELP_TOOLS` (`git_status`, `git_log`, `git_diff`, `project_files`, `project_grep`, `project_read`) плюс локальные `propose_edit`/`propose_file`. Они готовят черновик только `.md`; запись — по кнопке одного файла или `--apply` в CLI. Скрытый `project_path_status` вызывается кодом перед предложением и применением; SHA-256 защищает изменённый после предложения файл. Служебные вызовы кода (`git_branch`, `project_path_status`, `git_log` для HEAD) помечаются в подробностях страницы и не попадают в строку `# инструменты` шапки `.diff`. После основного лимита раундов `help` получает до двух раундов только с `propose_edit`/`propose_file`, затем текстовый ответ без каталога инструментов; разметка вызова в тексте не исполняется и исправляется ограниченным числом повторов. Каждый черновик сохраняет `.diff`, последние 20 доступны странице в памяти. Ревьюер ищет оба вида, исключая изменённые файлы; модель видит только `git_show_file`.
 
 Поддержка — чат клиента: ищет `faq` и отдельно `current`/`docs` без `week7/*`. Модель видит только `find_tickets` и `get_ticket` и только обращения названного клиента (`support_desk` подставляет `user_id` и отказывает в чужом обращении); `get_user` вызывает код. Гость — MCP не запускается.
 

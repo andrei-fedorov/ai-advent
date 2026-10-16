@@ -33,7 +33,7 @@ function render(goal,data){
   for(const f of data.change.files){
    const box=node('section',undefined,card,'file');node('strong',f.path,box);node('p',(f.kind==='new'?'новый':'правка')+' · +'+f.added+' −'+f.removed,box);
    const diff=folding(box,'Diff');const pre=node('pre',undefined,diff,'diff');
-   for(const line of f.diff.split('\n'))node('span',line,pre,line.startsWith('+')&&!line.startsWith('+++')?'added':line.startsWith('-')&&!line.startsWith('---')?'removed':'');
+   let body=false;for(const line of f.diff.split('\n')){if(line.startsWith('@@'))body=true;node('span',line,pre,body&&line.startsWith('+')?'added':body&&line.startsWith('-')?'removed':'');}
    const button=node('button','Применить',box,'apply');button.type='button';button.dataset.applied=f.applied?'yes':'no';button.disabled=busy||f.applied;
    const status=node('span',f.applied?'записан':'на диске не изменён',box,'status');
    button.addEventListener('click',async()=>{if(busy)return;lock(true);$('error').textContent='';try{const r=await post('/api/apply',{change:data.change.id,path:f.path});status.textContent=r.status+(r.status==='отказ'?': '+r.message:'');if(r.status==='записан'||r.status==='уже применён')button.dataset.applied='yes';}catch(e){status.textContent=e.message;}finally{lock(false);}});
@@ -44,7 +44,7 @@ function render(goal,data){
  node('p','Запрос поиска: '+d.query,more);
  for(const hit of d.hits)node('div',hit.label+' · sim='+hit.sim.toFixed(3)+' · score='+(hit.score===null?'—':hit.score.toFixed(3)),more,'text');
  node('h4','Вызовы инструментов',more);
- for(const call of d.calls)node('pre',call.name+' '+JSON.stringify(call.arguments)+' · '+call.elapsed.toFixed(3)+' с · '+call.size+' симв.'+(call.error?' · ошибка: '+call.error:''),more);
+ for(const call of d.calls)node('pre',(call.service?'служебный · ':'')+call.name+' '+JSON.stringify(call.arguments)+' · '+call.elapsed.toFixed(3)+' с · '+call.size+' симв.'+(call.error?' · ошибка: '+call.error:''),more);
  node('p','Раундов '+d.rounds+' · токены '+d.prompt_tokens+' → '+d.completion_tokens+' · стоимость '+(d.cost_usd===null?'неизвестна':'$'+d.cost_usd.toFixed(6))+' · finish_reason='+d.finish_reason,more);
  card.scrollIntoView({behavior:'smooth',block:'start'});
 }
