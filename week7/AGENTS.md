@@ -62,7 +62,7 @@
 ./week7/run.sh index [--repo <путь>] [--db <путь>] [--full] [--probe]   # день 31: индекс документации
 ./week7/run.sh help  [--repo <путь>] [--db <путь>] ["вопрос"]   # день 31: ассистент разработчика, /help
 ./week7/run.sh review [--repo <путь>] [--db <путь>] [--base main] [--head HEAD] [--out <путь>] # день 32: ревью ветки
-./week7/run.sh support [--repo <путь>] [--db <путь>] [--crm <путь>] [--port <порт>] # день 33: страница оператора
+./week7/run.sh support [--repo <путь>] [--db <путь>] [--crm <путь>] [--port <порт>] # день 33: чат поддержки для клиентов
 ./week7/run.sh crm-server --crm <путь>                          # день 33: MCP CRM вручную
 ./week7/run.sh git-server --repo <путь>                         # день 31: MCP-сервер git вручную (отладка)
 ```
@@ -87,8 +87,8 @@
 | `src/citations.py` | Лист: номера ссылок, источники и пометки для devhelp и поддержки |
 | `src/crm_server.py` | Отдельная программа: чтение JSON, get_ticket/get_user/find_tickets, без contact |
 | `src/support_web.py` | Лист: Starlette/uvicorn, HTTP, защита и один ответ за раз; обработчики аргументами |
-| `src/support_page.html` | Страница оператора: тикеты, пользователь, редактируемый черновик, только текст |
-| `src/support_desk.py` | → settings, search, llm, mcp_client, citations, support_web: контекст, поиск, черновик |
+| `src/support_page.html` | Страница чата клиента: кто вы, переписка, источники и подробности под ответом, только текст |
+| `src/support_desk.py` | → settings, search, llm, mcp_client, citations, support_web: данные клиента, поиск, ответ, ограничение инструментов клиентом |
 | `src/devhelp.py` | → `settings`, `search`, `llm`, `mcp_client`, `citations`: `.env`, CLI, один MCP-процесс на вопрос, подписи источников и итоговый расход |
 
 ```text
@@ -108,7 +108,7 @@ mcp_client ──stdio──► crm_server ──► demo/crm.json
 
 Индекс содержит `current`/`docs`, `code` и `faq` (FAQ поддержки); devhelp ищет только `current`/`docs` и показывает модели только `DEVHELP_TOOLS` (`git_status`, `git_log`, `git_diff`). Ревьюер ищет оба вида, исключая изменённые файлы; модель видит только `git_show_file`.
 
-Поддержка ищет `faq` и отдельно `current`/`docs` без `week7/*`. Модель видит только `find_tickets` и `get_ticket`; `get_user` вызывает код. Без тикета MCP не запускается.
+Поддержка — чат клиента: ищет `faq` и отдельно `current`/`docs` без `week7/*`. Модель видит только `find_tickets` и `get_ticket` и только обращения названного клиента (`support_desk` подставляет `user_id` и отказывает в чужом обращении); `get_user` вызывает код. Гость — MCP не запускается.
 
 Индекс — SQLite версии 1: `meta`, `files`, `chunks`. Файлы с прежним SHA-256 сохраняют куски и векторы; новая база целиком пишется в `<db>.tmp`, затем `os.replace`. Чужой файл не затирается. `help` и `support` читают индекс в память, проверяют кэш обеих моделей без сети; устаревшие файлы и другой `repo` — предупреждения. Ошибка реранкера во время поиска оставляет пять ближайших векторов.
 

@@ -1,4 +1,4 @@
-"""Граница HTTP: локальный сервер, проверки запросов и страница оператора."""
+"""Граница HTTP: локальный сервер, проверки запросов и страница чата."""
 
 import asyncio
 import json
@@ -17,60 +17,62 @@ def json_response(data, status=200):
     return JSONResponse(data, status_code=status, media_type="application/json; charset=utf-8")
 
 
-def make_app(*, page, port, max_body_bytes, list_tickets, get_ticket, prepare_answer, health):
+def valid_chat(data, history_messages):
+    if not isinstance(data, dict) or set(data) - {"who", "question", "history"}:
+        return False
+    who, question, history = data.get("who"), data.get("question"), data.get("history", [])
+    if who is not None and (not isinstance(who, str) or not who.strip() or len(who.strip()) > 32):
+        return False
+    if not isinstance(question, str) or not question.strip():
+        return False
+    return (isinstance(history, list) and len(history) <= history_messages
+            and all(isinstance(item, dict) and set(item) == {"role", "content"}
+                    and item["role"] in ("user", "assistant") and isinstance(item["content"], str)
+                    for item in history))
+
+
+def make_app(*, page, port, max_body_bytes, history_messages, chat, health):
     busy = False
     tasks = set()
 
     async def home(request):
         return HTMLResponse(page.read_text(encoding="utf-8"))
 
-    async def tickets(request):
-        status = request.query_params.get('status', 'open')
-        if status not in ('open', 'waiting', 'closed', 'all'):
-            return json_response({'error': 'status: допустимы open, waiting, closed, all'}, 400)
-        return json_response(await list_tickets(status))
-
-    async def ticket(request):
-        return json_response(await get_ticket(request.path_params['id']))
-
     async def state(request):
-        return json_response({**health(), 'busy': busy})
+        return json_response({**health(), "busy": busy})
 
-    async def answer(request):
+    async def reply(request):
         nonlocal busy
         if busy:
-            return json_response({'error': 'черновик уже готовится'}, 409)
+            return json_response({"error": "ассистент уже отвечает"}, 409)
         # Чтение ограничено по фактическим байтам, включая chunked-запросы.
         body = bytearray()
         async for chunk in request.stream():
             if len(body) + len(chunk) > max_body_bytes:
-                return json_response({'error': 'тело запроса больше 16 КБ'}, 413)
+                return json_response({"error": f"тело запроса больше {max_body_bytes // 1024} КБ"}, 413)
             body.extend(chunk)
         try:
             data = json.loads(body)
         except (ValueError, UnicodeError):
-            return json_response({'error': 'тело запроса должно быть JSON'}, 400)
-        if (not isinstance(data, dict) or set(data) - {'ticket_id', 'question'}
-                or not isinstance(data.get('question', ''), str)
-                or (data.get('ticket_id') is not None and
-                    (not isinstance(data['ticket_id'], str) or not data['ticket_id'].strip()
-                     or len(data['ticket_id']) > 32))):
-            return json_response({'error': 'нужны ticket_id (строка или null) и question (строка)'}, 400)
-        question = data.get('question', '').strip()
-        ticket_id = data.get('ticket_id')
-        if ticket_id is None and not question:
-            return json_response({'error': 'нужен тикет или вопрос'}, 400)
+            return json_response({"error": "тело запроса должно быть JSON"}, 400)
+        if not valid_chat(data, history_messages):
+            return json_response({"error": "нужны question (непустая строка), who (строка до 32 символов или null) "
+                                           f"и history (до {history_messages} реплик user/assistant)"}, 400)
+        who = data["who"].strip() if data.get("who") is not None else None
+        question, history = data["question"].strip(), data.get("history", [])
         if busy:
-            return json_response({'error': 'черновик уже готовится'}, 409)
+            return json_response({"error": "ассистент уже отвечает"}, 409)
         busy = True
+
         async def complete():
             nonlocal busy
             try:
-                return await prepare_answer(ticket_id, question)
+                return await chat(who, question, history)
             finally:
                 busy = False
         task = asyncio.create_task(complete())
         tasks.add(task)
+
         # Отключение вкладки не отменяет работу; сильная ссылка живёт до завершения.
         def finished(done):
             tasks.discard(done)
@@ -93,9 +95,9 @@ def make_app(*, page, port, max_body_bytes, list_tickets, get_ticket, prepare_an
     async def http_error(request, exc):
         return json_response({'error': 'адрес не найден' if exc.status_code == 404 else 'метод не поддерживается'}, exc.status_code)
 
-    app = Starlette(exception_handlers={HTTPException: http_error}, routes=[Route('/', guarded(home)), Route('/api/tickets', guarded(tickets)),
-                            Route('/api/tickets/{id}', guarded(ticket)), Route('/api/answer', guarded(answer), methods=['POST']),
-                            Route('/api/health', guarded(state))])
+    app = Starlette(exception_handlers={HTTPException: http_error},
+                    routes=[Route("/", guarded(home)), Route("/api/chat", guarded(reply), methods=["POST"]),
+                            Route("/api/health", guarded(state))])
 
     class LocalHttp:
         async def __call__(self, scope, receive, send):

@@ -1,4 +1,4 @@
-"""Поддержка: контекст CRM, два поиска, черновик для локальной страницы оператора."""
+"""Поддержка: чат клиента — данные CRM, два поиска, ответ модели для локальной страницы."""
 
 import argparse
 import asyncio
@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 from citations import cited_sources
 from llm import LlmParams, answer
-from mcp_client import McpSession
+from mcp_client import McpSession, ToolCall
 from search import DocsIndex
 import settings as cfg
 from support_web import make_app, serve
@@ -43,6 +43,10 @@ def excerpt_block(start, hits):
     return "\n\n".join(f"[{n}] {hit.label()}\n{hit.text}" for n, hit in enumerate(hits, start)) or "Выдержек нет."
 
 
+def unavailable(error):
+    return SupportError(502, "данные поддержки недоступны: " + str(error))
+
+
 class SupportDesk:
     def __init__(self, repo, crm, index, params, warnings):
         self.repo, self.crm, self.index, self.params = repo, crm, index, params
@@ -57,7 +61,7 @@ class SupportDesk:
                               env=None, timeout_s=cfg.MCP_TIMEOUT_S) as session:
             log(f"MCP подключение {session.elapsed:.3f} с · {session.error or 'готово'}")
             if session.error:
-                raise SupportError(502, "контекст тикета недоступен: " + session.error)
+                raise unavailable(session.error)
             yield session
 
     async def call(self, session, name, arguments):
@@ -70,77 +74,56 @@ class SupportDesk:
             f"{len(result.text)} символов · {first[:200] if result.ok else result.error}")
         return result
 
-    def require_ticket(self, result):
-        if result.ok:
-            return
-        error = result.error or "нет ответа CRM"
-        if "тикет не найден:" in error:
-            raise SupportError(404, error[error.index("тикет не найден:"):])
-        raise SupportError(502, "контекст тикета недоступен: " + error)
-
-    async def context(self, session, ticket_id):
-        ticket = await self.call(session, "get_ticket", {"ticket_id": ticket_id})
-        self.require_ticket(ticket)
-        try:
-            user_id = marked(ticket.text, "Пользователь ID")
-            last_message = marked(ticket.text, "Последнее сообщение пользователя")
-            subject = marked(ticket.text, "Тема")
-            environment = marked(ticket.text, "Окружение (JSON)")
-        except (ValueError, TypeError) as exc:
-            raise SupportError(502, f"контекст тикета недоступен: {exc}") from exc
+    async def client(self, session, who):
+        # Номер обращения или id клиента: сначала обращение, затем клиент.
+        ticket = await self.call(session, "get_ticket", {"ticket_id": who})
+        context = {"who": who, "ticket_id": None, "ticket": None, "subject": None, "environment": {}}
+        if ticket.ok:
+            try:
+                user_id = marked(ticket.text, "Пользователь ID")
+                context.update(ticket_id=who, ticket=ticket.text, subject=marked(ticket.text, "Тема"),
+                               environment=marked(ticket.text, "Окружение (JSON)"))
+            except (ValueError, TypeError) as exc:
+                raise unavailable(exc) from exc
+        elif "тикет не найден:" in (ticket.error or ""):
+            user_id = who
+        else:
+            raise unavailable(ticket.error or "нет ответа CRM")
         user = await self.call(session, "get_user", {"user_id": user_id})
-        user_error = None if user.ok else "данные пользователя недоступны: " + str(user.error)
+        if not user.ok and context["ticket"] is None:
+            if "пользователь не найден:" in (user.error or ""):
+                raise SupportError(404, f"не нашли обращение или клиента: {who}")
+            raise unavailable(user.error or "нет ответа CRM")
+        user_error = None if user.ok else "данные клиента недоступны: " + str(user.error)
         if user_error:
             log(user_error)
-        return {"ticket": ticket.text, "user": user.text if user.ok else None, "user_error": user_error,
-                "last_user_message": last_message, "user_id": user_id, "subject": subject,
-                "environment": environment}
-
-    async def list_tickets(self, status):
-        async with self.session() as session:
-            arguments = {"limit": 10}
-            if status != "all":
-                arguments["status"] = status
-            result = await self.call(session, "find_tickets", arguments)
-            if not result.ok:
-                raise SupportError(502, "контекст тикета недоступен: " + str(result.error))
-            try:
-                rows = [json.loads(line[len(TICKET_LINE):]) for line in result.text.splitlines()
-                        if line.startswith(TICKET_LINE)]
-                tickets = [{key: row[key] for key in ("id", "created", "status", "subject")} for row in rows]
-            except (ValueError, KeyError) as exc:
-                raise SupportError(502, "контекст тикета недоступен: неверный список тикетов") from exc
-            return {"tickets": tickets, "text": result.text}
-
-    async def get_ticket(self, ticket_id):
-        async with self.session() as session:
-            context = await self.context(session, ticket_id)
-            return {key: context[key] for key in ("ticket", "user", "user_error", "last_user_message")}
+        context.update(user_id=user_id, user=user.text if user.ok else None, user_error=user_error)
+        return context
 
     def health(self):
         return {"chunks": len(self.index.chunks), "faq_chunks": self.faq_count,
                 "warnings": self.index_warnings, "model": self.params.model}
 
-    async def prepare_answer(self, ticket_id, question):
-        if ticket_id is None:
-            return await self.generate(None, question, None, None)
+    async def chat(self, who, question, history):
+        if who is None:
+            return await self.respond(question, history, None, None)
         async with self.session() as session:
-            context = await self.context(session, ticket_id)
-            return await self.generate(ticket_id, question, context, session)
+            context = await self.client(session, who)
+            return await self.respond(question, history, context, session)
 
-    async def generate(self, ticket_id, question, context, session):
-        question_from_ticket = not question and context is not None
-        if question_from_ticket:
-            question = context["last_user_message"].strip()
-        if not question:
-            raise SupportError(400, "в тикете нет сообщения пользователя — задайте вопрос")
+    async def respond(self, question, history, context, session):
+        previous = next((item["content"] for item in reversed(history) if item["role"] == "user"), None)
         parts = [question]
-        if context:
+        if previous:
+            # Уточнение («а где эта кнопка?») само по себе поиску мало.
+            parts.append(previous)
+        if context and context["subject"]:
             parts.append(context["subject"])
+        if context:
             parts += [str(context["environment"][key]) for key in cfg.CRM_ERROR_KEYS if key in context["environment"]]
-        # Вопрос идёт первым: при нехватке места сокращаются тема и окружение.
+        # Вопрос идёт первым: при нехватке места сокращается хвост.
         query = " · ".join(parts)[:cfg.SUPPORT_QUERY_MAX_CHARS]
-        log(f"черновик · тикет {ticket_id or 'нет'} · вопрос из {'тикета' if question_from_ticket else 'поля'} · "
+        log(f"ответ · {context['who'] if context else 'гость'} · реплик в истории {len(history)} · "
             f"запрос {query[:80]!r}")
         faq, docs = await asyncio.to_thread(self.search, query)
         faq_hits = faq.hits[:cfg.SUPPORT_FAQ_TOP_K]
@@ -154,42 +137,58 @@ class SupportDesk:
             log(f"MCP каталог {session.tools_elapsed:.3f} с · {', '.join(tool['name'] for tool in catalog)} · "
                 f"{session.error or 'готово'}")
             if session.error:
-                raise SupportError(502, "контекст тикета недоступен: " + session.error)
+                raise unavailable(session.error)
             tools = [{"type": "function", "function": {"name": tool["name"], "description": tool["description"],
                                                        "parameters": tool["inputSchema"]}}
                      for tool in catalog if tool["name"] in cfg.SUPPORT_MODEL_TOOLS]
 
         async def call_tool(name, arguments):
+            # Модель видит только обращения этого клиента: проверяет код, а не промпт.
+            if name == "find_tickets":
+                arguments = {**arguments, "user_id": context["user_id"]}
             result = await self.call(session, name, arguments)
+            if name == "get_ticket" and result.ok:
+                try:
+                    owner = marked(result.text, "Пользователь ID")
+                except (ValueError, TypeError):
+                    owner = None
+                if owner != context["user_id"]:
+                    log(f"MCP get_ticket {arguments.get('ticket_id')} · отказ: обращение другого клиента")
+                    result = ToolCall(ok=False, text="", elapsed=result.elapsed, error="обращение другого клиента")
             calls.append({"name": name, "arguments": arguments, "ok": result.ok})
             return result
 
-        crm = cfg.NO_TICKET if context is None else (
-            "Тикет (CRM, get_ticket):\n" + context["ticket"]
-            + "\n\nПользователь (CRM, get_user):\n" + (context["user"] or context["user_error"]))
+        if context is None:
+            crm = cfg.NO_CLIENT
+        else:
+            crm = "Клиент (CRM, get_user):\n" + (context["user"] or context["user_error"])
+            if context["ticket"]:
+                crm = "Обращение (CRM, get_ticket):\n" + context["ticket"] + "\n\n" + crm
         prompt = cfg.SUPPORT_USER_TEMPLATE.format(repo=self.repo.name, crm=crm, faq=excerpt_block(1, faq_hits),
                                                   docs=excerpt_block(len(faq_hits) + 1, docs.hits), question=question)
-        messages = [{"role": "system", "content": cfg.SUPPORT_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+        messages = [{"role": "system", "content": cfg.SUPPORT_SYSTEM_PROMPT}, *history,
+                    {"role": "user", "content": prompt}]
         result = await answer(messages, tools, call_tool, self.params)
         if not result.ok:
-            log("черновик · ошибка LLM: " + str(result.error))
+            log("ответ · ошибка LLM: " + str(result.error))
             raise SupportError(502, "ошибка LLM: " + str(result.error))
 
         sources, warnings = cited_sources(result.text, hits)
         if result.finish_reason == "length":
             warnings.append("⚠️ ответ достиг ограничения длины")
-        crm_line = "CRM: тикета нет"
+        crm_line = "CRM: клиент не назвался"
         if context:
             counts = Counter(call["name"] for call in calls)
             model_calls = ", ".join(f"{name} ×{count}" for name, count in counts.items()) or "нет"
-            crm_line = (f"CRM: тикет {ticket_id} (get_ticket) · пользователь {context['user_id']} "
-                        f"({context['user_error'] or 'get_user'}) · вызвано моделью: {model_calls}")
+            ticket_part = f"обращение {context['ticket_id']} (get_ticket) · " if context["ticket_id"] else ""
+            crm_line = (f"CRM: {ticket_part}клиент {context['user_id']} ({context['user_error'] or 'get_user'}) · "
+                        f"вызвано моделью: {model_calls}")
         cost = "стоимость неизвестна" if result.cost_usd is None else f"≈ ${result.cost_usd:.6f}"
         stats = (f"Поиск {faq.elapsed + docs.elapsed:.2f} с · модель {sum(r.elapsed for r in result.rounds):.2f} с · "
                  f"раундов {len(result.rounds)} · {result.prompt_tokens:,} → {result.completion_tokens:,} токенов · {cost}")
-        log(f"черновик готов · источников {len(sources)} · пометок {len(warnings)} · {stats}")
-        return {"ticket_id": ticket_id, "question": question, "question_from_ticket": question_from_ticket,
-                "query": query, "answer": result.text, "sources": [{"n": n, "label": label} for n, label in sources],
+        log(f"ответ готов · источников {len(sources)} · пометок {len(warnings)} · {stats}")
+        return {"who": context["who"] if context else None, "question": question, "query": query,
+                "answer": result.text, "sources": [{"n": n, "label": label} for n, label in sources],
                 "warnings": warnings, "crm": crm_line, "tool_calls": calls, "excerpts": excerpts, "stats": stats}
 
     def search(self, query):
@@ -208,7 +207,7 @@ class SupportDesk:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ассистент оператора поддержки")
+    parser = argparse.ArgumentParser(description="Чат поддержки для клиентов")
     parser.add_argument("--repo", type=Path, default=cfg.DEFAULT_REPO)
     parser.add_argument("--db", type=Path, default=cfg.INDEX_DB)
     parser.add_argument("--crm", type=Path, default=cfg.CRM_PATH)
@@ -241,10 +240,9 @@ def main():
         index.load_models(allow_download=False)
         desk = SupportDesk(repo, crm, index, params, warnings)
         app = make_app(page=cfg.SUPPORT_PAGE, port=args.port, max_body_bytes=cfg.SUPPORT_MAX_BODY_BYTES,
-                       list_tickets=desk.list_tickets, get_ticket=desk.get_ticket,
-                       prepare_answer=desk.prepare_answer, health=desk.health)
+                       history_messages=cfg.SUPPORT_HISTORY_MESSAGES, chat=desk.chat, health=desk.health)
         ready = (f"репозиторий {repo} · индекс {db}, {len(index.chunks)} кусков, из них FAQ {desk.faq_count} · "
-                 f"CRM {crm} · LLM {params.model} · адрес {params.base_url} · страница http://127.0.0.1:{args.port}")
+                 f"CRM {crm} · LLM {params.model} · адрес {params.base_url} · чат http://127.0.0.1:{args.port}")
         serve(app, args.port, lambda: log(ready))
     except KeyboardInterrupt:
         return 0
