@@ -1,11 +1,13 @@
 """Отдельный MCP-сервер git: только чтение, stdout занят JSON-RPC."""
 
 import argparse
+import fnmatch
 import json
 import logging
 import os
 from pathlib import Path, PureWindowsPath
 import subprocess
+import stat
 import sys
 import time
 from typing import Annotated
@@ -20,6 +22,11 @@ SHOW_MAX_LINES = 400
 SHOW_MAX_CHARS = 30_000
 STATUS_MAX_LINES = 100
 DIFF_MAX_CHARS = 12000
+FILES_MAX = 300
+GREP_MAX_MATCHES = 100
+GREP_LINE_MAX_CHARS = 200
+READ_MAX_LINES = 300
+READ_MAX_CHARS = 12000
 GIT_TIMEOUT_S = 10
 BRANCH_DESCRIPTION = "Узнать текущую git-ветку, upstream и число коммитов впереди/позади."
 STATUS_DESCRIPTION = "Что изменено сейчас: файлы в индексе, рабочем дереве и неотслеживаемые. Вызывай при вопросах о текущих изменениях."
@@ -30,11 +37,13 @@ DIFF_DESCRIPTION = "Показать изменения: статистика и
 def make_server(repo: Path):
     server = MCPServer("git-сервер", log_level="WARNING")
 
-    def git(*args, allow_failure=False):
+    def git(*args, allow_failure=False, ok_codes=(0,)):
         started = time.monotonic()
         try:
+            # check-ignore сам принимает имена; глобальная literal-magic ему не подходит.
             result = subprocess.run(
-                ["git", "-C", str(repo), "--no-pager", "--literal-pathspecs", *args],
+                ["git", "-C", str(repo), "--no-pager",
+                 *([] if args[0] == "check-ignore" else ["--literal-pathspecs"]), *args],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=GIT_TIMEOUT_S,
                 env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"},
@@ -43,9 +52,9 @@ def make_server(repo: Path):
             raise ToolError(f"git: {exc}") from exc
         finally:
             print(f"[git-сервер] {args[0]} · {time.monotonic() - started:.3f} с", file=sys.stderr, flush=True)
-        if result.returncode and not allow_failure:
+        if result.returncode not in ok_codes and not allow_failure:
             raise ToolError(result.stderr.strip() or f"git завершился с кодом {result.returncode}")
-        return result.stdout if not result.returncode else None
+        return result.stdout if result.returncode in ok_codes else None
 
     def validate_path(path):
         relative = Path(path)
@@ -167,6 +176,94 @@ def make_server(repo: Path):
         # Даже одна строка длиннее потолка возвращается с явной пометкой, без потери границы.
         suffix = "\nобрезано: продолжение не поместилось" if shown_end < end else ""
         return header + "\n" + "".join(chosen) + suffix
+
+    def project_list(glob=None):
+        paths = sorted(set(git("ls-files", "-co", "--exclude-standard", "-z").split("\0")) - {""})
+        return [path for path in paths if ((repo / path).is_file() or (repo / path).is_symlink())
+                and (glob is None or fnmatch.fnmatchcase(path, glob))]
+
+    @server.tool(description="Список файлов проекта: отслеживаемые git и новые, без игнорируемых. "
+                 "glob — шаблон пути, например week7/src/*.py или *.md; без него — все файлы. "
+                 "Вызывай, чтобы узнать, какие файлы есть.")
+    def project_files(glob: str | None = None) -> str:
+        paths = project_list(glob)
+        lines = [path + (" (символьная ссылка)" if (repo / path).is_symlink() else "")
+                 for path in paths[:FILES_MAX]]
+        if len(paths) > FILES_MAX:
+            lines.append(f"и ещё {len(paths) - FILES_MAX}")
+        return "\n".join([*lines, f"всего {len(paths)}"])
+
+    @server.tool(description="Найти строки в файлах проекта: путь, номер строки, текст. pattern — регулярное "
+                 "выражение, fixed=true — точная строка; glob — в каких файлах искать. Вызывай, чтобы найти "
+                 "все места использования имени, импорта, константы. Показывает до 100 совпадений.")
+    def project_grep(pattern: str, glob: str | None = None, fixed: bool = False) -> str:
+        paths = project_list(glob)
+        if not paths:
+            return "совпадений нет"
+        if "\0" in pattern:
+            raise ToolError("pattern содержит нулевой байт")
+        # Символьные ссылки git grep сам не читает; код 1 означает отсутствие совпадений.
+        raw = git("grep", "-n", "-I", "--null", "--no-color", "--untracked",
+                  "-F" if fixed else "-E", "-e", pattern, "--", *paths, ok_codes=(0, 1))
+        matches = []
+        for line in raw.splitlines():
+            path, number, text = line.split("\0", 2)
+            matches.append(f"{path}:{number}: {text[:GREP_LINE_MAX_CHARS]}" +
+                           ("…" if len(text) > GREP_LINE_MAX_CHARS else ""))
+        suffix = [f"обрезано: и ещё {len(matches) - GREP_MAX_MATCHES}"] if len(matches) > GREP_MAX_MATCHES else []
+        return "\n".join(matches[:GREP_MAX_MATCHES] + suffix) or "совпадений нет"
+
+    @server.tool(description="Прочитать файл проекта из рабочего дерева целиком или диапазоном строк, с номерами "
+                 "строк. Ответ ограничен 300 строками и 12000 символами; продолжение читай следующим диапазоном. "
+                 "Номера строк — не часть файла.")
+    def project_read(path: str, start_line: Annotated[int, Field(ge=1)] = 1,
+                     end_line: Annotated[int | None, Field(ge=1)] = None) -> str:
+        validate_path(path)
+        paths = project_list()
+        if path not in paths:
+            raise ToolError("файл отсутствует в списке проекта (возможно, игнорируется git)")
+        # Ссылка внутри проекта не должна открывать игнорируемые файлы через другое имя.
+        resolved = (repo / path).resolve().relative_to(repo).as_posix()
+        if resolved not in paths:
+            raise ToolError("цель ссылки отсутствует в списке проекта")
+        if end_line is not None and end_line < start_line:
+            raise ToolError("end_line должен быть не меньше start_line")
+        try:
+            with (repo / path).open(encoding="utf-8", newline="") as stream:
+                text = stream.read()
+        except (OSError, UnicodeError) as exc:
+            raise ToolError(f"нельзя прочитать UTF-8: {exc}") from exc
+        if "\0" in text:
+            raise ToolError("двоичный файл")
+        lines = text.splitlines()
+        if start_line > len(lines) and lines:
+            raise ToolError("start_line за концом файла")
+        end = min(len(lines), end_line or len(lines), start_line + READ_MAX_LINES - 1)
+        chosen, size = [], 0
+        for n in range(start_line, end + 1):
+            line = f"{n}│{lines[n - 1]}\n"
+            if size + len(line) > max(0, READ_MAX_CHARS - len(path) - 200):
+                break
+            chosen.append(line)
+            size += len(line)
+        shown = start_line + len(chosen) - 1
+        suffix = f"\nобрезано: продолжение со строки {shown + 1}" if shown < (end_line or len(lines)) and shown < len(lines) else ""
+        return f"{path}, строки {start_line}–{shown} из {len(lines)}\n" + "".join(chosen) + suffix
+
+    @server.tool(description="Статус пути для проверки предложения и применения правок; служебный инструмент.")
+    def project_path_status(path: str) -> str:
+        validate_path(path)
+        current, symlink = repo, False
+        for part in Path(path).parts:
+            current /= part
+            try:
+                symlink = symlink or stat.S_ISLNK(os.lstat(current).st_mode)
+            except FileNotFoundError:
+                pass
+        tracked = git("ls-files", "--error-unmatch", "--", path, allow_failure=True) is not None
+        ignored = git("check-ignore", "-q", "--", path, allow_failure=True) is not None
+        status = "ignored" if ignored else "tracked" if tracked else "untracked" if (repo / path).exists() else "absent"
+        return json.dumps({"status": status, "symlink": symlink})
 
     @server.tool(description=BRANCH_DESCRIPTION)
     def git_branch() -> str:

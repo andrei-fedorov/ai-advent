@@ -17,21 +17,7 @@ def json_response(data, status=200):
     return JSONResponse(data, status_code=status, media_type="application/json; charset=utf-8")
 
 
-def valid_chat(data, history_messages):
-    if not isinstance(data, dict) or set(data) - {"who", "question", "history"}:
-        return False
-    who, question, history = data.get("who"), data.get("question"), data.get("history", [])
-    if who is not None and (not isinstance(who, str) or not who.strip() or len(who.strip()) > 32):
-        return False
-    if not isinstance(question, str) or not question.strip():
-        return False
-    return (isinstance(history, list) and len(history) <= history_messages
-            and all(isinstance(item, dict) and set(item) == {"role", "content"}
-                    and item["role"] in ("user", "assistant") and isinstance(item["content"], str)
-                    for item in history))
-
-
-def make_app(*, page, port, max_body_bytes, history_messages, chat, health):
+def make_app(*, page, port, max_body_bytes, log_prefix, posts, health):
     busy = False
     tasks = set()
 
@@ -41,7 +27,7 @@ def make_app(*, page, port, max_body_bytes, history_messages, chat, health):
     async def state(request):
         return json_response({**health(), "busy": busy})
 
-    async def reply(request):
+    async def reply(request, validate, handler):
         nonlocal busy
         if busy:
             return json_response({"error": "ассистент уже отвечает"}, 409)
@@ -55,11 +41,9 @@ def make_app(*, page, port, max_body_bytes, history_messages, chat, health):
             data = json.loads(body)
         except (ValueError, UnicodeError):
             return json_response({"error": "тело запроса должно быть JSON"}, 400)
-        if not valid_chat(data, history_messages):
-            return json_response({"error": "нужны question (непустая строка), who (строка до 32 символов или null) "
-                                           f"и history (до {history_messages} реплик user/assistant)"}, 400)
-        who = data["who"].strip() if data.get("who") is not None else None
-        question, history = data["question"].strip(), data.get("history", [])
+        error = validate(data)
+        if error:
+            return json_response({"error": error}, 400)
         if busy:
             return json_response({"error": "ассистент уже отвечает"}, 409)
         busy = True
@@ -67,7 +51,7 @@ def make_app(*, page, port, max_body_bytes, history_messages, chat, health):
         async def complete():
             nonlocal busy
             try:
-                return await chat(who, question, history)
+                return await handler(data)
             finally:
                 busy = False
         task = asyncio.create_task(complete())
@@ -79,7 +63,8 @@ def make_app(*, page, port, max_body_bytes, history_messages, chat, health):
             if not done.cancelled():
                 done.exception()
         task.add_done_callback(finished)
-        return json_response(await asyncio.shield(task))
+        payload, status = await asyncio.shield(task)
+        return json_response(payload, status)
 
     def guarded(handler):
         async def endpoint(request):
@@ -95,9 +80,14 @@ def make_app(*, page, port, max_body_bytes, history_messages, chat, health):
     async def http_error(request, exc):
         return json_response({'error': 'адрес не найден' if exc.status_code == 404 else 'метод не поддерживается'}, exc.status_code)
 
+    def post_endpoint(validate, handler):
+        async def endpoint(request):
+            return await reply(request, validate, handler)
+        return guarded(endpoint)
+
     app = Starlette(exception_handlers={HTTPException: http_error},
-                    routes=[Route("/", guarded(home)), Route("/api/chat", guarded(reply), methods=["POST"]),
-                            Route("/api/health", guarded(state))])
+                    routes=[Route("/", guarded(home)), Route("/api/health", guarded(state)),
+                            *(Route(path, post_endpoint(*pair), methods=["POST"]) for path, pair in posts.items())])
 
     class LocalHttp:
         async def __call__(self, scope, receive, send):
@@ -124,7 +114,7 @@ def make_app(*, page, port, max_body_bytes, history_messages, chat, health):
                 if response is not None:
                     await response(scope, receive, logged_send)
             finally:
-                print(f"[support] HTTP {scope['method']} {scope['path']} · {status} · {time.monotonic()-started:.3f} с", flush=True)
+                print(f"{log_prefix} HTTP {scope['method']} {scope['path']} · {status} · {time.monotonic()-started:.3f} с", flush=True)
     return LocalHttp()
 
 

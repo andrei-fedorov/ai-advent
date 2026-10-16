@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ассистент разработчика</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#e5eaf3;background:#111621;color-scheme:dark}body{max-width:1000px;margin:32px auto;padding:0 20px}h1{font-size:26px}p{line-height:1.6}.muted,summary{color:#a8b5ca}textarea{width:100%;box-sizing:border-box;min-height:100px;padding:12px;font:inherit;background:#192232;border:1px solid #43516a;border-radius:8px}button{font:inherit;border:1px solid #526480;border-radius:7px;padding:8px 13px;background:#253a58;color:inherit;cursor:pointer}button:disabled{opacity:.5;cursor:default}#examples{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}#examples button{font-size:13px;text-align:left}article{margin:24px 0;padding:20px;background:#192232;border:1px solid #35445d;border-radius:10px}pre,.text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}pre{font-size:13px;overflow:auto}.file{margin:12px 0;padding:12px;border:1px solid #43516a;border-radius:7px}.file strong{overflow-wrap:anywhere}details{margin:12px 0}summary{cursor:pointer}.added{color:#b6e9c6;background:#1c3829}.removed{color:#ffc3c3;background:#42272e}.diff span{display:block;white-space:pre-wrap}.status{margin-left:12px}#error{color:#ffb9b9}#connection{font-size:13px}label{display:block;margin:14px 0 8px}
+</style>
+<h1>Ассистент разработчика</h1>
+<p class="muted">Новая цель не видит прошлых ответов. Правки Markdown сначала попадают в черновик.</p>
+<p id="connection" class="muted">Подключение…</p>
+<form id="form">
+<label for="goal">Цель или вопрос</label>
+<textarea id="goal" placeholder="Что найти, проверить или предложить изменить?" required></textarea>
+<div id="examples"></div>
+<button id="send" type="submit">Отправить</button> <span id="working" role="status"></span>
+<p id="error" role="alert"></p>
+</form>
+<main id="feed"></main>
+<script>
+const $=id=>document.getElementById(id);
+let busy=false;
+function node(tag,text,parent,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;if(parent)parent.append(e);return e;}
+function lock(value){busy=value;$('goal').disabled=value;$('send').disabled=value;document.querySelectorAll('#examples button,button.apply').forEach(b=>b.disabled=value||b.dataset.applied==='yes');$('working').textContent=value?'Выполняется…':'';}
+async function post(path,data){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const result=await r.json();if(!r.ok)throw Error(result.error||'Ошибка запроса');return result;}
+function folding(parent,title){const d=node('details',undefined,parent);node('summary',title,d);return d;}
+function render(goal,data){
+ const card=node('article',undefined,$('feed'));
+ node('h2',goal,card);node('div',data.answer,card,'text');node('p','Ветка: '+data.branch,card,'muted');
+ const sources=node('div',undefined,card,'text');for(const line of data.sources)node('div',line,sources);
+ if(data.change){
+  node('h3','Правки',card);
+  for(const f of data.change.files){
+   const box=node('section',undefined,card,'file');node('strong',f.path,box);node('p',(f.kind==='new'?'новый':'правка')+' · +'+f.added+' −'+f.removed,box);
+   const diff=folding(box,'Diff');const pre=node('pre',undefined,diff,'diff');
+   for(const line of f.diff.split('\n'))node('span',line,pre,line.startsWith('+')&&!line.startsWith('+++')?'added':line.startsWith('-')&&!line.startsWith('---')?'removed':'');
+   const button=node('button','Применить',box,'apply');button.type='button';button.dataset.applied=f.applied?'yes':'no';button.disabled=busy||f.applied;
+   const status=node('span',f.applied?'записан':'на диске не изменён',box,'status');
+   button.addEventListener('click',async()=>{if(busy)return;lock(true);$('error').textContent='';try{const r=await post('/api/apply',{change:data.change.id,path:f.path});status.textContent=r.status+(r.status==='отказ'?': '+r.message:'');if(r.status==='записан'||r.status==='уже применён')button.dataset.applied='yes';}catch(e){status.textContent=e.message;}finally{lock(false);}});
+  }
+  node('p','Diff: '+data.change.diff_path,card,'text');
+ }
+ const d=data.details,more=folding(card,'Подробности');
+ node('p','Запрос поиска: '+d.query,more);
+ for(const hit of d.hits)node('div',hit.label+' · sim='+hit.sim.toFixed(3)+' · score='+(hit.score===null?'—':hit.score.toFixed(3)),more,'text');
+ node('h4','Вызовы инструментов',more);
+ for(const call of d.calls)node('pre',call.name+' '+JSON.stringify(call.arguments)+' · '+call.elapsed.toFixed(3)+' с · '+call.size+' симв.'+(call.error?' · ошибка: '+call.error:''),more);
+ node('p','Раундов '+d.rounds+' · токены '+d.prompt_tokens+' → '+d.completion_tokens+' · стоимость '+(d.cost_usd===null?'неизвестна':'$'+d.cost_usd.toFixed(6))+' · finish_reason='+d.finish_reason,more);
+ card.scrollIntoView({behavior:'smooth',block:'start'});
+}
+$('goal').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('form').requestSubmit();}});
+$('form').addEventListener('submit',async e=>{e.preventDefault();const goal=$('goal').value.trim();if(!goal||busy)return;lock(true);$('error').textContent='';try{render(goal,await post('/api/chat',{goal}));$('goal').value='';}catch(e){$('error').textContent=e.message;}finally{lock(false);$('goal').focus();}});
+fetch('/api/health').then(async r=>{if(!r.ok)throw Error('Сервер недоступен');const h=await r.json();$('connection').textContent=h.repo+' · индекс '+h.db+' · '+h.model;for(const goal of h.goals){const b=node('button',goal,$('examples'));b.type='button';b.addEventListener('click',()=>{$('goal').value=goal;$('goal').focus();});}}).catch(e=>{$('connection').textContent=e.message;});
+</script>
+</html>

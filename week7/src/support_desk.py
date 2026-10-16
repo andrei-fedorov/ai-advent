@@ -16,9 +16,23 @@ from llm import LlmParams, answer
 from mcp_client import McpSession, ToolCall
 from search import DocsIndex
 import settings as cfg
-from support_web import make_app, serve
+from local_web import make_app, serve
 
 TICKET_LINE = "Тикет: "
+
+
+def valid_chat(data, history_messages):
+    if not isinstance(data, dict) or set(data) - {"who", "question", "history"}:
+        return False
+    who, question, history = data.get("who"), data.get("question"), data.get("history", [])
+    if who is not None and (not isinstance(who, str) or not who.strip() or len(who.strip()) > 32):
+        return False
+    if not isinstance(question, str) or not question.strip():
+        return False
+    return (isinstance(history, list) and len(history) <= history_messages
+            and all(isinstance(item, dict) and set(item) == {"role", "content"}
+                    and item["role"] in ("user", "assistant") and isinstance(item["content"], str)
+                    for item in history))
 
 
 class SupportError(Exception):
@@ -239,8 +253,19 @@ def main():
             log("⚠️ " + warning)
         index.load_models(allow_download=False)
         desk = SupportDesk(repo, crm, index, params, warnings)
+
+        def validate(data):
+            if not valid_chat(data, cfg.SUPPORT_HISTORY_MESSAGES):
+                return ("нужны question (непустая строка), who (строка до 32 символов или null) "
+                        f"и history (до {cfg.SUPPORT_HISTORY_MESSAGES} реплик user/assistant)")
+            return None
+
+        async def chat(data):
+            who = data["who"].strip() if data.get("who") is not None else None
+            return await desk.chat(who, data["question"].strip(), data.get("history", [])), 200
+
         app = make_app(page=cfg.SUPPORT_PAGE, port=args.port, max_body_bytes=cfg.SUPPORT_MAX_BODY_BYTES,
-                       history_messages=cfg.SUPPORT_HISTORY_MESSAGES, chat=desk.chat, health=desk.health)
+                       log_prefix="[support]", posts={"/api/chat": (validate, chat)}, health=desk.health)
         ready = (f"репозиторий {repo} · индекс {db}, {len(index.chunks)} кусков, из них FAQ {desk.faq_count} · "
                  f"CRM {crm} · LLM {params.model} · адрес {params.base_url} · чат http://127.0.0.1:{args.port}")
         serve(app, args.port, lambda: log(ready))
